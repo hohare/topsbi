@@ -28,6 +28,9 @@ def test_get_lower_tri_matches_processor_ordering():
     wcs = [1.0, 2.0, 3.0, 5.0]
     expected = [wcs[i] * wcs[j] for i in range(len(wcs)) for j in range(i + 1)]
     assert get_lower_tri(wcs, dtype=torch.float64).tolist() == expected
+    point = [1.0, 0.1, -0.3, 1.7]
+    assert torch.equal(get_lower_tri(point, dtype=torch.float64),
+                       get_lower_tri(torch.tensor(point, dtype=torch.float64), dtype=torch.float64))
 
 
 def test_eft_training(train_config, tmp_path):
@@ -95,6 +98,25 @@ def test_get_weights_stitched():
 
     with pytest.raises(KeyError):
         get_weights(coefs, {k: v for k, v in config.items() if k != 'lumi'}, years)
+
+
+def test_find_zero_terms_keeps_tail_terms():
+    """a term that is negligible inclusively but large in a tail is kept; a term that is negligible everywhere is not"""
+    from topsbi.tools.data import find_zero_terms
+
+    n = 10000
+    x = torch.linspace(0, 1, n, dtype=torch.float64)[:, None]  # one feature; columns: sm, a, a*a, b, b*a, b*b
+    coefs = torch.full((n, 6), 0.1, dtype=torch.float64)
+    coefs[:, 0] = 1.0
+    coefs[:, 1] = 1e-8  # a: negligible everywhere
+    coefs[:, 4] = 0.0
+    coefs[-n // 100 :, 4] = 1e-5  # b*a: only in the top 1% of x; inclusive ratio 1e-7, top 5% bin 2e-6
+    lumi = torch.ones(n, dtype=torch.float64)
+
+    inclusive = (coefs.abs().sum(0) / coefs[:, 0].abs().sum()).tolist()
+    assert inclusive[1] < 1e-6 and inclusive[4] < 1e-6  # an inclusive criterion drops both
+    assert find_zero_terms(coefs, ['a', 'b'], lumi, x) == [['a', 'sm']]
+    assert find_zero_terms(coefs, ['a', 'b'], lumi, x, n_bins=1) == [['a', 'sm'], ['b', 'a']]  # one bin: inclusive
 
 
 SHARED_KEYS = ['auc', 'rate_closure', 'rate_pull', 'r_chi2_ndf', 'r_z', 'r_rms_bias', 'r_pull', 'r_ci_diff',
