@@ -1,6 +1,7 @@
 from matplotlib.axes import Axes
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
 from matplotlib.transforms import ScaledTranslation, blended_transform_factory
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -1099,7 +1100,18 @@ def _no_tex_mapping(record):
 
 
 def plot_z_heatmap(
-    Z, labels, kinds, features, outname, z_threshold=5.0, z_max=15.0, components=None, feature_config=None
+    Z,
+    labels,
+    kinds,
+    features,
+    outname,
+    z_threshold=5.0,
+    z_max=15.0,
+    components=None,
+    feature_config=None,
+    kind_order=KIND_ORDER,
+    tick_labels=None,
+    sort=True,
 ):
     '''
     Significance of the bias of gamma components in every network input. Columns are components, grouped by kind and
@@ -1117,11 +1129,22 @@ def plot_z_heatmap(
         components: indices of the components to show, default all
         feature_config: contents of the features yml; if given, features are labelled with their TeX label (as on
             the x axis of the training's kinematic plots, without the unit) instead of by name
+        kind_order: the column groups, in order (default the kinds of gamma components)
+        tick_labels: [K] TeX label of every column (default component_tex of labels)
+        sort: sort the columns of a group by their largest Z; False keeps the order of Z
     '''
     kinds = np.array(kinds)
     components = np.arange(len(labels)) if components is None else np.asarray(components)
     max_z = np.nanmax(Z, axis=1)
-    columns = [k for kind in KIND_ORDER for k in sorted(components[kinds[components] == kind], key=lambda k: -max_z[k])]
+    columns = [
+        k
+        for kind in kind_order
+        for k in (
+            sorted(components[kinds[components] == kind], key=lambda k: -max_z[k])
+            if sort
+            else components[kinds[components] == kind]
+        )
+    ]
     rows = np.argsort(-(Z > z_threshold).sum(0), kind='stable')
     shown = Z[np.ix_(columns, rows)].T
 
@@ -1133,11 +1156,12 @@ def plot_z_heatmap(
     for row, col in zip(*np.nonzero(shown > z_threshold)):
         ax.add_patch(Rectangle((col - 0.5, row - 0.5), 1, 1, fill=False, edgecolor='#e34948', linewidth=1.5))
     # separators between the kinds
-    present = [kind for kind in KIND_ORDER if (kinds[columns] == kind).any()]
+    present = [kind for kind in kind_order if (kinds[columns] == kind).any()]
     edges = np.cumsum([(kinds[columns] == kind).sum() for kind in present])
     for e in edges[:-1]:
         ax.axvline(e - 0.5, color='k', linewidth=1)
-    ax.set_xticks(range(len(columns)), [component_tex(labels[k]) for k in columns], rotation=90, fontsize=16)
+    column_labels = [component_tex(labels[k]) if tick_labels is None else tick_labels[k] for k in columns]
+    ax.set_xticks(range(len(columns)), column_labels, rotation=90, fontsize=16)
     if feature_config is None:
         names = [features[f] for f in rows]
     else:
@@ -1178,6 +1202,140 @@ def plot_z_heatmap(
     plt.close(fig)
 
 
+def _feature_label(name, feature_config):
+    '''Axis label of a feature as on the training's kinematic plots: its TeX label [unit], or its name.'''
+    if not feature_config:
+        return name
+    unit = feature_config[name].get('unit')
+    return feature_config[name]['label'] + (f' [{unit}]' if unit else '')
+
+
+def _closure_figure(
+    edges,
+    truth,
+    learned,
+    D,
+    noise,
+    sm,
+    empty,
+    z_max,
+    xlabel,
+    ylabel,
+    labels,
+    outname,
+    errors=None,
+    nominal=None,
+    title=None,
+):
+    '''
+    Two-panel closure figure on equal-width bins labelled by their edges: the learned and target yields per bin (top),
+    Delta_b / lambda_K_b with the band of its noise (bottom); bins in empty are hatched in both panels, and Z_max is
+    shown with the legend (plot_closure, plot_nuisance_closure).
+
+    Args:
+        edges: bin edges in the feature
+        truth, learned, D, noise, sm: [B] target yield w_b, learned yield hat w_b, Delta_b = hat w_b - w_b,
+            sqrt(Var_MC + Var_seeds), and lambda_K_b normalising the bottom panel
+        empty: [B] bool, bins hatched
+        z_max: largest Z of the test
+        xlabel, ylabel: x label (bottom panel), y label (top panel)
+        labels: {'truth', 'learned', 'ratio', 'band'} legend text of the two lines, the points and the band
+        outname: file to save the plot to
+        errors: (truth_err, learned_err) [B] error bars at the bin centres, optional
+        nominal: (values [B], label) drawn as a grey line in the top panel, with (truth - values) / sm in the bottom
+            panel as the true shift, optional
+        title: drawn above the top panel, optional
+    '''
+    x = np.arange(len(edges))
+    centers = x[:-1] + 0.5
+
+    fig, (top, bottom) = plt.subplots(
+        2, 1, sharex=True, figsize=(10, 9), gridspec_kw={'height_ratios': [2, 1], 'hspace': 0}
+    )
+    if nominal is not None:
+        top.stairs(nominal[0], x, color='#9a9a9a', linewidth=2, label=nominal[1])
+    top.stairs(truth, x, color='k', linewidth=2, label=labels['truth'])
+    top.stairs(learned, x, color=ENSEMBLE_COLOR, linewidth=2, label=labels['learned'])
+    if errors is not None:
+        top.errorbar(centers, truth, yerr=errors[0], fmt='none', color='k', linewidth=2)
+        top.errorbar(
+            centers,
+            learned,
+            yerr=errors[1],
+            fmt='none',
+            color=ENSEMBLE_COLOR,
+            linewidth=2,
+        )
+    top.set_ylabel(ylabel)
+    # bins in empty may have sm = 0; they are masked
+    with np.errstate(divide='ignore', invalid='ignore'):
+        band = np.where(empty, np.nan, noise / sm)
+        ratio = D / sm
+        shift = None if nominal is None else np.where(empty, np.nan, (truth - nominal[0]) / sm)
+    bottom.stairs(
+        band,
+        x,
+        baseline=-band,
+        fill=True,
+        color='#d9d9d9',
+        label=labels['band'],
+    )
+    if nominal is not None:
+        bottom.stairs(shift, x, color='#9a9a9a', linewidth=1.5)
+        # the bottom panel's entries go in the legend of the top panel
+        top.fill_between([], [], color='#d9d9d9', label=labels['band'])
+        top.plot([], [], color='#9a9a9a', linewidth=1.5, label='true shift')
+        top.plot([], [], 'o', color='k', label=labels['ratio'])
+    bottom.plot(centers[~empty], ratio[~empty], 'o', color='k', label=labels['ratio'])
+    bottom.axhline(0, color='k', linestyle='--', linewidth=1)
+    # bins in empty: hatched in both panels
+    for i in np.flatnonzero(empty):
+        for ax in (top, bottom):
+            ax.axvspan(x[i], x[i + 1], facecolor='none', edgecolor='#9a9a9a', hatch='//', linewidth=0)
+    bottom.set_ylabel(labels['ratio'])
+    bottom.set_xlabel(xlabel)
+    # equal-width bins labelled with the feature values at 6 evenly spaced edges, the first and last included
+    # (fewer if the feature has fewer edges); 3 significant digits, no exponent
+    tick = [np.format_float_positional(e, precision=3, unique=False, fractional=False, trim='-') for e in edges]
+    # a feature symmetric about 0 (e.g. an eta) gets 7 labels instead, the middle one at the point where it is 0
+    symmetric = edges[0] < 0 < edges[-1] and abs(edges[0] + edges[-1]) <= 0.05 * (edges[-1] - edges[0])
+    shown = np.unique(np.round(np.linspace(0, len(edges) - 1, min(7 if symmetric else 6, len(edges)))).astype(int))
+    positions, names = list(x[shown].astype(float)), [tick[i] for i in shown]
+    if symmetric and len(shown) == 7:
+        positions[3], names[3] = float(np.interp(0, edges, x)), '0'
+    bottom.set_xticks(positions, names)
+    # minor ticks on every bin edge, so major and minor ticks both sit on edges (shared by the top panel)
+    bottom.set_xticks(x, minor=True)
+    bottom.set_xlim(x[0], x[-1])
+    if title is not None:
+        # centred above the row of the CMS label
+        top.set_title(title, fontsize=18, pad=45)
+    # the CMS label measures the text already on the figure, so the filter must be on before it is added
+    mathtext_log = logging.getLogger('matplotlib.mathtext')
+    mathtext_log.addFilter(_no_tex_mapping)
+    try:
+        mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=top)
+        # legend and Z_max where they cover the least of the lines and error bars (the ranges stay as they are)
+        lines = (truth, learned) if nominal is None else (truth, learned, nominal[0])
+        sampled = [np.c_[np.linspace(x[i], x[i + 1], 20), np.full(20, v[i])] for v in lines for i in range(len(v))]
+        sampled += [
+            np.c_[np.full(20, x[i + 1]), np.linspace(v[i], v[i + 1], 20)] for v in lines for i in range(len(v) - 1)
+        ]
+        if errors is not None:
+            sampled += [
+                np.c_[np.full(20, c), np.linspace(v - e, v + e, 20)]
+                for vals, errs in ((truth, errors[0]), (learned, errors[1]))
+                for c, v, e in zip(centers, vals, errs)
+            ]
+        # smaller text for the six entries with nominal
+        fontsize = 20 if nominal is None else 15
+        place_legend(top, np.concatenate(sampled), [(r'$Z_{max}$', f'{z_max:.1f}')], fontsize=fontsize, beside=False)
+        fig.savefig(outname, bbox_inches='tight')
+    finally:
+        mathtext_log.removeFilter(_no_tex_mapping)
+    plt.close(fig)
+
+
 def plot_closure(k, f, sums, bias, binning, labels, outname, feature_config=None):
     '''
     Closure of one gamma component q in one feature: the learned sum hat w_q,b = sum_i w^s_i(theta_0) gamma_hat_q,i
@@ -1198,98 +1356,75 @@ def plot_closure(k, f, sums, bias, binning, labels, outname, feature_config=None
     '''
     b = binning['feature'] == f
     truth, D = sums['truth'][k, b], bias['D'][k, b]
-    noise = np.sqrt(sums['mc_var'][k, b] + bias['s2'][k, b])
-    sm = sums['sm_yield'][b]
-    empty = sums['mc_var'][k, b] <= 0
-    edges = binning['edges'][f]
-    x = np.arange(len(edges))
-    centers = x[:-1] + 0.5
-
-    fig, (top, bottom) = plt.subplots(
-        2, 1, sharex=True, figsize=(10, 9), gridspec_kw={'height_ratios': [2, 1], 'hspace': 0}
-    )
-    top.stairs(truth, x, color='k', linewidth=2, label='truth')
-    top.stairs(truth + D, x, color=ENSEMBLE_COLOR, linewidth=2, label=r'$\sum_i w^s_i(\theta_0)\,\hat{\gamma}_{q,i}$')
     # MC statistics of each sum; the learned one also carries the seed spread of the ensemble mean
-    truth_err = np.sqrt(sums['truth_var'][k, b])
-    learned_err = np.sqrt(sums['learned_var'][k, b] + bias['s2'][k, b])
-    top.errorbar(centers, truth, yerr=truth_err, fmt='none', color='k', linewidth=2)
-    top.errorbar(
-        centers,
-        truth + D,
-        yerr=learned_err,
-        fmt='none',
-        color=ENSEMBLE_COLOR,
-        linewidth=2,
-    )
+    errors = (np.sqrt(sums['truth_var'][k, b]), np.sqrt(sums['learned_var'][k, b] + bias['s2'][k, b]))
     # the component's coefficient in the yield: events it adds per bin when its WC product equals 1
-    if labels[k] == 'sm':
-        top.set_ylabel('Events (SM)')
-    else:
-        top.set_ylabel(f'Events per unit {component_tex(labels[k])}')
-    band = np.where(empty, np.nan, noise / sm)
-    bottom.stairs(
-        band,
-        x,
-        baseline=-band,
-        fill=True,
-        color='#d9d9d9',
-        label=r'$\pm\sqrt{\mathrm{Var}_{\mathrm{MC}} + \mathrm{Var}_{\mathrm{seeds}}} / \lambda_{K_b}(\theta_{\mathrm{SM}})$',
+    ylabel = 'Events (SM)' if labels[k] == 'sm' else f'Events per unit {component_tex(labels[k])}'
+    lam = r'\lambda_{K_b}(\theta_{\mathrm{SM}})'
+    _closure_figure(
+        binning['edges'][f],
+        truth,
+        truth + D,
+        D,
+        np.sqrt(sums['mc_var'][k, b] + bias['s2'][k, b]),
+        sums['sm_yield'][b],
+        sums['mc_var'][k, b] <= 0,
+        np.nanmax(bias['Z'][k]),
+        _feature_label(binning['names'][f], feature_config),
+        ylabel,
+        {
+            'truth': 'truth',
+            'learned': r'$\sum_i w^s_i(\theta_0)\,\hat{\gamma}_{q,i}$',
+            'ratio': rf'$\Delta / {lam}$',
+            'band': rf'$\pm\sqrt{{\mathrm{{Var}}_{{\mathrm{{MC}}}} + \mathrm{{Var}}_{{\mathrm{{seeds}}}}}} / {lam}$',
+        },
+        outname,
+        errors=errors,
     )
-    bottom.plot(
-        centers[~empty], (D / sm)[~empty], 'o', color='k', label=r'$\Delta / \lambda_{K_b}(\theta_{\mathrm{SM}})$'
+
+
+def plot_nuisance_closure(sums, row, f, z_max, binning, outname, title, nominal=True, feature_config=None):
+    '''
+    Closure of one nuisance test in one feature: the learned yield hat w_b = sum_i w^s_i(theta_ref, 0) exp f_hat(x_i)
+    against the target w_b per bin K_b (top), and Delta_b relative to the nominal yield lambda_K_b(theta_ref, 0) with
+    the noise band sqrt(Var_MC + Var_seeds) (bottom). With nominal, lambda_K_b(theta_ref, 0) is drawn in the top panel
+    and the true shift (w_b - lambda_K_b) / lambda_K_b in the bottom one. Bins without tested events are hatched.
+
+    Args:
+        sums: {D, s2, mc_var, truth, sm_yield} [rows, B] of one test (nuisance_sums.npz, nuisance_validation.test_arrays)
+        row: row of the test (2 n + d for the networks, n for the parts)
+        f: feature index into binning['names']
+        z_max: largest Z of the test (nuisance_diagnostics.yml)
+        binning: {'names', 'edges', 'feature'} of the closure
+        outname: file to save the plot to
+        title: drawn above the top panel
+        nominal: draw the nominal yield and the true shift (for the networks of check 1, not the parts)
+        feature_config: contents of the features yml, for the feature's TeX label
+    '''
+    b = binning['feature'] == f
+    truth, D, sm = sums['truth'][row, b], sums['D'][row, b], sums['sm_yield'][row, b]
+    lam = r'\lambda_{K_b}(\theta_{\mathrm{ref}}, 0)'
+    _closure_figure(
+        binning['edges'][f],
+        truth,
+        truth + D,
+        D,
+        np.sqrt(sums['mc_var'][row, b] + sums['s2'][row, b]),
+        sm,
+        sm <= 0,
+        z_max,
+        _feature_label(binning['names'][f], feature_config),
+        'Events',
+        {
+            'truth': r'$w_b$',
+            'learned': r'$\hat{w}_b$',
+            'ratio': rf'$\Delta_b / {lam}$',
+            'band': rf'$\pm\sqrt{{\mathrm{{Var}}_{{\mathrm{{MC}}}} + \mathrm{{Var}}_{{\mathrm{{seeds}}}}}} / {lam}$',
+        },
+        outname,
+        nominal=(sm, rf'${lam}$') if nominal else None,
+        title=title,
     )
-    bottom.axhline(0, color='k', linestyle='--', linewidth=1)
-    # bins without events of the component: hatched in both panels
-    for i in np.flatnonzero(empty):
-        for ax in (top, bottom):
-            ax.axvspan(x[i], x[i + 1], facecolor='none', edgecolor='#9a9a9a', hatch='//', linewidth=0)
-    bottom.set_ylabel(r'$\Delta / \lambda_{K_b}(\theta_{\mathrm{SM}})$')
-    name = binning['names'][f]
-    # as on the x axis of the training's kinematic plots: label [unit]
-    if feature_config:
-        unit = feature_config[name].get('unit')
-        bottom.set_xlabel(feature_config[name]['label'] + (f' [{unit}]' if unit else ''))
-    else:
-        bottom.set_xlabel(name)
-    # equal-width bins labelled with the feature values at 6 evenly spaced edges, the first and last included
-    # (fewer if the feature has fewer edges); 3 significant digits, no exponent
-    tick = [np.format_float_positional(e, precision=3, unique=False, fractional=False, trim='-') for e in edges]
-    # a feature symmetric about 0 (e.g. an eta) gets 7 labels instead, the middle one at the point where it is 0
-    symmetric = edges[0] < 0 < edges[-1] and abs(edges[0] + edges[-1]) <= 0.05 * (edges[-1] - edges[0])
-    shown = np.unique(np.round(np.linspace(0, len(edges) - 1, min(7 if symmetric else 6, len(edges)))).astype(int))
-    positions, names = list(x[shown].astype(float)), [tick[i] for i in shown]
-    if symmetric and len(shown) == 7:
-        positions[3], names[3] = float(np.interp(0, edges, x)), '0'
-    bottom.set_xticks(positions, names)
-    # minor ticks on every bin edge, so major and minor ticks both sit on edges (shared by the top panel)
-    bottom.set_xticks(x, minor=True)
-    bottom.set_xlim(x[0], x[-1])
-    # the CMS label measures the text already on the figure, so the filter must be on before it is added
-    mathtext_log = logging.getLogger('matplotlib.mathtext')
-    mathtext_log.addFilter(_no_tex_mapping)
-    try:
-        mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=top)
-        # legend and Z_max where they cover the least of the lines and error bars (the ranges stay as they are)
-        sampled = [
-            np.c_[np.linspace(x[i], x[i + 1], 20), np.full(20, v[i])] for v in (truth, truth + D) for i in range(len(v))
-        ]
-        sampled += [
-            np.c_[np.full(20, x[i + 1]), np.linspace(v[i], v[i + 1], 20)]
-            for v in (truth, truth + D)
-            for i in range(len(v) - 1)
-        ]
-        sampled += [
-            np.c_[np.full(20, c), np.linspace(v - e, v + e, 20)]
-            for vals, errs in ((truth, truth_err), (truth + D, learned_err))
-            for c, v, e in zip(centers, vals, errs)
-        ]
-        z_max = np.nanmax(bias['Z'][k])
-        place_legend(top, np.concatenate(sampled), [(r'$Z_{max}$', f'{z_max:.1f}')], fontsize=20, beside=False)
-        fig.savefig(outname, bbox_inches='tight')
-    finally:
-        mathtext_log.removeFilter(_no_tex_mapping)
-    plt.close(fig)
 
 
 def network_tex(Theta, names, wcs, mask):
@@ -1766,4 +1901,340 @@ def plot_network_misclosure(misclosure, yield_ratio, network_tex, outname, notes
         fig.savefig(outname, bbox_inches='tight')
     finally:
         mathtext_log.removeFilter(_no_tex_mapping)
+    plt.close(fig)
+
+
+METHOD_NAMES = {'weight_shift': 'weight shift', 'kinematic_shift': 'kinematic shift'}
+METHOD_COLORS = {'weight_shift': ENSEMBLE_COLOR, 'kinematic_shift': '#eb6834'}
+DIRECTION_TEX = {'down': r'$\downarrow$', 'up': r'$\uparrow$'}
+DIRECTION_MARKERS = {'down': 'v', 'up': '^', 'part': 'o'}
+
+
+def plot_size_significance(panels, methods, z_threshold, outname, reference=None, n_labels=4, floor=1e-5, z_floor=0.1):
+    '''
+    Size against significance of the closure tests of the nuisance networks: the rms bias Delta_rms (a fraction of
+    lambda_K_b) against the largest Z over the network inputs, one panel per test, coloured by method, with triangles
+    for Down / Up and circles for the parts of the interpolation. The line at z_threshold marks the flagged tests;
+    rms biases below floor and Z below z_floor are drawn there. The n_labels largest rms biases among the flagged tests
+    of each panel are labelled, skipping a test that sits on an already labelled one.
+
+    Args:
+        panels: {panel title: {marker key: {nuisance: (max_Z, rms_bias)}}}, marker key 'down', 'up' or 'part'
+        methods: {nuisance: method}
+        z_threshold: flagging threshold
+        outname: file to save the plot to
+        reference: (label, rms bias) drawn as a dashed line in every panel, optional
+        n_labels: points labelled per panel
+        floor: smallest rms bias shown
+        z_floor: smallest Z shown
+    '''
+    fig, axes = plt.subplots(1, len(panels), figsize=(8 * len(panels), 8), sharex=True, sharey=True, squeeze=False)
+    for ax, (title, tests) in zip(axes[0], panels.items()):
+        flagged = []
+        for key, values in tests.items():
+            for nuisance, (z, rms) in values.items():
+                x, y = max(z, z_floor), max(rms, floor)
+                ax.scatter(
+                    x,
+                    y,
+                    marker=DIRECTION_MARKERS[key],
+                    s=90,
+                    color=METHOD_COLORS[methods[nuisance]],
+                    edgecolor='white',
+                    linewidth=1,
+                    zorder=3,
+                )
+                if z > z_threshold:
+                    label = nuisance if key == 'part' else f'{nuisance} {DIRECTION_TEX[key]}'
+                    flagged.append((y, x, label))
+        # labelled points at least 0.15 decades apart in rms bias or 0.5 decades in Z, so the labels do not overlap
+        labelled = []
+        for y, x, label in sorted(flagged, reverse=True):
+            near = [abs(np.log10(y / v)) < 0.15 and abs(np.log10(x / u)) < 0.5 for v, u in labelled]
+            if len(labelled) == n_labels or any(near):
+                continue
+            labelled.append((y, x))
+            ax.annotate(label, (x, y), xytext=(6, 6), textcoords='offset points', fontsize=14)
+        ax.axvline(z_threshold, color='#e34948', linewidth=2)
+        if reference is not None:
+            ax.axhline(max(reference[1], floor), color='#9a9a9a', linestyle='--', linewidth=2)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        # clear of the CMS label above the first panel
+        ax.set_title(title, fontsize=18, pad=40)
+        ax.set_xlabel(r'largest $Z$ over the network inputs')
+    axes[0, 0].set_ylabel(r'$\Delta_{\mathrm{rms}}$ (fraction of $\lambda_{K_b}$)')
+    # legend: method by colour, test by marker, and the reference line
+    handles = [Patch(color=METHOD_COLORS[m], label=METHOD_NAMES[m]) for m in METHOD_COLORS]
+    handles += [
+        Line2D([], [], marker=DIRECTION_MARKERS[k], linestyle='', color='#5a5a5a', markersize=10, label=text)
+        for k, text in (('down', 'Down'), ('up', 'Up'), ('part', 'part of the interpolation'))
+    ]
+    if reference is not None:
+        handles.append(Line2D([], [], color='#9a9a9a', linestyle='--', linewidth=2, label=reference[0]))
+    fig.legend(
+        handles=handles, fontsize=14, loc='upper center', bbox_to_anchor=(0.5, 0.0), ncol=len(handles), frameon=False
+    )
+    # smaller than the default so it fits above one 8 inch panel
+    mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=axes[0, 0], fontsize=18)
+    fig.savefig(outname, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_interpolation_yield(nu, yields, truth, truth_err, names, methods, outname, n_cols=6):
+    '''
+    Yield of every nuisance on its eras against nu, one panel per nuisance: the learned yield change
+    lambda(nu) / lambda(0) - 1 from the interpolation of <f_hat>_e (nuisance_validation.interpolation_yield), coloured
+    by method, and the true yield changes at nu = -1, +1 with their MC noise (the member scatter is not included).
+    Dotted lines at nu = +-1 mark where the interpolation turns linear. Panels follow the order of names, each with its
+    own y range.
+
+    Args:
+        nu: [G] values of nu
+        yields: [n_n, G] learned yield relative to nu = 0
+        truth, truth_err: [n_n, 2] true yield relative to nu = 0 at nu = -1, +1 (Down, Up), and its noise
+        names, methods: [n_n] nuisance names and methods
+        outname: file to save the plot to
+        n_cols: panels per row
+    '''
+    n_rows = -(-len(names) // n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 2.8 * n_rows), sharex=True, squeeze=False)
+    for ax, n in zip(axes.flat, range(len(names))):
+        ax.axhline(0, color='#d9d9d9', linewidth=1)
+        for edge in (-1, 1):
+            ax.axvline(edge, color='#9a9a9a', linestyle=':', linewidth=1)
+        ax.plot(nu, 100 * (yields[n] - 1), color=METHOD_COLORS[methods[n]], linewidth=2)
+        ax.errorbar(
+            [-1, 1],
+            100 * (truth[n] - 1),
+            yerr=100 * truth_err[n],
+            fmt='o',
+            color='k',
+            markersize=5,
+            linewidth=1.5,
+            zorder=3,
+        )
+        ax.set_title(names[n], fontsize=12)
+        ax.tick_params(labelsize=10)
+    for ax in axes.flat[len(names) :]:
+        ax.set_visible(False)
+    # x labels on the lowest panel of every column (above the empty slots of a short last row)
+    for column in range(n_cols):
+        filled = [r for r in range(n_rows) if r * n_cols + column < len(names)]
+        if filled:
+            axes[filled[-1], column].tick_params(labelbottom=True)
+            axes[filled[-1], column].set_xlabel(r'$\nu$', fontsize=14)
+    for ax in axes[:, 0]:
+        ax.set_ylabel(r'$\lambda(\nu) / \lambda(0) - 1$ [%]', fontsize=12)
+    handles = [
+        Line2D([], [], color=METHOD_COLORS[m], linewidth=2, label=f'interpolation ({METHOD_NAMES[m]})')
+        for m in METHOD_COLORS
+    ]
+    handles.append(Line2D([], [], marker='o', linestyle='', color='k', label=r'truth at $\nu = \pm 1$'))
+    fig.tight_layout()
+    fig.legend(
+        handles=handles,
+        loc='lower center',
+        ncol=len(handles),
+        fontsize=14,
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.0),
+    )
+    fig.savefig(outname, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_interpolation_shape(shape, names, methods, outname, n_sigma=3.0, floor=1e-5):
+    '''
+    Shape of the interpolation in nu of every nuisance (nuisance_validation.interpolation_shape), one row per nuisance
+    grouped by method. Left: the yield-weighted sizes <|f_hat^slope|> (filled) and <|f_hat^sym|> (open) on a log scale,
+    with the member noise <sqrt(Var_seeds(f_hat^sym))> as a grey bar; values below floor are drawn at floor. Right: the
+    yield fractions of events with a significant symmetric part (> n_sigma noise) where log r_hat(x; nu) is not
+    monotonic in nu and where f_hat^Up and f_hat^Down have the same sign.
+
+    Args:
+        shape: [n_n] dicts of interpolation_shape (nuisance_diagnostics.yml 'shape'), in the order of names
+        names, methods: [n_n] nuisance names and methods, rows from the top
+        outname: file to save the plot to
+        n_sigma: significance used for the fractions (config shape.n_sigma), for the label
+        floor: smallest size shown
+    '''
+
+    def values(key):
+        return np.array([np.nan if s[key] is None else s[key] for s in shape], dtype=float)
+
+    rows = np.arange(len(names))
+    slope, symmetry, noise = values('slope_size'), values('symmetry_size'), values('symmetry_noise')
+    fig, (left, right) = plt.subplots(
+        1,
+        2,
+        sharey=True,
+        figsize=(14, 0.32 * len(names) + 2),
+        gridspec_kw={'width_ratios': [3, 2], 'wspace': 0.08},
+    )
+    left.barh(
+        rows,
+        np.maximum(noise, floor) - floor,
+        left=floor,
+        height=0.6,
+        color='#d9d9d9',
+        label=r'$\langle\sqrt{\mathrm{Var}_{\mathrm{seeds}}(\hat{f}\,^{\mathrm{sym}})}\rangle$',
+    )
+    left.plot(
+        np.maximum(slope, floor),
+        rows,
+        'o',
+        color='k',
+        markersize=7,
+        label=r'$\langle|\hat{f}\,^{\mathrm{slope}}|\rangle$',
+    )
+    left.plot(
+        np.maximum(symmetry, floor),
+        rows,
+        'o',
+        markerfacecolor='white',
+        markeredgecolor='k',
+        markersize=7,
+        label=r'$\langle|\hat{f}\,^{\mathrm{sym}}|\rangle$',
+    )
+    left.set_xscale('log')
+    left.set_xlabel('yield-weighted mean', fontsize=16)
+    left.legend(fontsize=12, loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=3, frameon=False)
+    if np.isnan(noise).all():
+        left.text(0.02, 0.98, '1 member: no noise estimate', transform=left.transAxes, va='top', fontsize=12)
+    right.barh(rows - 0.17, values('non_monotonic'), height=0.34, color='k', label='not monotonic')
+    right.barh(
+        rows + 0.17,
+        values('same_sign'),
+        height=0.34,
+        color='#9a9a9a',
+        label=r'$\hat{f}\,^{\mathrm{Up}}$, $\hat{f}\,^{\mathrm{Down}}$ same sign',
+    )
+    right.set_xlim(0, 1)
+    right.set_xlabel(
+        rf'yield fraction ($|\hat{{f}}\,^{{\mathrm{{sym}}}}| > {n_sigma:g}\sqrt{{\mathrm{{Var}}_{{\mathrm{{seeds}}}}}}$)',
+        fontsize=16,
+    )
+    right.legend(fontsize=12, loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=1, frameon=False)
+    left.set_yticks(rows, names, fontsize=11)
+    left.set_ylim(len(names) - 0.5, -0.5)
+    # separator and names of the method groups
+    methods = np.asarray(methods)
+    where = blended_transform_factory(right.transAxes, right.transData)
+    for m in METHOD_NAMES:
+        inside = np.flatnonzero(methods == m)
+        if not len(inside):
+            continue
+        if inside[0] > 0:
+            for ax in (left, right):
+                ax.axhline(inside[0] - 0.5, color='k', linewidth=1)
+        right.text(
+            1.01, inside.mean(), METHOD_NAMES[m], transform=where, rotation=270, va='center', ha='left', fontsize=13
+        )
+    for ax in (left, right):
+        ax.grid(axis='x', color='#eeeeee', linewidth=0.8)
+        ax.set_axisbelow(True)
+    # silence only mathtext's notice about the sized delimiters of the square roots
+    mathtext_log = logging.getLogger('matplotlib.mathtext')
+    mathtext_log.addFilter(_no_tex_mapping)
+    try:
+        mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=left)
+        fig.savefig(outname, bbox_inches='tight')
+    finally:
+        mathtext_log.removeFilter(_no_tex_mapping)
+    plt.close(fig)
+
+
+def plot_rms_comparison(names, before, after, flagged, labels, outname, reference=None, floor=1e-5):
+    '''
+    Change of the rms bias Delta_rms (a fraction of lambda_K_b) of the nuisance networks between two closure tests,
+    one row per nuisance with Down above and Up below the row centre: the rms bias of the first test (open marker)
+    joined to that of the second (filled marker, ringed in red when the second test is flagged). Values below floor
+    are drawn at floor.
+
+    Args:
+        names: [n] nuisance names, rows from the top
+        before, after: [n, 2] rms bias of the first and second test, (Down, Up)
+        flagged: [n, 2] bool, the second test is flagged
+        labels: (label of the first test, label of the second test)
+        outname: file to save the plot to
+        reference: (label, rms bias) drawn as a dashed vertical line, optional
+        floor: smallest value shown
+    '''
+    rows = np.arange(len(names))
+    before, after = np.maximum(before, floor), np.maximum(after, floor)
+    flagged = np.asarray(flagged, dtype=bool)
+    fig, ax = plt.subplots(figsize=(11, 0.4 * len(names) + 2))
+    for d, (direction, offset) in enumerate((('down', -0.17), ('up', 0.17))):
+        y = rows + offset
+        ax.hlines(
+            y,
+            np.minimum(before[:, d], after[:, d]),
+            np.maximum(before[:, d], after[:, d]),
+            color='#9a9a9a',
+            linewidth=1.5,
+            zorder=1,
+        )
+        ax.plot(
+            before[:, d],
+            y,
+            DIRECTION_MARKERS[direction],
+            markerfacecolor='white',
+            markeredgecolor='k',
+            markersize=8,
+            linestyle='',
+            zorder=2,
+        )
+        ax.plot(after[:, d], y, DIRECTION_MARKERS[direction], color='k', markersize=8, linestyle='', zorder=3)
+        ring = flagged[:, d]
+        ax.plot(
+            after[ring, d],
+            y[ring],
+            'o',
+            markerfacecolor='none',
+            markeredgecolor='#e34948',
+            markersize=15,
+            markeredgewidth=2,
+            linestyle='',
+            zorder=4,
+        )
+    if reference is not None:
+        ax.axvline(max(reference[1], floor), color='#9a9a9a', linestyle='--', linewidth=2)
+    ax.set_xscale('log')
+    ax.set_yticks(rows, names, fontsize=12)
+    ax.set_ylim(len(names) - 0.5, -0.5)
+    ax.set_xlabel(r'$\Delta_{\mathrm{rms}}$ (fraction of $\lambda_{K_b}$)')
+    ax.grid(axis='x', color='#eeeeee', linewidth=0.8)
+    ax.set_axisbelow(True)
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker='o',
+            linestyle='',
+            markerfacecolor='white',
+            markeredgecolor='k',
+            markersize=8,
+            label=labels[0],
+        ),
+        Line2D([], [], marker='o', linestyle='', color='k', markersize=8, label=labels[1]),
+        Line2D([], [], marker='v', linestyle='', color='#5a5a5a', markersize=8, label='Down'),
+        Line2D([], [], marker='^', linestyle='', color='#5a5a5a', markersize=8, label='Up'),
+        Line2D(
+            [],
+            [],
+            marker='o',
+            linestyle='',
+            markerfacecolor='none',
+            markeredgecolor='#e34948',
+            markersize=12,
+            markeredgewidth=2,
+            label='flagged',
+        ),
+    ]
+    if reference is not None:
+        handles.append(Line2D([], [], color='#9a9a9a', linestyle='--', linewidth=2, label=reference[0]))
+    ax.legend(handles=handles, fontsize=12, loc='upper center', bbox_to_anchor=(0.5, -0.08), ncol=3, frameon=False)
+    mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=ax)
+    fig.savefig(outname, bbox_inches='tight')
     plt.close(fig)
