@@ -27,3 +27,12 @@ Referenced by the training config's `zero_terms` key; it depends on the samples,
 
 - `zero_terms`: list of WC pairs (names as in the config's `wcs`, any order within a pair) whose quadratic term is
   structurally zero; their columns of the `get_lower_tri` expansion are dropped
+- finding them: `topsbi.tools.data.find_zero_terms(coefs, wcs, lumi_per_event, features, n_bins=20, tol=1e-6)`
+  returns the list for a sample. Every feature column is cut into `n_bins` equal-count quantile bins; in each bin a
+  term's size is $\sum_i L |s_q(z_i)| / \sum_i L |s_{\rm SM}(z_i)|$ over the events in the bin, and a term is listed
+  only if its largest size over all bins of all features is below `tol`. A term that is small overall but large in
+  one region (a tail) is therefore kept. Structurally zero terms sit at the level of numerical noise in every bin,
+  far below the kept terms; if the smallest kept and largest dropped sizes are close, inspect the terms near `tol`
+  rather than trusting the cut.
+- every network of an ensemble must use the same `zero_terms` (see [`docs/ensemble.md`](../../docs/ensemble.md)):
+  find the list once per sample, before training, and regenerate it (and retrain) only if the samples change

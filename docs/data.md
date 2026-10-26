@@ -88,4 +88,6 @@ The reco_systematics analysis builds its data with ttbarEFT:
 per-chunk tensors from NanoAOD (features, structure constants, event identity, weight-systematic ratios), and
 [`analysis/combine_tensors.py`](https://github.com/TopEFT/ttbarEFT/blob/main/analysis/combine_tensors.py) merges
 them per variation, removes duplicate events, adds `w_ref` and makes the event-key train / validation split and
-`sample.yml`. Its v3 production is `/groups/klannon/cmcgrad2/data/reco_systematics_v3/SR_CHANNELS_2j3j_gen`.
+`sample.yml`. The processor's `--drop-wcs` fixes WCs to 0 at the reference point, and the combine step removes their
+columns from the structure constants; `sample.yml` then lists the WCs of the data (`wcs`) and those dropped
+(`dropped_wcs`). The current data are `/groups/klannon/cmcgrad2/data/reco_systematics_v4/SR_CHANNELS_2j3j_gen`.

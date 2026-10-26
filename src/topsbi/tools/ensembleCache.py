@@ -51,6 +51,23 @@ def quantile_binning(features, feature_config, nbins=20, names=None):
     }
 
 
+def bin_events(binning, features, feature_config):
+    """
+    Bins of other events in an existing binning (e.g. the shifted sample of a kinematic systematic), edge bins
+    taking the events outside the range, as in quantile_binning and merge_sparse.
+
+    Returns:
+        [F, M] bin of each event in each feature, offset into [0, n_bins) as binning['index']
+    """
+    index, offset = [], 0
+    for f, name in enumerate(binning['names']):
+        x = features[:, feature_config[name]['loc']].double().numpy()
+        edges = binning['edges'][f]
+        index.append(np.clip(np.searchsorted(edges, x, side='right') - 1, 0, len(edges) - 2) + offset)
+        offset += len(edges) - 1
+    return torch.from_numpy(np.stack(index))
+
+
 def merge_sparse(binning, features, feature_config, weights, min_neff=30):
     """
     Merge neighbouring bins of each feature until each holds at least min_neff effective events,

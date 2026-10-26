@@ -2,18 +2,44 @@ import numpy as np
 import os, torch, tqdm, yaml
 
 
-def find_zero_terms(coefs: torch.tensor, wcs: list, lumi_per_event: torch.tensor, tol: float = 1e-6):
+def find_zero_terms(
+    coefs: torch.tensor,
+    wcs: list,
+    lumi_per_event: torch.tensor,
+    features: torch.tensor,
+    n_bins: int = 20,
+    tol: float = 1e-6,
+):
     """
-    WC pairs whose structure constants s_q(z) contribute negligibly to the total yield.
+    WC pairs whose structure constants s_q(z) are negligible in every region of phase space.
 
-    Uses sum_i L |s_q(z_i)| / sum_i L |s_SM(z_i)| so every event counts with its weight and
-    positive/negative contributions cannot cancel.
+    Every feature column is cut into n_bins equal-count quantile bins K_b (fewer for discrete features). The size of
+    a term in a bin is sum_{i in K_b} L |s_q(z_i)| / sum_{i in K_b} L |s_SM(z_i)|, and a term is dropped if its
+    largest size over all bins of all features is below tol. Absolute values stop positive and negative
+    contributions from cancelling; the per-bin ratio keeps a term that is large only in a small region (a tail),
+    which an inclusive ratio dilutes. The largest bin ratio is never below the inclusive ratio, so this drops a
+    subset of the terms an inclusive criterion drops.
+
+    Args:
+        coefs: structure constants s_q(z) [n_events, n_q]
+        wcs: WC names in the order of coefs
+        lumi_per_event: L of each event's era
+        features: event features [n_events, n_features]; every column is binned
+        n_bins: quantile bins per feature
+        tol: threshold on the largest bin ratio
+    Returns:
+        list of [wc_i, wc_j] pairs (names as in zero_terms.yml)
     """
     names = ['sm'] + list(wcs)
-    w = lumi_per_event.to(coefs.dtype)[:, None] * coefs.abs()
-    rel = w.sum(0) / w[:, 0].sum()
+    w = lumi_per_event.to(torch.float64)[:, None] * coefs.to(torch.float64).abs()
+    largest = torch.zeros(w.shape[1], dtype=torch.float64)
+    for column in features.to(torch.float64).T.numpy():
+        edges = np.unique(np.quantile(column, np.linspace(0, 1, n_bins + 1)))
+        bins = torch.from_numpy(np.clip(np.searchsorted(edges, column, side='right') - 1, 0, max(len(edges) - 2, 0)))
+        sums = torch.zeros(max(len(edges) - 1, 1), w.shape[1], dtype=torch.float64).index_add_(0, bins, w)
+        largest = torch.maximum(largest, (sums / sums[:, :1]).max(0).values)
     rows, cols = torch.tril_indices(len(names), len(names))
-    return [[names[i], names[j]] for i, j, r in zip(rows.tolist(), cols.tolist(), rel.tolist()) if r < tol]
+    return [[names[i], names[j]] for i, j, r in zip(rows.tolist(), cols.tolist(), largest.tolist()) if r < tol]
 
 
 def load_zero_terms(config: dict):
@@ -84,10 +110,7 @@ def get_lower_tri(
     Returns:
         T(theta), length (n + 1)(n + 2) / 2
     """
-    if type(theta) != torch.tensor:
-        theta = torch.tensor(theta)
-    if theta.dtype != dtype:
-        theta = theta.to(dtype)
+    theta = torch.as_tensor(theta, dtype=dtype)
     outer = torch.outer(theta, theta)
     n = outer.shape[0]
     rows, cols = torch.tril_indices(n, n)
