@@ -1222,13 +1222,14 @@ def _q_plot_1d(ax, scans, arrays, shown):
             markeredgewidth=2,
             color=SCAN_COLORS[0],
             alpha=0.7,
+            clip_on=False,
             label=f'members ({len(members)})',
         )
     grid = arrays[f'{shown[0]}/grid'][:, 0]
     step = float(np.diff(np.sort(grid)).min()) if len(grid) > 1 else 0.0
     lo, hi = (min(inside) - step, max(inside) + step) if inside else (grid.min(), grid.max())
     ax.set_xlim(max(lo, grid.min()), min(hi, grid.max()))
-    ax.set_ylim(-0.05 * top, top)
+    ax.set_ylim(0, top)
     ax.set_xlabel(f'${wc_tex(poi)}$')
     ax.set_ylabel(r'$-2\Delta\log\mathcal{L}$')
     ax.legend(loc='best', fontsize=14)
