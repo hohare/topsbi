@@ -222,6 +222,39 @@ def test_background_rejects_swapped_samples(background_config):
         check_config({key: value for key, value in background_config.items() if key != 'background'})
 
 
+def test_balance_classes(background_config):
+    """balanced rows: equal class totals in train, test scaled by the same k; the loss minimum stays at log(w1 / w0)"""
+    import math
+
+    from topsbi.model.net import Model
+    from topsbi.train import balance_classes, check_config, load_training_data, loss_tensors
+
+    _, splits = load_training_data(background_config)
+    train, test = loss_tensors('labelled', splits['train']), loss_tensors('labelled', splits['test'])
+    (x, w, y), (_, w_test, y_test), shift = balance_classes(train, test)
+    assert torch.isclose(w[y == 0].sum(), w[y == 1].sum())
+    k = train[1][train[2] == 0].sum() / train[1][train[2] == 1].sum()
+    assert torch.allclose(w_test[y_test == 1], test[1][test[2] == 1] * k) and math.isclose(shift, float(torch.log(k)))
+    # one feature-free point: the minimum over a constant f_hat of the shifted loss is log(w1 / w0)
+    model = Model(22, 'background', 'cpu', None, 0)
+    model.logit_shift = shift
+    w0, w1 = 3.0, 0.2
+    f = torch.linspace(-6, 2, 8001)
+    loss = w0 * torch.nn.functional.softplus(f + shift) + w1 * k * torch.nn.functional.softplus(-(f + shift))
+    assert abs(float(f[loss.argmin()]) - math.log(w1 / w0)) < 2e-3
+    with pytest.raises(ValueError, match='balance_classes'):
+        check_config({**background_config, 'method': 'kinematic_shift', 'systematic': 'JES_X', 'direction': 'up',
+                      'balance_classes': True})
+
+
+def test_background_training_balanced(background_config, tmp_path):
+    from topsbi.train import main
+
+    main({**background_config, 'balance_classes': True})
+    performance = check_nuisance_outputs(tmp_path / 'background', paired=False)
+    assert performance['logit_shift'] > 0  # the synthetic background is the smaller class
+
+
 @pytest.mark.parametrize('method', ['eft', 'weight_shift', 'kinematic_shift', 'background'])
 def test_closure_inputs(method, train_config, nuisance_config, background_config):
     """closure_inputs gives closure_metrics' sample arguments for both data kinds"""

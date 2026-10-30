@@ -141,6 +141,8 @@ class Model:
             raise ValueError(f"method {method!r} needs a {expected} network: set the last activation to {last!r}")
         self.device = device
         self.method = method
+        # added to the network output inside the loss only (balance_classes in train.py); f_hat itself is unchanged
+        self.logit_shift = 0.0
         if self.method in SOFT_PLUS_METHODS:
             # soft+ cross entropy: w0 log(1 + e^f_hat) + w1 log(1 + e^-f_hat), minimised at e^f_hat = w1 / w0
             self.cost = torch.nn.BCEWithLogitsLoss()
@@ -168,9 +170,10 @@ class Model:
     def labelled_loss(self, features, weights, labels):
         """
         Weighted cross entropy of labelled rows: one row per event, label 0 for w^s(theta, 0) rows (nominal),
-        1 for w^s(theta, nu) rows (shifted).
+        1 for w^s(theta, nu) rows (shifted); for background trainings label 0 for the signal, 1 for the background.
 
-        Used directly by kinematic_shift, where the nominal and shifted samples are different events.
+        Used directly by kinematic_shift and background, where the two samples are different events. The loss takes
+        f_hat + logit_shift as its logit (0 unless the classes are balanced, see train.balance_classes).
         Args:
             features: inputs used to train the neural network
             weights: weight of every row
@@ -181,4 +184,4 @@ class Model:
         if not ((labels == 0) | (labels == 1)).all():
             raise ValueError('labels must be 0 (nominal) or 1 (shifted)')
         self.cost.weight = weights
-        return self.cost(self.net(features).squeeze(-1), labels)
+        return self.cost(self.net(features).squeeze(-1) + self.logit_shift, labels)
