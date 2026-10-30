@@ -5,7 +5,6 @@ What a training writes, its metrics and plots: [`docs/training.md`](../../docs/t
 
 - `animate_per_epoch`: how often (in epochs) a frame is added to the closure animations of `features_to_animate` (5 in the examples)
 - `background`: `background` only (required), root of the combined background sample (its `nominal/sample.yml` has `eft: false` and names the `process`)
-- `balance_classes`: `background` only, optional (default `false`): weight the background rows by $k = \sum w_0 / \sum w_1$ of the training split so both classes carry the same total weight, with $\hat f + \log k$ as the logit of the loss. The loss minimum stays at $\hat f = \log \hat r$, so the network output keeps its meaning; use it when a background that is much smaller than the signal comes out overconfident (too small $\hat r$ where the background is sparse)
 - `batchSize`: number of events to feed the network at once
 - `bootstrap`: if `true`, split `train.p` 75/25 into training and test sets; if `false`, load `train.p` and `test.p` separately. Ignored for a combined sample (see `data`)
 - `c0`, `c1`: `eft` only, the points $\theta_0$ (label 0) and $\theta_1$ (label 1): $n_{\rm wcs}+1$ values each, 1 (SM) followed by one value per WC in `wcs` order

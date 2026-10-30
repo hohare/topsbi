@@ -43,8 +43,6 @@ def check_config(config):
     missing = [key for key in required.get(config['method'], ()) if key not in config]
     if missing:
         raise KeyError(f"method {config['method']!r} needs {missing}")
-    if config.get('balance_classes') and config['method'] != 'background':
-        raise ValueError(f"'balance_classes' is for method 'background', not {config['method']!r}")
     if 'eras' in config and 'lumi' in config and len(config['eras']) != len(config['lumi']):
         raise ValueError(f"config 'eras' has {len(config['eras'])} names but 'lumi' {len(config['lumi'])} values")
     locs = []
@@ -160,34 +158,6 @@ def normalize_weights(kind, splits):
 def loss_tensors(kind, split):
     """tensors passed to the loss: (x, w0, w1) for paired data, labelled rows (x, w, y) otherwise"""
     return split['rows'] if kind == 'labelled' else split
-
-
-def balance_classes(train_tensors, test_tensors):
-    """
-    Class balancing of labelled rows (config 'balance_classes', background trainings): the label-1 rows of the train
-    and test loss tensors are weighted by k = sum w0 / sum w1 of the training rows, so both classes carry the same
-    total weight in the loss, and the loss takes f_hat + log k as its logit (Model.logit_shift). The weighted loss is
-    then minimised at f_hat = log(w1 / w0) per x, as without balancing, so f_hat and model.pt keep their meaning; only
-    how much the regions where the label-1 sample is sparse count in the fit changes. Closure metrics and plots use
-    the unscaled weights.
-
-    Args:
-        train_tensors: (features, weights, labels) of the training split (loss_tensors)
-        test_tensors: (features, weights, labels) of the test split
-    Returns:
-        train_tensors and test_tensors with the label-1 weights scaled by k, and log k
-    """
-    _, weights, labels = train_tensors
-    total0, total1 = weights[labels == 0].sum(), weights[labels == 1].sum()
-    if total0 <= 0 or total1 <= 0:
-        raise ValueError(f'balance_classes needs positive class totals, got {float(total0)} and {float(total1)}')
-    k = total0 / total1
-
-    def scaled(tensors):
-        x, w, y = tensors
-        return x, torch.where(y == 1, w * k, w), y
-
-    return scaled(train_tensors), scaled(test_tensors), float(torch.log(k))
 
 
 def epoch_batches(tensors, batch_size, generator):
@@ -434,10 +404,6 @@ def main(config):
     normalize_weights(kind, splits)
     train, test, holdout = splits['train'], splits['test'], splits['holdout']
     train_tensors, test_tensors = loss_tensors(kind, train), loss_tensors(kind, test)
-    logit_shift = 0.0
-    if config.get('balance_classes'):
-        train_tensors, test_tensors, logit_shift = balance_classes(train_tensors, test_tensors)
-        print(f'[INFO] classes balanced: background rows x {np.exp(logit_shift):.4g}, logit shift {logit_shift:+.4f}')
     train_x = nominal_features(kind, train)
     groups = closure_options(config)
     outside = [loc for loc in (groups['year_loc'], *groups['group_cols']) if not 0 <= loc < train_x.shape[1]]
@@ -455,7 +421,6 @@ def main(config):
     )
     # the network standardises its inputs with the training-set (nominal) statistics, which are saved in model.pt
     model.net.set_feature_normalization(*get_feature_normalization(train_x))
-    model.logit_shift = logit_shift
     # paired methods duplicate each event with weights w0 / w1; kinematic_shift has one labelled row per event
     loss_fn = model.labelled_loss if kind == 'labelled' else model.loss
     optimizer = torch.optim.Adam(model.net.parameters(), lr=config['learningRate'])
@@ -599,7 +564,6 @@ def main(config):
     if config['method'] == 'background':
         # the reference the ratio is learned against, to be checked against the c0 of the EFT ensemble it is used with
         performance.update(background_reference(config))
-        performance['logit_shift'] = round(logit_shift, 6)
     details = summary_plots(
         model.net,
         kind,
