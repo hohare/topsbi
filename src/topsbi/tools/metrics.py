@@ -229,8 +229,10 @@ def closure_metrics(
     the effect before any correction. 'auc' is the weighted AUC of f_hat between the two samples.
     (a) rate: one bin holding every event; estimates lambda(theta, nu) / lambda(theta, 0).
     (b) r_hat calibration: n_R_bins equal-count quantile bins R_b of f_hat from the nominal events.
-    (c) group closure: cells of era x njets (group_caps merged) x n_group_bins bins R_b inside each group; cells with
-        fewer than min_events nominal events are left out. Groups come from network inputs, so a calibrated network
+    (c) group closure: cells of era x njets (group_caps merged) x n_group_bins bins R_b inside each group, neighbouring
+        bins merged until the target has n_eff >= min_neff (merge_sparse_bins; a cell without target events has no
+        target variance to test against); cells with fewer than min_events reference events, or still below min_neff
+        (a group too sparse for one cell), are left out. Groups come from network inputs, so a calibrated network
         closes in every cell.
     (d) per-feature closure: each feature of features_config in its fine binning K_b, out-of-range values in the edge
         bins, merged to n_eff >= min_neff on the shifted sample (merge_sparse_bins, as the closure plots).
@@ -284,9 +286,19 @@ def closure_metrics(
     cell0, cell1, cells = np.full(len(x0), -1), np.full(len(x1), -1), []
     for g in np.unique(g0, axis=0):
         in0, in1 = np.flatnonzero((g0 == g).all(1)), np.flatnonzero((g1 == g).all(1))
+        # neighbouring R_b bins merged until the target has n_eff >= min_neff (as the per-feature bins): a cell without
+        # target events has no target variance, so any w_hat_b > 0 would be a large pull, whatever the network does;
+        # target values outside the edges count in the edge bins, as to_bins puts them
         q = quantile_edges(f_hat0[in0], n_group_bins)
+        q = merge_sparse_bins(np.clip(f_hat1[in1], q[0], q[-1]), w1[in1], q, min_neff)
+        q = q if len(q) > 1 else np.repeat(q, 2)  # a constant f_hat (edges [c, c]) merges to one edge: one bin again
         b0, b1 = to_bins(f_hat0[in0], q), to_bins(f_hat1[in1], q)
-        for j in np.flatnonzero(np.bincount(b0, minlength=len(q) - 1) >= min_events):
+        n_bins = len(q) - 1
+        # a group too sparse for one such cell keeps a cell below min_neff, which is left out
+        sum1 = np.bincount(b1, weights=w1[in1], minlength=n_bins)
+        sum1_sq = np.bincount(b1, weights=w1[in1] ** 2, minlength=n_bins)
+        n_eff1 = np.divide(sum1**2, sum1_sq, out=np.zeros(n_bins), where=sum1_sq > 0)
+        for j in np.flatnonzero((np.bincount(b0, minlength=n_bins) >= min_events) & (n_eff1 >= min_neff)):
             cell0[in0[b0 == j]], cell1[in1[b1 == j]] = len(cells), len(cells)
             cells.append((tuple(g.tolist()), int(j)))
     group = closure(cell0, cell1, len(cells))

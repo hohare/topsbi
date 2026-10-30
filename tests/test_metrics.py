@@ -169,6 +169,27 @@ def test_closure_metrics_detects_regional_bias(two_samples):
     assert details['group']['cols'] == (21, 19)  # the columns the cells were grouped by, for the plot labels
 
 
+def test_closure_metrics_merges_sparse_target_cells():
+    """
+    A target that is rare where r_hat is small: the reference x ~ N(0, 1) and the target x' ~ N(3.3, 1) with the same
+    yield, so r(x) = exp(3.3x - 3.3^2 / 2) exactly; 0.35 target events are expected in the lowest group bin and none
+    falls there. Unmerged, that bin is a pull of about 80 for the exact ratio (w_b = 0 against w_hat_b with only its MC
+    variance); merged with its neighbours until the target has n_eff >= 30, the exact ratio closes (detection of a
+    real bias with merged cells: test_closure_metrics_detects_regional_bias).
+    """
+    rng = np.random.default_rng(5)
+    n0, n1 = 60_000, 20_000
+    x0, x1 = np.zeros((n0, 22)), np.zeros((n1, 22))
+    x0[:, 0], x1[:, 0] = rng.normal(size=n0), rng.normal(3.3, 1, n1)
+    x0[:, 19] = x1[:, 19] = 2  # one era x njets group
+    w0, w1 = np.ones(n0), np.full(n1, n0 / n1)
+    i0, i1 = np.arange(n0), n0 + np.arange(n1)
+    f0, f1 = 3.3 * x0[:, 0] - 3.3**2 / 2, 3.3 * x1[:, 0] - 3.3**2 / 2
+    performance, details = closure_metrics(f0, (x0, w0, i0), f1, (x1, w1, i1), {})
+    assert len(details['group']['cells']) < 5  # the sparse low-r_hat bins merged
+    assert abs(performance['group_worst_pull']) < 4 and abs(performance['group_z']) < 4
+
+
 def test_closure_metrics_paired():
     """eft / weight_shift: the same events in both samples, w1 = w0 r with r scattering around r_hat"""
     rng = np.random.default_rng(4)
