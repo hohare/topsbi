@@ -183,8 +183,47 @@ def test_kinematic_shift_keeps_variation_eras(nuisance_config):
         load_nuisance_data(config)
 
 
-@pytest.mark.parametrize('method', ['eft', 'weight_shift', 'kinematic_shift'])
-def test_closure_inputs(method, train_config, nuisance_config):
+def test_background_training(background_config, tmp_path):
+    from topsbi.train import hypothesis, main
+
+    main(background_config)
+    performance = check_nuisance_outputs(tmp_path / 'background', paired=False)
+    assert performance['process'] == 'tW' and performance['reference'] == 'sm'
+    assert performance['reference_point'] == [1.0] + [0.0] * 16
+    assert hypothesis(background_config) == r'\mathrm{tW}'
+
+
+def test_background_data(background_config):
+    """signal rows labelled 0, background rows 1 with their negative weights kept; event indices disjoint"""
+    from topsbi.tools.data import load_background_data
+
+    splits = load_background_data(background_config)
+    for split in splits.values():
+        features, weights, labels = split['rows']
+        (x0, w0, i0), (x1, w1, i1) = split['nominal'], split['shifted']
+        assert torch.equal(features, torch.cat([x0, x1])) and torch.equal(weights, torch.cat([w0, w1]))
+        assert torch.equal(labels, torch.cat([torch.zeros(len(x0)), torch.ones(len(x1))]))
+        assert (w0 > 0).all() and (w1 < 0).any()
+        assert torch.equal(torch.cat([i0, i1]), torch.arange(len(x0) + len(x1)))
+    # train.p of each sample is split into train and test; validation.p of both is the holdout
+    assert len(splits['train']['nominal'][0]) + len(splits['test']['nominal'][0]) == 2000
+    assert len(splits['train']['shifted'][0]) + len(splits['test']['shifted'][0]) == 1000
+    assert len(splits['holdout']['nominal'][0]) == 1000 and len(splits['holdout']['shifted'][0]) == 500
+
+
+def test_background_rejects_swapped_samples(background_config):
+    from topsbi.tools.data import load_background_data
+    from topsbi.train import check_config
+
+    swapped = {**background_config, 'data': background_config['background'], 'background': background_config['data']}
+    with pytest.raises(ValueError, match='not a background sample'):
+        load_background_data(swapped)
+    with pytest.raises(KeyError, match='background'):
+        check_config({key: value for key, value in background_config.items() if key != 'background'})
+
+
+@pytest.mark.parametrize('method', ['eft', 'weight_shift', 'kinematic_shift', 'background'])
+def test_closure_inputs(method, train_config, nuisance_config, background_config):
     """closure_inputs gives closure_metrics' sample arguments for both data kinds"""
     import numpy as np
 
@@ -195,6 +234,8 @@ def test_closure_inputs(method, train_config, nuisance_config):
 
     if method == 'eft':
         config = train_config
+    elif method == 'background':
+        config = background_config
     else:
         config = {**nuisance_config, 'method': method, 'systematic': 'ISR' if method == 'weight_shift' else 'JES_X'}
     kind, splits = load_training_data(config)
@@ -209,7 +250,7 @@ def test_closure_inputs(method, train_config, nuisance_config):
         assert len(f0) == len(x)  # untrained networks give finite f_hat everywhere
         assert np.array_equal(f0, f1) and np.array_equal(x0, x1) and np.array_equal(i0, np.arange(len(x)))
     else:
-        assert kind == 'labelled' and method == 'kinematic_shift'
+        assert kind == 'labelled' and method in ('kinematic_shift', 'background')
         assert len(f1) == len(splits['test']['shifted'][0])  # every shifted row is kept
     closure_metrics(f0, (x0, w0, i0), f1, (x1, w1, i1), {})
 

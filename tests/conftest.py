@@ -134,9 +134,44 @@ def make_combined_sample(root, n_events: int):
             (root / name).mkdir(exist_ok=True)
             torch.save(torch.utils.data.TensorDataset(*tensors), root / name / f'{split}.p')
     # written by the combiner; marks the combined format for EFT training (is_combined)
-    (root / 'nominal' / 'sample.yml').write_text(yaml.safe_dump({'variation': 'nominal', 'reference': 'sm'}))
+    (root / 'nominal' / 'sample.yml').write_text(
+        yaml.safe_dump({'variation': 'nominal', 'reference': 'sm', 'reference_point': [1.0] + [0.0] * N_WCS})
+    )
     (root / 'nominal' / 'systematics.yml').write_text(
         yaml.safe_dump({'syst_ratio': ['ISR', 'FSR'], 'directions': ['Up', 'Down']})
+    )
+    return root
+
+
+def make_background_sample(root, n_events: int, process: str = 'tW'):
+    """
+    Small background sample in the combined format read by load_background_data: nominal/{train,validation}.p with
+    the nominal NUISANCE_COLUMNS, coefs nonzero only in the SM column (= w_ref), a feature-0 shape different from the
+    signal, 20% of the events with a negative weight, and the event_id numbering of make_combined_sample (different
+    processes can share MC event numbers); nominal/sample.yml with eft: false and the process.
+    """
+    (root / 'nominal').mkdir(parents=True, exist_ok=True)
+    for split, n, seed in (('train', n_events, 0), ('validation', n_events // 2, 1)):
+        features, coefs, ids = make_dataset(n, seed=10 + seed)[:]
+        features[:, 0] *= 0.8
+        gen = torch.Generator().manual_seed(200 + seed)
+        sign = torch.where(torch.rand(n, 1, generator=gen) < 0.2, -0.5, 1.0).double()
+        w_ref = 0.05 * coefs[:, :1] * sign
+        sm_only = torch.zeros_like(coefs)
+        sm_only[:, :1] = w_ref
+        event_id = torch.stack([
+            torch.ones(n, dtype=torch.int64),
+            torch.full((n,), seed, dtype=torch.int64),
+            torch.arange(n, dtype=torch.int64),
+            torch.zeros(n, dtype=torch.int64),
+        ], dim=1)
+        syst_ratio = torch.ones(n, 2, 2)
+        torch.save(
+            torch.utils.data.TensorDataset(features, sm_only, ids, event_id, syst_ratio, w_ref),
+            root / 'nominal' / f'{split}.p',
+        )
+    (root / 'nominal' / 'sample.yml').write_text(
+        yaml.safe_dump({'variation': 'nominal', 'reference': 'sm', 'process': process, 'eft': False})
     )
     return root
 
@@ -167,3 +202,11 @@ def nuisance_config(train_config, tmp_path):
             {'activation': 'None', 'in': 16, 'out': 1, 'type': 'Linear'},
         ],
     }
+
+
+@pytest.fixture
+def background_config(nuisance_config, tmp_path):
+    """Minimal background training config: the combined signal sample of nuisance_config against a tW sample."""
+    config = {key: value for key, value in nuisance_config.items() if key != 'direction'}
+    background = make_background_sample(tmp_path / 'tW', 1000)
+    return {**config, 'method': 'background', 'background': str(background), 'name': str(tmp_path / 'background')}

@@ -121,11 +121,24 @@ class RatioFit:
         self.mask = ~(self.Theta == 0).all(dim=0) & zero_term_mask(self.wcs, zero_terms)
         self.Theta = self.Theta[:, self.mask]
         self.finite = ~torch.isinf(self.R).any(0)
-        Gamma, self.residuals, self.rank, self.singular_values = torch.linalg.lstsq(
-            self.Theta, self.R[:, self.finite], driver='gelsd'
-        )
-        # lstsq returns the solution in an [n_networks, N_finite] buffer; keep only Gamma's rows
-        self.Gamma = Gamma[: self.Theta.shape[1]].clone()
+        if sm_reference:
+            # theta_0 = SM: r_hat(x; theta_SM) = T(theta_SM)[mask] Gamma = Gamma[0] (the SM term is the first kept
+            # column) is exactly 1, so Gamma[0] is fixed to 1 and the other rows solve Theta[:, 1:] Gamma[1:] =
+            # R - Theta[:, :1] in least squares; the SM row drops out (1 - 1 = 0 against a row of zeros)
+            rest, self.residuals, rank, self.singular_values = torch.linalg.lstsq(
+                self.Theta[:, 1:], self.R[:, self.finite] - self.Theta[:, :1], driver='gelsd'
+            )
+            # rank of the full Theta: the fixed SM column is independent of the others in the SM row
+            self.rank = rank + 1
+            self.Gamma = torch.vstack(
+                [torch.ones((1, rest.shape[1]), dtype=rest.dtype), rest[: self.Theta.shape[1] - 1]]
+            )
+        else:
+            Gamma, self.residuals, self.rank, self.singular_values = torch.linalg.lstsq(
+                self.Theta, self.R[:, self.finite], driver='gelsd'
+            )
+            # lstsq returns the solution in an [n_networks, N_finite] buffer; keep only Gamma's rows
+            self.Gamma = Gamma[: self.Theta.shape[1]].clone()
 
     def __call__(self, theta):
         """

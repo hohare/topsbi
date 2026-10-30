@@ -332,6 +332,37 @@ def kinematic_shift_sample(nominal: list, shifted: list, config: dict):
     }
 
 
+def background_sample(signal: list, background: list, config: dict):
+    """
+    Two-sample data of a background training: the signal at its reference point theta_ref (label 0; theta_g for a
+    sample combined at the generation point) and the sample of one background process p (label 1), so the learned
+    ratio is r_hat(x; p) = f_p(x) / f_S(x; theta_ref).
+
+    The two samples are different processes, so no event is in both: the event index i runs over the signal rows
+    first and the background rows after them.
+    Args:
+        signal: nominal tensors of the signal sample combined at theta_ref (load_combined)
+        background: nominal tensors of the background sample (load_combined)
+        config: dictionary with 'lumi' and 'device'
+    Returns:
+        {'rows': (features, weights, labels) for Model.labelled_loss, label 0 signal / 1 background,
+         'nominal': (x, w0, i0) of the signal and 'shifted': (x_p, w1, i1) of the background for plots and metrics,
+         with w0 = w^s(theta_ref), w1 = L_era w_ref x 1000 of the background (negative weights kept) and i0 / i1
+         disjoint event indices}
+    """
+    x = dict(zip(NUISANCE_COLUMNS['nominal'], signal))['features']
+    x_p = dict(zip(NUISANCE_COLUMNS['nominal'], background))['features']
+    w0, w1 = sample_weight(signal, 'nominal', config), sample_weight(background, 'nominal', config)
+    i0 = torch.arange(len(w0))
+    i1 = torch.arange(len(w0), len(w0) + len(w1))
+    labels = torch.cat([torch.zeros_like(w0), torch.ones_like(w1)])
+    return {
+        'rows': (torch.cat([x, x_p]), torch.cat([w0, w1]), labels),
+        'nominal': (x, w0, i0),
+        'shifted': (x_p, w1, i1),
+    }
+
+
 def _select(tensors: list, mask: torch.tensor):
     """rows of every loaded column (None columns stay None)"""
     return [None if t is None else t[mask] for t in tensors]
@@ -435,6 +466,75 @@ def load_nuisance_data(config: dict):
             out['train'] = build(_select(nominal, ~test_nominal), _select(shifted, ~test_shifted))
             out['test'] = build(_select(nominal, test_nominal), _select(shifted, test_shifted))
     return out
+
+
+def load_background_data(config: dict):
+    """
+    Train / test / holdout data of a background training (method 'background').
+
+    The signal sample is the nominal directory of config['data'], combined at its reference point theta_ref (theta_g
+    for a sample combined at the generation point); the background sample is the nominal directory of
+    config['background'], a sample whose sample.yml has eft: false. Each train.p is split into train and test (early
+    stopping) by event_split with the training seed, so the signal test events are those of the EFT and nuisance
+    trainings with the same seed; validation.p of both samples is the holdout.
+
+    Args:
+        config: dictionary with 'data', 'background', 'seed', 'lumi', 'device' (optional 'year_loc', default 21)
+    Returns:
+        {'train', 'test', 'holdout'}: background_sample dicts
+    """
+    specs = {}
+    for key in ('data', 'background'):
+        path = f'{config[key]}/nominal/sample.yml'
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"config {key!r}: no combined sample in {config[key]} (missing {path})")
+        with open(path) as f:
+            specs[key] = yaml.safe_load(f)
+    if specs['background'].get('eft', True):
+        raise ValueError(f"config 'background': {config['background']} is not a background sample (sample.yml eft)")
+    if specs['data'].get('eft') is False:
+        raise ValueError(f"config 'data': {config['data']} is a background sample, expected the signal")
+    need = ('features', 'ids', 'event_id', 'w_ref')
+    year_loc = config.get('year_loc', 21)
+
+    def build(signal, background):
+        sample = background_sample(signal, background, config)
+        return {key: tuple(t.to(config['device']) for t in value) for key, value in sample.items()}
+
+    # split on the CPU (event_split hashes numpy arrays), then move to the device
+    signal = load_combined(f"{config['data']}/nominal/train.p", 'nominal', need)
+    background = load_combined(f"{config['background']}/nominal/train.p", 'nominal', need)
+    test_signal = event_split(signal, 'nominal', config['seed'], year_loc=year_loc)
+    test_background = event_split(background, 'nominal', config['seed'], year_loc=year_loc)
+    if not test_signal.any() or not test_background.any():
+        raise ValueError(f"empty test split in {config['data']} or {config['background']}: too few events")
+    holdout = [load_combined(f'{config[key]}/nominal/validation.p', 'nominal', need) for key in ('data', 'background')]
+    return {
+        'train': build(_select(signal, ~test_signal), _select(background, ~test_background)),
+        'test': build(_select(signal, test_signal), _select(background, test_background)),
+        'holdout': build(*holdout),
+    }
+
+
+def background_reference(config: dict):
+    """
+    Process and reference point of a background training, from the sample.yml of its two samples.
+
+    Args:
+        config: dictionary with 'data' (signal sample) and 'background' (background sample)
+    Returns:
+        {'process': the background process p, 'reference': name of theta_ref ('gen' or 'sm'), 'reference_point':
+         theta_ref (SM-inclusive) the signal was combined at}
+    """
+    with open(f"{config['data']}/nominal/sample.yml") as f:
+        signal = yaml.safe_load(f)
+    with open(f"{config['background']}/nominal/sample.yml") as f:
+        background = yaml.safe_load(f)
+    return {
+        'process': background['process'],
+        'reference': signal['reference'],
+        'reference_point': [float(c) for c in signal['reference_point']],
+    }
 
 
 def is_combined(data: str):

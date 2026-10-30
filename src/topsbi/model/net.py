@@ -12,7 +12,7 @@ DEFAULT_NETWORK = [
 # EFT methods, trained with binary cross entropy; their networks output the score s_hat and need a Sigmoid last layer
 EFT_METHODS = ('eft',)
 # methods trained with the soft+ loss; their networks output f_hat = log r_hat and need a linear last layer
-SOFT_PLUS_METHODS = ('weight_shift', 'kinematic_shift')
+SOFT_PLUS_METHODS = ('weight_shift', 'kinematic_shift', 'background')
 
 
 def create_model(n_features, config):

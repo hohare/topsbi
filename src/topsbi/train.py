@@ -13,6 +13,8 @@ from topsbi.tools.data import (
     sample_bootstrap,
     get_feature_normalization,
     load_nuisance_data,
+    load_background_data,
+    background_reference,
     is_combined,
     load_eft_combined,
 )
@@ -23,20 +25,24 @@ from threadpoolctl import threadpool_limits
 
 # config keys every nuisance training needs
 NUISANCE_KEYS = ('data', 'systematic', 'direction', 'lumi', 'seed')
+# nuisance methods (soft+ loss on the nominal and a varied sample of the signal)
+NUISANCE_METHODS = ('weight_shift', 'kinematic_shift')
+# config keys every background training needs: the signal sample (data) and the background sample
+BACKGROUND_KEYS = ('data', 'background', 'lumi', 'seed')
 
 
 def check_config(config):
     """
-    Raise before loading anything if the method is missing or unknown, a nuisance training misses a key, or the
-    optional 'eras', 'closure_groups' or 'threads' are malformed.
+    Raise before loading anything if the method is missing or unknown, a nuisance or background training misses a
+    key, or the optional 'eras', 'closure_groups' or 'threads' are malformed.
     """
     methods = EFT_METHODS + SOFT_PLUS_METHODS
     if config.get('method') not in methods:
         raise ValueError(f"config 'method' must be one of {methods}, got {config.get('method')!r}")
-    if config['method'] in SOFT_PLUS_METHODS:
-        missing = [key for key in NUISANCE_KEYS if key not in config]
-        if missing:
-            raise KeyError(f"method {config['method']!r} needs {missing}")
+    required = {**{method: NUISANCE_KEYS for method in NUISANCE_METHODS}, 'background': BACKGROUND_KEYS}
+    missing = [key for key in required.get(config['method'], ()) if key not in config]
+    if missing:
+        raise KeyError(f"method {config['method']!r} needs {missing}")
     if 'eras' in config and 'lumi' in config and len(config['eras']) != len(config['lumi']):
         raise ValueError(f"config 'eras' has {len(config['eras'])} names but 'lumi' {len(config['lumi'])} values")
     locs = []
@@ -94,9 +100,12 @@ def load_training_data(config):
     EFT methods on a combined sample (nominal directory with sample.yml): load_eft_combined (event_split, holdout
     config['holdout'] or validation.p); 'bootstrap' is ignored. Other EFT data: train.p (bootstrap split or test.p)
     and the optional config['holdout'], through prepare_weights.
-    Nuisance methods: load_nuisance_data (event_split, holdout = validation.p); 'bootstrap' and 'holdout' are ignored.
+    Nuisance methods: load_nuisance_data (event_split, holdout = validation.p); background: load_background_data
+    (event_split of the signal and the background sample, holdout = validation.p of both); for both 'bootstrap' and
+    'holdout' are ignored.
     Returns:
-        kind: 'paired' ({split: (x, w0, w1)}) or 'labelled' ({split: kinematic_shift_sample dict})
+        kind: 'paired' ({split: (x, w0, w1)}) or 'labelled' ({split: kinematic_shift_sample or background_sample
+            dict})
         splits: {'train', 'test', 'holdout'}; holdout is None for EFT methods without config['holdout']
     """
     if config['method'] in SOFT_PLUS_METHODS:
@@ -106,6 +115,8 @@ def load_training_data(config):
                     f"[WARNING] {key!r} is ignored for {config['method']}: "
                     "train/test come from event_split, the holdout is validation.p"
                 )
+        if config['method'] == 'background':
+            return 'labelled', load_background_data(config)
         kind = 'labelled' if config['method'] == 'kinematic_shift' else 'paired'
         return kind, load_nuisance_data(config)
 
@@ -206,8 +217,13 @@ def closure_inputs(net, kind, split):
 
 
 def hypothesis(config):
-    """TeX of the hypothesis in the closure-plot labels: theta, nu for nuisance trainings, theta for eft"""
-    return r'\theta,\nu' if config['method'] in SOFT_PLUS_METHODS else r'\theta'
+    """
+    TeX of the hypothesis in the closure-plot labels: theta, nu for nuisance trainings, the background process p for
+    background trainings, theta for eft
+    """
+    if config['method'] == 'background':
+        return rf"\mathrm{{{background_reference(config)['process']}}}"
+    return r'\theta,\nu' if config['method'] in NUISANCE_METHODS else r'\theta'
 
 
 def plot_luminosity(config, x):
@@ -532,17 +548,22 @@ def main(config):
     # final metrics on data not used for training, early stopping or the scheduler
     if holdout is not None:
         evaluation = holdout
-        source = (
-            f'{config["data"]}/<nominal, variation>/validation.p'
-            if config['method'] in SOFT_PLUS_METHODS
-            else config.get('holdout') or f'{config["data"]}/validation.p'
-        )
+        if config['method'] == 'background':
+            source = f'{config["data"]}/nominal/validation.p and {config["background"]}/nominal/validation.p'
+        elif config['method'] in NUISANCE_METHODS:
+            source = f'{config["data"]}/<nominal, variation>/validation.p'
+        else:
+            source = config.get('holdout') or f'{config["data"]}/validation.p'
         print(f"[INFO] final metrics on holdout {source}")
     else:
         evaluation = test
         print("[WARNING] no holdout given: final metrics use the early-stopping test split and are optimistic")
 
     lumi = plot_luminosity(config, nominal_features(kind, evaluation).cpu().numpy())
+    performance = {'best_epoch': best_epoch, 'best_test_loss': round(best_test_loss, 6)}
+    if config['method'] == 'background':
+        # the reference the ratio is learned against, to be checked against the c0 of the EFT ensemble it is used with
+        performance.update(background_reference(config))
     details = summary_plots(
         model.net,
         kind,
@@ -554,7 +575,7 @@ def main(config):
         lr_history,
         features_config,
         lumi=lumi,
-        performance={'best_epoch': best_epoch, 'best_test_loss': round(best_test_loss, 6)},
+        performance=performance,
     )
     # per-feature closure of the final network, from the same closure_metrics run as performance.yml
     for feature, params in features_config.items():

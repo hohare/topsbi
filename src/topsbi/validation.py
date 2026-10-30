@@ -676,11 +676,13 @@ def write_results(
     features = binning['names']
     components = {}
     for k, label in enumerate(labels):
+        # a component closed exactly by construction (the SM term when theta_0 = SM) has no Z in any feature
+        closed = bool(np.isnan(bias['Z'][k]).all())
         entry = {
             'kind': kinds[k],
             'flagged': k in flagged,
-            'max_Z': float(np.nanmax(bias['Z'][k])),
-            'worst_feature': features[int(np.nanargmax(bias['Z'][k]))],
+            'max_Z': None if closed else float(np.nanmax(bias['Z'][k])),
+            'worst_feature': None if closed else features[int(np.nanargmax(bias['Z'][k]))],
             'rms_bias': float(np.nanmax(bias['rms_bias'][k])),
             'Z': {f: float(z) for f, z in zip(features, bias['Z'][k])},
             'constrained': bool(np.isfinite(sigma0[k])),
