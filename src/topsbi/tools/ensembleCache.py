@@ -181,7 +181,10 @@ class SeedCollector:
         os.makedirs(self.tmp)
 
     def __call__(self, seed, fit):
-        paths = self.seeds[seed]['networks'] + [self.seeds[seed]['sm']]
+        # network configs in the row order of Theta and R: the networks, then the SM network; a seed trained against
+        # theta_0 = SM has no SM network and its exact last row is named 'sm', the name an SM network gets
+        sm = self.seeds[seed].get('sm')
+        paths = self.seeds[seed]['networks'] + ([] if sm is None else [sm])
         base = os.path.commonpath([os.path.dirname(p) for p in paths])
         d = f'{self.tmp}/seed_{seed}'
         os.makedirs(d)
@@ -193,16 +196,20 @@ class SeedCollector:
             np.save(f'{d}/residuals.npy', fit.residuals.numpy())
         # R: every network's ratio for every event (inf where a network diverged; filter marks the usable events)
         np.save(f'{d}/ratios.npy', fit.R.numpy())
-        names = [os.path.relpath(os.path.dirname(p), base) for p in paths]
+        names = [os.path.relpath(os.path.dirname(p), base) for p in paths] + (['sm'] if sm is None else [])
         np.savez(f'{d}/network.npz', Theta=fit.Theta.numpy(), networks=np.array(names))
 
 
 def model_hashes(seeds):
-    """sha256 of the model.pt of every network (SM last), per seed: {seed: [hash, ...]} in config['seeds'] order."""
+    """
+    sha256 of the model.pt of every network (SM last; none for a seed without an SM network, theta_0 = SM), per seed:
+    {seed: [hash, ...]} in config['seeds'] order.
+    """
     hashes = {}
     for seed, networks in seeds.items():
         hashes[seed] = []
-        for path in networks['networks'] + [networks['sm']]:
+        sm = networks.get('sm')
+        for path in networks['networks'] + ([] if sm is None else [sm]):
             with open(path) as f:
                 name = yaml.safe_load(f)['name']
             with open(f'{name}/model.pt', 'rb') as f:

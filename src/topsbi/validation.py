@@ -935,7 +935,9 @@ def main(config_path, refit=False):
     design = cache.network(cache.seeds[0])
     Theta, names = design['Theta'].astype(np.float64), list(design['networks'])
     paths = cache.manifest['seeds'][cache.seeds[0]]
-    paths = paths['networks'] + [paths['sm']]
+    # one config per row of Theta, SM last; None for the exact SM row of a seed trained against theta_0 = SM (no
+    # network there, so it is never dropped or retrained)
+    paths = paths['networks'] + [paths.get('sm')]
     extra = []
     for n in drop:
         with open(paths[names.index(n)]) as f:

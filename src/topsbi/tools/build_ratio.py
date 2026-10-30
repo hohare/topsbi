@@ -61,9 +61,10 @@ class NetworkRatio:
 
 class RatioFit:
     """
-    One seed's ensemble: the networks trained at points theta_1^(n) (and the SM network) give the matrix of ratios R,
-    one row r_hat(x; theta_1^(n)) per network, and Theta, one row T(theta_1^(n))[mask] per network. The per-event
-    quadratic coefficients Gamma solve Theta Gamma = R in least squares, so r_hat(x; theta) = T(theta)[mask] Gamma.
+    One seed's ensemble: the networks trained at points theta_1^(n) (and the SM network, or an exact row of ones when
+    theta_0 is the SM) give the matrix of ratios R, one row r_hat(x; theta_1^(n)) per network, and Theta, one row
+    T(theta_1^(n))[mask] per network. The per-event quadratic coefficients Gamma solve Theta Gamma = R in least
+    squares, so r_hat(x; theta) = T(theta)[mask] Gamma.
     """
 
     def __init__(
@@ -75,11 +76,12 @@ class RatioFit:
         Fit Gamma for one seed.
 
         Args:
-            config: dictionary with 'sm' (SM network config), 'networks' (network configs) and 'features'
+            config: dictionary with 'sm' (SM network config, or None when the networks are trained against
+                theta_0 = SM: then r_hat(x; theta_SM) = 1 exactly), 'networks' (network configs) and 'features'
             features: non-normalized features x to be evaluated by the networks
         Attributes:
             Theta: [n_networks, K] T(theta_1^(n)) of every network, SM last, kept columns only
-            R: [n_networks, N] r_hat of every network for every event
+            R: [n_networks, N] r_hat of every network for every event, SM last (ones when theta_0 is the SM)
             mask: kept columns of T(theta): not zero for every network and not a listed zero term
             finite: [N] events where every network's r_hat is finite
             Gamma: [K, N_finite] least-squares coefficients; residuals, rank, singular_values from lstsq
@@ -89,12 +91,19 @@ class RatioFit:
         # filled row by row: no long-lived per-network tensors between the evaluation temporaries, so the heap does
         # not fragment (fitprobe, ensemble_validation diary)
         self.R = torch.empty((len(self.config['networks']) + 1, features.shape[0]))
-        if 'sm' in config.keys():
+        sm_reference = self.config.get('sm') is None
+        if sm_reference:
+            # theta_0 = SM: no SM network, its row of R is exactly one; WCs and zero terms from the first network
+            with open(self.config['networks'][0]) as f:
+                reference = yaml.safe_load(f)
+            self.R[-1] = 1.0
+        else:
             sm_network = NetworkRatio(self.config['sm'], len(self.config['features']), self.config['device'])
-            self.wcs = sm_network.config['wcs']
+            reference = sm_network.config
             self.R[-1] = sm_network(features)
-
-        zero_terms = load_zero_terms(sm_network.config)
+        self.wcs = reference['wcs']
+        zero_terms = load_zero_terms(reference)
+        sm = [1.0] + [0.0] * len(self.wcs)
 
         def same(terms):
             return {tuple(sorted(p)) for p in terms} == {tuple(sorted(p)) for p in zero_terms}
@@ -102,10 +111,12 @@ class RatioFit:
         for i, network_yaml in tqdm.tqdm(enumerate(self.config["networks"]), total=len(self.config['networks'])):
             network = NetworkRatio(network_yaml, len(self.config['features']), self.config['device'])
             if network.config['wcs'] != self.wcs or not same(load_zero_terms(network.config)):
-                raise ValueError(f'{network_yaml} uses different wcs or zero_terms than the SM network')
+                raise ValueError(f'{network_yaml} uses different wcs or zero_terms than the reference network')
+            if sm_reference and [float(c) for c in network.config['c0']] != sm:
+                raise ValueError(f'{network_yaml} is not trained against theta_0 = SM, but the seed has no SM network')
             self.Theta += [get_lower_tri(network.config['c1'])]
             self.R[i] = network(features)
-        self.Theta += [get_lower_tri([1] + [0] * len(self.wcs))]
+        self.Theta += [get_lower_tri(sm)]
         self.Theta = torch.vstack(self.Theta)
         self.mask = ~(self.Theta == 0).all(dim=0) & zero_term_mask(self.wcs, zero_terms)
         self.Theta = self.Theta[:, self.mask]
