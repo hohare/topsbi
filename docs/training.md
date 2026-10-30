@@ -49,7 +49,7 @@ Each `*_chi2_ndf` is $\Delta^T \mathrm{Cov}^+ \Delta / \mathrm{ndf}$, about 1 fo
 | `auc` | weighted AUC between the reference and target samples; separation power, blind to calibration | no reference value |
 | `rate_closure`, `rate_pull` | $\sum \hat w / \sum w - 1$ over all events (signed normalisation misclosure) and its pull | 0, about $\pm 1$ |
 | `r_chi2_ndf`, `r_ndf`, `r_z`, `r_rms_bias`, `r_worst_pull` | calibration in 50 equal-count bins $R_b$ of $\hat f = \log \hat r$ | 1, -, 0, 0, about $\pm 3$ |
-| `group_chi2_ndf`, `group_ndf`, `group_z`, `group_rms_bias`, `group_worst_pull` | cells of the group columns (`closure_groups`) x 5 bins $R_b$ (cells with >= 200 reference events); catches miscalibration in regions of the inputs that cancels within the bins $R_b$ | 1, -, 0, 0, about $\pm 3$ |
+| `group_chi2_ndf`, `group_ndf`, `group_z`, `group_rms_bias`, `group_worst_pull` | cells of the group columns (`closure_groups`) x 5 bins $R_b$ (neighbouring bins merged to a target $n_{\rm eff} \geq 30$; cells with >= 200 reference events); catches miscalibration in regions of the inputs that cancels within the bins $R_b$ | 1, -, 0, 0, about $\pm 3$ |
 | `feature_chi2_ndf`, `feature_rms_bias` | per feature, in its `features.yml` binning $K_b$ merged to $n_{\rm eff} \ge 30$ | 1, 0 per feature |
 | `feature_worst`, `feature_worst_pull` | the feature with the largest $\chi^2/\mathrm{ndf}$ and its largest bin pull, for diagnosis | - |
 | `r_pull`, `r_pull_err` | in the bins $R_b$: mean $\lvert\Delta_b\rvert / \sqrt{\mathrm{Cov}_{bb}}$ minus $\sqrt{2/\pi}$ (its value for standard normal pulls); robust to a single outlying bin | 0 within about $2\times$`r_pull_err` |
@@ -65,7 +65,7 @@ Group closure is only defined for groups built from network inputs: grouping by 
 
 - **Features, bins $K_b$.** Each feature starts from `nbins` equal bins between `min` and `max` (`features.yml`); neighbouring bins are merged until each holds at least 30 effective events of the target sample, $n_{\rm eff} = (\sum w)^2 / \sum w^2$ (`merge_sparse_bins`, summed in float64 so the bins do not depend on the CPU). Sparse tails therefore end up in wider bins instead of noisy ones. Events outside `[min, max]` are put into the first and last bins, so the range should contain nearly all events (see the `min` / `max` keys).
 - **Learned ratio, bins $R_b$.** 50 equal-count bins of $\hat f = \log \hat r$, with edges from the reference sample; target events outside them go into the edge bins.
-- **Groups.** The group columns (`closure_groups`) x 5 bins $R_b$ inside each group, keeping cells with >= 200 reference events. The group columns must be network inputs. The default suits this analysis's layout: the era (`year_loc`) and njets (column 19) with values >= 4 merged; set `closure_groups` for other data.
+- **Groups.** The group columns (`closure_groups`) x 5 bins $R_b$ inside each group, neighbouring bins merged until the target sample has $n_{\rm eff} \geq 30$ (a cell without target events has nothing to test against), keeping cells with >= 200 reference events. The group columns must be network inputs. The default suits this analysis's layout: the era (`year_loc`) and njets (column 19) with values >= 4 merged; set `closure_groups` for other data.
 
 The numbers of bins and the thresholds (50 bins $R_b$, 5 per group, 200 reference events per cell, $n_{\rm eff} \ge 30$) are defaults of `closure_metrics`, not configuration keys.
 
