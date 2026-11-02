@@ -26,6 +26,7 @@ SCAN_KEYS = (
     'box',
     'target',
     'nu_obs',
+    'theta_base',
     'ratio',
     'rate',
     'profile_wcs',
@@ -654,6 +655,7 @@ def scan(
     theta_t=None,
     selection_wcs=(),
     keep=None,
+    theta_base=None,
 ):
     """
     Likelihood scan of one or two WCs (pois) on a grid: at every grid point the pois are fixed and the profiled WCs and
@@ -664,17 +666,18 @@ def scan(
     fixed at theta_t (warm-started from the nearest grid fit). Events: the NLL takes the log of r_hat for a learned
     ratio and of w^s for a truth ratio (the rate only sums them). The selection keeps
     the events where that quantity is positive for every Gamma in Gammas (learned ratio) over the box of the moving WCs
-    (the pois, the profiled WCs and selection_wcs; the other WCs at 0): exactly when at most two WCs move, and
+    (the pois, the profiled WCs and selection_wcs; the other WCs at theta_base): exactly when at most two WCs move, and
     conservatively when more move, so that every fit inside the box stays finite (positive_events); keep gives the
     initial selection instead. The visited points of the fits are checked too; when they remove events the scan is
     repeated on the smaller selection (at most max_selections times). A warm start whose NLL is not finite is recorded
-    as visited, so the next pass removes those events, and the fit starts from the profiled WCs at 0 instead
+    as visited, so the next pass removes those events, and the fit starts from the profiled WCs at theta_base instead
     (start_fallbacks counts them in the last pass). For one poi, the region q < chi2 quantile(cl, 1) at each confidence
     level cl is found on the grid points and the best fit: every run of consecutive points below the level is one
     segment, its ends found by brentq on the profiled q between the last point below and the next point above (the
     stored q at those two points, fits between them warm-started from the nearer one; the best fit counts as a point)
     (None where the run reaches the grid edge); segments lists them all, intervals the one containing the minimum. Other WCs
-    not profiled stay at 0; nuisances not profiled stay at nu_obs (0 by default).
+    not profiled stay at theta_base (0 by default), where the profiled WCs and the best fit also start; nuisances not
+    profiled stay at nu_obs (0 by default).
 
     Args:
         inputs: load_inputs result
@@ -697,12 +700,14 @@ def scan(
         theta_t: [n_wcs] target WC point (its pois entries are used), or None for no q_target
         selection_wcs: further WC names whose box rows enter the positivity box (not fitted)
         keep: [N] bool initial event selection, or None to select from the box
+        theta_base: [n_wcs] values of the WCs that are not pois (held there, or the start of their fits when
+            profiled; the pois' entries start the best fit), or None for 0; a profiled WC's value must lie in its box
     Returns:
         SimpleNamespace: pois, grid [P, n_poi], q [P], nll_min, levels {cl: q level}, intervals {cl: [lower, upper]}
         (one poi: the segment containing the minimum; None where open), segments {cl: [[lower, upper], ...]} (one poi:
         every segment, in order), q_target (None without theta_t), best (fit at the minimum: theta, nu, nll, success,
         edm), best_refit (the best fit was repeated from a lower grid point), start_fallbacks (fits of the last pass
-        started from the profiled WCs at 0), theta [P, n_wcs], nu [P, n_nu], success [P], edm [P], at_bound [P] (a
+        started from the profiled WCs at theta_base), theta [P, n_wcs], nu [P, n_nu], success [P], edm [P], at_bound [P] (a
         profiled parameter on its bound), best_at_bound, grid_below_best (a grid point has a lower NLL than the best
         fit), keep [N], dropped (events removed), dropped_sm_fraction (their share of the SM yield, truth weights),
         selections, stable
@@ -722,7 +727,12 @@ def scan(
     free_best[poi] = True
     box = np.asarray(box, dtype=np.float64)
     bounds = np.concatenate([box, np.tile([-nu_bound, nu_bound], (n_nu, 1))])
-    theta0 = np.zeros(n_wcs)
+    theta0 = np.zeros(n_wcs) if theta_base is None else np.asarray(theta_base, dtype=np.float64).copy()
+    if theta0.shape != (n_wcs,):
+        raise ValueError(f'theta_base has shape {theta0.shape}, expected ({n_wcs},)')
+    outside = free_best[:n_wcs] & ((theta0 < box[:, 0]) | (theta0 > box[:, 1]))
+    if outside.any():
+        raise ValueError(f'theta_base outside the box for {[wcs[i] for i in np.flatnonzero(outside)]}')
     nu0 = np.zeros(n_nu) if nu_obs is None else np.asarray(nu_obs, dtype=np.float64).copy()
     grids = [np.asarray(g, dtype=np.float64) for g in grids]
     points = np.stack(np.meshgrid(*grids, indexing='ij'), -1).reshape(-1, len(pois))
@@ -737,7 +747,7 @@ def scan(
         return positive_events([inputs.coefs.T], inputs.keep_q, **kwargs)
 
     moving = sorted(set(poi) | {wcs.index(w) for w in profile_wcs} | {wcs.index(w) for w in selection_wcs})
-    selection_box = np.zeros((n_wcs, 2))
+    selection_box = np.tile(theta0[:, None], (1, 2))
     selection_box[moving] = box[moving]
     keep = positive(box=selection_box) if keep is None else torch.as_tensor(keep, dtype=torch.bool).clone()
     stable = False
@@ -751,7 +761,7 @@ def scan(
                 start_nll = nll(torch.as_tensor(theta), torch.as_tensor(nu), terms, ratio=ratio, rate=rate)
                 if not torch.isfinite(start_nll):
                     visited.append(np.asarray(theta, dtype=np.float64)[None].copy())
-                    theta = np.where(profiled_wcs, 0.0, theta)
+                    theta = np.where(profiled_wcs, theta0, theta)
                     fallbacks[0] += 1
                 f = fit(terms, theta, nu, free_mask, bounds, ratio=ratio, rate=rate)
             else:
@@ -1399,7 +1409,8 @@ def check_scans(config):
     Check the scan entries of a config before any input is loaded. A scan entry (config['scans'][label]) has pois
     (one or two WCs) and grid ({poi: {values: [...]} or {range: [lo, hi], points: n}}), and optional target
     ({theta: {wc: value}, nu: {name: value}, kind: asimov or toy, seed (required for a toy)}), nu_obs ('target' or
-    {name: value}), ratio and rate (learned or truth), profile_wcs and profile_nu (names or 'all'), selection_wcs
+    {name: value}), theta_base ('target' or {wc: value}: where the WCs that are not pois are held or, if profiled,
+    start; 0 by default), ratio and rate (learned or truth), profile_wcs and profile_nu (names or 'all'), selection_wcs
     (names or 'all': further WCs whose box enters the event selection), nu_bound, cls, max_selections, box
     ({wc: [lo, hi]}, over the top-level box),
     overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty) and label
@@ -1436,6 +1447,11 @@ def check_scans(config):
         if target.get('kind') == 'toy' and target.get('seed') is None:
             sys.exit(f'[error]: scan {label}: a toy target needs a seed')
         _check_names(target.get('theta', {}), config['wcs'], 'WCs in target', label)
+        base = entry.get('theta_base')
+        if base is not None and base != 'target':
+            if not isinstance(base, dict):
+                sys.exit(f"[error]: scan {label}: theta_base must be 'target' or {{wc: value}}, not {base}")
+            _check_names(base, config['wcs'], 'WCs in theta_base', label)
         unknown = sorted(set(entry.get('uncertainty') or {}) - set(UNCERTAINTY_KEYS))
         if unknown:
             sys.exit(f'[error]: scan {label}: unknown uncertainty keys {unknown}')
@@ -1462,8 +1478,8 @@ def scan_settings(config, label, inputs):
     Returns:
         scan_args (keyword arguments of scan other than inputs, target, Gammas, theta_t and keep), target (dict:
         theta_t [n_wcs], nu_t [n_nu] or None, kind, seed) and spec (the entry as written to scans.yml: profile_wcs,
-        profile_nu and selection_wcs as name lists, nu_obs as {name: value} of its nonzero entries, box as the
-        {wc: [lo, hi]} used)
+        profile_nu and selection_wcs as name lists, nu_obs and theta_base as {name: value} of their nonzero entries,
+        box as the {wc: [lo, hi]} used)
     """
     entry = config['scans'][label]
     wcs = inputs.wcs
@@ -1507,6 +1523,13 @@ def scan_settings(config, label, inputs):
         nu_obs = np.zeros(len(names_nu))
         for n, v in nu_obs_entry.items():
             nu_obs[names_nu.index(n)] = v
+    base_entry = entry.get('theta_base')
+    if base_entry == 'target':
+        theta_base = theta_t.copy()
+    else:
+        theta_base = np.zeros(len(wcs))
+        for w, v in (base_entry or {}).items():
+            theta_base[wcs.index(w)] = v
 
     scan_args = dict(
         pois=pois,
@@ -1521,6 +1544,7 @@ def scan_settings(config, label, inputs):
         rate=entry.get('rate', 'learned'),
         cls=tuple(entry.get('cls', (0.6827, 0.95))),
         max_selections=entry.get('max_selections', 5),
+        theta_base=theta_base,
     )
     target_spec = dict(
         theta_t=theta_t,
@@ -1534,6 +1558,7 @@ def scan_settings(config, label, inputs):
         profile_nu=profile_nu,
         selection_wcs=selection_wcs,
         nu_obs={n: float(v) for n, v in zip(names_nu, nu_obs) if v != 0},
+        theta_base={w: float(v) for w, v in zip(wcs, theta_base) if v != 0},
         box=box_used,
     )
     return scan_args, target_spec, spec
