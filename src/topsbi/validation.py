@@ -1,5 +1,5 @@
-from topsbi.tools.build_ratio import Ensemble, seed_map
-from topsbi.tools.data import get_lower_tri
+from topsbi.tools.build_ratio import Ensemble, NetworkRatio, seed_map
+from topsbi.tools.data import get_lower_tri, sample_weight
 from topsbi.tools.ensembleCache import (
     EnsembleCache,
     SeedCollector,
@@ -7,6 +7,7 @@ from topsbi.tools.ensembleCache import (
     component_labels,
     is_cross_term,
     merge_sparse,
+    network_hash,
     quantile_binning,
     write_cache,
 )
@@ -25,25 +26,30 @@ from topsbi.tools.plots import (
 import mplhep as mh
 import numpy as np
 
-import argparse, os, sys, torch, types, yaml
+import argparse, datetime, os, shutil, sys, torch, types, yaml
 
 mh.style.use("CMS")
 
 
-def load_ensemble(config, features, refit=False):
+def load_ensemble(config, features, refit=False, data=None, path=None):
     """
-    The ensemble cache of config: read from {name}/ensemble when it matches config (data, c0, networks and their
-    model.pt), otherwise fitted and written, but only when refit is set.
+    The ensemble cache of config: read from path when it matches config (data, c0, networks and their model.pt),
+    otherwise fitted and written, but only when refit is set.
 
     Args:
         config: validation config (name, data, c0, wcs, seeds, features, lumi, optional device and workers, the seeds
             fitted at once)
-        features: [N, n_features] raw network inputs of config['data']
+        features: [N, n_features] raw network inputs of the data the cache is for
         refit: fit the ensemble and replace the cache even if one exists
+        data: path of the dataset features come from, in place of config['data'] (e.g. a background validation.p)
+        path: cache directory, in place of {name}/ensemble
     Returns:
         EnsembleCache
     """
-    path = f'{config["name"]}/ensemble'
+    if data is not None:
+        config = {**config, 'data': data}
+    if path is None:
+        path = f'{config["name"]}/ensemble'
     if not refit:
         if not os.path.exists(f'{path}/ensemble.yml'):
             sys.exit(f'[error]: no ensemble cache in {path}; rerun with --refit to fit one')
@@ -56,6 +62,268 @@ def load_ensemble(config, features, refit=False):
     ensemble = Ensemble(config, features, per_seed=collector, workers=config.get('workers', 1))
     write_cache(path, config, ensemble)
     return EnsembleCache(path)
+
+
+def check_backgrounds(config):
+    """
+    Check the background keys of a validation config (docs/ensemble.md, background caches) before any background
+    cache is built; exits listing every failure.
+
+    Checks: both keys are present and name the same processes; every process has networks for the same seeds; each
+    background directory holds a validation.p and a sample.yml with eft: false; each network's
+    complete/performance.yml has process equal to its process and reference_point equal to c0.
+
+    Args:
+        config: validation config with c0, backgrounds ({process: nominal directory of its combined sample}) and
+            background_networks ({process: {seed: training yml}})
+    Returns:
+        processes (the keys of background_networks, in config order), seeds (sorted, the same for every process)
+    """
+    for key in ('backgrounds', 'background_networks'):
+        if not config.get(key):
+            sys.exit(f'[error]: --backgrounds needs the config key {key!r}')
+    errors = []
+    processes = list(config['background_networks'])
+    if set(processes) != set(config['backgrounds']):
+        errors.append(
+            f'backgrounds names {sorted(config["backgrounds"])} but background_networks names {sorted(processes)}'
+        )
+    seeds = sorted(config['background_networks'][processes[0]])
+    for q in processes[1:]:
+        if sorted(config['background_networks'][q]) != seeds:
+            errors.append(
+                f'{q} has networks for seeds {sorted(config["background_networks"][q])}, '
+                f'{processes[0]} for seeds {seeds}'
+            )
+    for p, directory in config['backgrounds'].items():
+        if not os.path.exists(f'{directory}/validation.p'):
+            errors.append(f'{p}: no validation.p in {directory}')
+        if not os.path.exists(f'{directory}/sample.yml'):
+            errors.append(f'{p}: no sample.yml in {directory}')
+            continue
+        with open(f'{directory}/sample.yml') as f:
+            if yaml.safe_load(f).get('eft', True):
+                errors.append(f'{p}: {directory} is not a background sample (sample.yml eft)')
+    c0 = np.asarray(config['c0'], dtype=np.float64)
+    for q, networks in config['background_networks'].items():
+        for seed, training in networks.items():
+            with open(training) as f:
+                name = yaml.safe_load(f)['name']
+            path = f'{name}/complete/performance.yml'
+            if not os.path.exists(path):
+                errors.append(f'{q} seed {seed}: no {path}')
+                continue
+            with open(path) as f:
+                performance = yaml.safe_load(f)
+            if performance.get('process') != q:
+                errors.append(f'{q} seed {seed}: {path} has process {performance.get("process")!r}')
+            point = np.asarray(performance.get('reference_point', []), dtype=np.float64)
+            if point.shape != c0.shape or not np.array_equal(point, c0):
+                errors.append(f'{q} seed {seed}: reference_point {point.tolist()} differs from c0 {c0.tolist()}')
+    if errors:
+        sys.exit('[error]: background config:\n  ' + '\n  '.join(errors))
+    return processes, seeds
+
+
+def background_ensembles(config, signal, refit=False):
+    """
+    The EFT ensemble on the holdout events of every background process: {name}/ensemble_<p>/, with the layout of
+    {name}/ensemble (docs/ensemble.md) and its manifest data set to the background's validation.p. A cache is read
+    when it matches config (with that data path), otherwise it is fitted and written; refit rebuilds every one.
+    Exits if a cache's kept columns of T(theta) (mask) differ from the signal cache's.
+
+    Args:
+        config: validation config with backgrounds ({process: nominal directory of its combined sample}), checked by
+            check_backgrounds
+        signal: EnsembleCache of config['data'] ({name}/ensemble)
+        refit: fit every background ensemble and replace its cache even if it matches
+    Returns:
+        {process: EnsembleCache}, in the order of config['backgrounds']
+    """
+    caches = {}
+    for p, directory in config['backgrounds'].items():
+        data = f'{directory}/validation.p'
+        path = f'{config["name"]}/ensemble_{p}'
+        build = (
+            refit
+            or not os.path.exists(f'{path}/ensemble.yml')
+            or not EnsembleCache(path).matches({**config, 'data': data})
+        )
+        features = None
+        if build:
+            print(f'[info]: fitting the ensemble on {p} ({data}) into {path}')
+            features = torch.load(data, weights_only=False, mmap=True).tensors[0].clone()
+        cache = load_ensemble(config, features, refit=build, data=data, path=path)
+        if not np.array_equal(cache.mask, signal.mask):
+            sys.exit(f'[error]: {path} keeps other columns of T(theta) than {signal.path}')
+        caches[p] = cache
+    return caches
+
+
+def ratio_manifest(config, sets):
+    """
+    Manifest of the background-ratio cache {name}/background_ratios/ (docs/ensemble.md), without its created time.
+
+    Args:
+        config: validation config with c0 and background_networks ({process: {seed: training yml}}), checked by
+            check_backgrounds
+        sets: {event set: validation.p path} for 'signal' and every background process
+    Returns:
+        {'networks': {process: {seed: training yml}}, 'model_hash': {process: {seed: sha256 of model.pt}},
+         'reference_point': c0, 'data': {event set: path}}, seeds sorted
+    """
+    networks = {q: {seed: paths[seed] for seed in sorted(paths)} for q, paths in config['background_networks'].items()}
+    return {
+        'networks': networks,
+        'model_hash': {q: {seed: network_hash(path) for seed, path in paths.items()} for q, paths in networks.items()},
+        'reference_point': [float(c) for c in config['c0']],
+        'data': dict(sets),
+    }
+
+
+def ratios_match(path, manifest):
+    """
+    Whether the background-ratio cache in path is complete and was built from the networks, model.pt files,
+    reference point and event sets of manifest (from ratio_manifest; the created time is ignored).
+    """
+    if not os.path.exists(f'{path}/manifest.yml'):
+        return False
+    with open(f'{path}/manifest.yml') as f:
+        stored = yaml.safe_load(f)
+    return all(stored.get(key) == value for key, value in manifest.items())
+
+
+def background_ratios(config, sets, refit=False, chunk=100_000):
+    """
+    Ratios r_hat(x; q) = exp(f_hat) of every background network (process q, seed) on every event set:
+    {name}/background_ratios/<set>.npz with r_hat [n_q, n_seeds, N] float32 (rows in the order of processes),
+    processes, seeds (sorted) and finite [N] (every network finite and positive), then manifest.yml
+    (docs/ensemble.md). The cache is read when its manifest matches config and sets, otherwise rebuilt; refit always
+    rebuilds it.
+
+    Args:
+        config: validation config with c0, background_networks ({process: {seed: training yml}}), optional device;
+            checked by check_backgrounds
+        sets: {event set: validation.p path} for 'signal' and every background process
+        refit: rebuild the cache even if it matches
+        chunk: events evaluated at once
+    Returns:
+        {event set: {'r_hat', 'processes', 'seeds', 'finite'}} as numpy arrays
+    """
+    path = f'{config["name"]}/background_ratios'
+    manifest = ratio_manifest(config, sets)
+    if not refit and ratios_match(path, manifest):
+        out = {}
+        for name in sets:
+            with np.load(f'{path}/{name}.npz') as f:
+                out[name] = {k: f[k] for k in f.files}
+        return out
+    processes = list(manifest['networks'])
+    seeds = sorted(manifest['networks'][processes[0]])
+    device = config.get('device', 'cpu')
+    n_features = None
+    networks = None
+    tmp = f'{path}.tmp'
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    out = {}
+    for name, data in sets.items():
+        features = torch.load(data, weights_only=False, mmap=True).tensors[0]
+        if networks is None:
+            n_features = int(features.shape[1])
+            networks = [
+                [NetworkRatio(manifest['networks'][q][seed], n_features, device) for seed in seeds] for q in processes
+            ]
+        elif int(features.shape[1]) != n_features:
+            sys.exit(f'[error]: {data} has {features.shape[1]} features, the other event sets {n_features}')
+        n_events = int(features.shape[0])
+        print(f'[info]: background-network ratios on {name} ({n_events} events)')
+        r_hat = np.empty((len(processes), len(seeds), n_events), dtype=np.float32)
+        for start in range(0, n_events, chunk):
+            stop = min(start + chunk, n_events)
+            x = features[start:stop].clone()
+            for i, row in enumerate(networks):
+                for j, network in enumerate(row):
+                    r_hat[i, j, start:stop] = torch.exp(network.log_ratio(x).to(torch.float64)).numpy()
+        finite = (np.isfinite(r_hat) & (r_hat > 0)).all(axis=(0, 1))
+        out[name] = {
+            'r_hat': r_hat,
+            'processes': np.array(processes),
+            'seeds': np.array(seeds),
+            'finite': finite,
+        }
+        np.savez(f'{tmp}/{name}.npz', **out[name])
+    with open(f'{tmp}/manifest.yml', 'w') as f:
+        yaml.safe_dump(
+            {**manifest, 'created': datetime.datetime.now().isoformat(timespec='seconds')}, f, sort_keys=False
+        )
+    shutil.rmtree(path, ignore_errors=True)
+    os.replace(tmp, path)
+    return out
+
+
+def background_diagnostics(config, caches, ratios):
+    """
+    Diagnostics of the background caches (docs/ensemble.md, background caches), for every background process p:
+    - the fraction of p's events dropped by the ensemble filter, by the background-ratio filter and by either;
+    - the fraction with r_hat(x; theta_SM) <= 0 and with r_hat(x; theta_g) <= 0 (theta_g = c0), for the member mean
+      <Gamma>_e on the events every member keeps and for each member e on its own kept events;
+    - sum w r_hat(x; theta_SM) against sum w on the events every member keeps, with w = L_era w_ref x 1000;
+    and for every background network process q the seed spread of r_hat(x; q), the rms over seeds divided by the
+    seed mean per event (median and 90th percentile), on the signal events and on q's own events.
+
+    Args:
+        config: validation config with c0, lumi, backgrounds (optional year_loc)
+        caches: {process: EnsembleCache} from background_ensembles
+        ratios: {event set: arrays} from background_ratios
+    Returns:
+        {'backgrounds': {process: {'events', 'dropped', 'nonpositive', 'yield'}}, 'seed_spread': {q: {event set:
+         {'median', 'p90'}}}, 'seeds'}
+    """
+    c0 = [float(c) for c in config['c0']]
+    points = {'theta_sm': [1.0] + [0.0] * (len(c0) - 1), 'theta_g': c0}
+    out = {}
+    for p, cache in caches.items():
+        tensors = torch.load(f'{config["backgrounds"][p]}/validation.p', weights_only=False, mmap=True).tensors
+        w = sample_weight(tensors, 'nominal', config).numpy().astype(np.float64)
+        kept = ratios[p]['finite']
+        nonpositive = {}
+        for key, theta in points.items():
+            T = get_lower_tri(theta, dtype=torch.float64).numpy()[cache.mask]
+            members = {
+                int(s): float(np.mean(T @ np.asarray(cache.seed_Gamma[s], dtype=np.float64) <= 0)) for s in cache.seeds
+            }
+            nonpositive[key] = {'mean': float(np.mean(cache(theta) <= 0)), 'members': members}
+        w_kept = w[cache.finite]
+        sum_w_r = float(np.sum(w_kept * cache(points['theta_sm'])))
+        out[p] = {
+            'events': int(len(w)),
+            'dropped': {
+                'ensemble': float(1 - cache.finite.mean()),
+                'ratios': float(1 - kept.mean()),
+                'either': float(1 - (cache.finite & kept).mean()),
+            },
+            'nonpositive': nonpositive,
+            'yield': {
+                'sum_w': float(w.sum()),
+                'sum_w_kept': float(w_kept.sum()),
+                'sum_w_r_sm': sum_w_r,
+                'ratio': sum_w_r / float(w_kept.sum()),
+            },
+        }
+    processes = [str(q) for q in ratios['signal']['processes']]
+    spread = {}
+    for i, q in enumerate(processes):
+        spread[q] = {}
+        for name in ('signal', q):
+            r = ratios[name]['r_hat'][i][:, ratios[name]['finite']].astype(np.float64)
+            relative = r.std(axis=0) / r.mean(axis=0)
+            spread[q][name] = {'median': float(np.median(relative)), 'p90': float(np.percentile(relative, 90))}
+    return {
+        'backgrounds': out,
+        'seed_spread': spread,
+        'seeds': [int(s) for s in ratios['signal']['seeds']],
+    }
 
 
 def component_sums(cache, binning, w0, weights):
@@ -752,15 +1020,53 @@ def write_results(
         )
 
 
-def main(config_path, refit=False):
+def run_backgrounds(config, refit=False):
+    """
+    The background step (--backgrounds; docs/ensemble.md, background caches): checks the background keys, reads the
+    signal ensemble cache (a missing or stale one stops the run unless refit), builds or reads {name}/ensemble_<p>/
+    for every background process and {name}/background_ratios/, and writes {name}/background_diagnostics.yml.
+
+    Args:
+        config: validation config with backgrounds and background_networks (features already loaded from its file)
+        refit: fit the signal and background ensembles and rebuild the background ratios even if they match
+    """
+    if 'lumi' not in config:
+        sys.exit('[error]: config needs lumi, the luminosity of each era')
+    if 'signal' in config.get('backgrounds', {}):
+        sys.exit("[error]: 'signal' is the name of the signal event set; rename that background process")
+    check_backgrounds(config)
+    features = torch.load(config['data'], weights_only=False, mmap=True).tensors[0].clone() if refit else None
+    signal = load_ensemble(config, features, refit)
+    del features
+    caches = background_ensembles(config, signal, refit)
+    sets = {'signal': config['data'], **{p: f'{d}/validation.p' for p, d in config['backgrounds'].items()}}
+    ratios = background_ratios(config, sets, refit)
+    diagnostics = background_diagnostics(config, caches, ratios)
+    path = f'{config["name"]}/background_diagnostics.yml'
+    with open(path, 'w') as f:
+        yaml.safe_dump(diagnostics, f, sort_keys=False)
+    for p, entry in diagnostics['backgrounds'].items():
+        print(
+            f'[info]: {p}: {entry["events"]} events, {100 * entry["dropped"]["either"]:.2f}% dropped, '
+            f'r_hat(theta_SM) <= 0 for {100 * entry["nonpositive"]["theta_sm"]["mean"]:.2f}%, '
+            f'sum w r_hat(theta_SM) / sum w = {entry["yield"]["ratio"]:.4f}'
+        )
+    for q, sets_spread in diagnostics['seed_spread'].items():
+        text = ', '.join(f'{name} {s["median"]:.3f} (90%: {s["p90"]:.3f})' for name, s in sets_spread.items())
+        print(f'[info]: seed spread of r_hat(x; {q}): {text}')
+    print(f'[info]: background caches written; see {path}')
+
+
+def main(config_path, refit=False, backgrounds=False):
     """
     Run the validation of an ensemble (AGENTS.md, validation): bias test of every component gamma_q, attribution,
     suspects and drop tests, point search; writes ensemble_diagnostics.yml, proposed_points.yml and plots/ under
-    config['name'].
+    config['name']. With backgrounds, only the background step runs instead (run_backgrounds).
 
     Args:
         config_path: validation config yml
         refit: fit the ensemble and replace its cache
+        backgrounds: build the background caches (config keys backgrounds, background_networks) and stop
     """
     with open(config_path) as f:
         config = yaml.safe_load(f)
@@ -770,6 +1076,9 @@ def main(config_path, refit=False):
     if isinstance(config['features'], str):
         with open(config['features']) as f:
             config['features'] = yaml.safe_load(f)
+    if backgrounds:
+        run_backgrounds(config, refit)
+        return
     name = config['name']
     os.makedirs(f'{name}/plots', mode=0o755, exist_ok=True)
 
@@ -1017,5 +1326,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', '-c', help='validation configuration yml file')
     parser.add_argument('--refit', action='store_true', help='fit the ensemble and replace the cache')
+    parser.add_argument(
+        '--backgrounds', action='store_true', help='build the background caches (backgrounds, background_networks)'
+    )
     args = parser.parse_args()
-    main(args.config, args.refit)
+    main(args.config, args.refit, args.backgrounds)

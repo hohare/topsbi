@@ -200,6 +200,21 @@ class SeedCollector:
         np.savez(f'{d}/network.npz', Theta=fit.Theta.numpy(), networks=np.array(names))
 
 
+def network_hash(training):
+    """
+    sha256 of the model.pt of one trained network.
+
+    Args:
+        training: path to the network's training yml (model.pt is read from its 'name' directory)
+    Returns:
+        hex digest of {name}/model.pt
+    """
+    with open(training) as f:
+        name = yaml.safe_load(f)['name']
+    with open(f'{name}/model.pt', 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def model_hashes(seeds):
     """
     sha256 of the model.pt of every network (SM last; none for a seed without an SM network, theta_0 = SM), per seed:
@@ -207,13 +222,8 @@ def model_hashes(seeds):
     """
     hashes = {}
     for seed, networks in seeds.items():
-        hashes[seed] = []
         sm = networks.get('sm')
-        for path in networks['networks'] + ([] if sm is None else [sm]):
-            with open(path) as f:
-                name = yaml.safe_load(f)['name']
-            with open(f'{name}/model.pt', 'rb') as f:
-                hashes[seed].append(hashlib.sha256(f.read()).hexdigest())
+        hashes[seed] = [network_hash(path) for path in networks['networks'] + ([] if sm is None else [sm])]
     return hashes
 
 

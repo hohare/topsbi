@@ -12,6 +12,8 @@ import torch
 import yaml
 
 import topsbi.validation as val
+from topsbi.model.net import Net
+from topsbi.tools.build_ratio import NetworkRatio
 from topsbi.tools.data import get_lower_tri
 from topsbi.tools.ensembleCache import (
     EnsembleCache,
@@ -19,6 +21,8 @@ from topsbi.tools.ensembleCache import (
     binned_sums,
     component_labels,
     merge_sparse,
+    model_hashes,
+    network_hash,
     quantile_binning,
     write_cache,
 )
@@ -354,3 +358,293 @@ def test_binning():
         w2 = np.bincount(index, weights=weights**2, minlength=merged['n_bins'])
         own = merged['feature'] == f
         assert (w[own] ** 2 / w2[own] >= 30).all()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# background caches (--backgrounds): the toy EFT ensemble on two background event sets, and real (untrained) background
+# networks with a linear output, loaded through NetworkRatio
+
+BACKGROUNDS = {'tW': 400, 'Others': 600}  # process -> number of holdout events
+BG_C0 = [1.0, 0.5, -0.5]  # reference point theta_g of the toy (c0 and every background network's reference_point)
+BG_NETWORK = [
+    {'type': 'Linear', 'out': 8, 'activation': 'LeakyReLU'},
+    {'type': 'Linear', 'in': 8, 'out': 1, 'activation': 'None'},
+]
+
+
+def toy_gamma(x):
+    """True per-event coefficients of the toy at features x (the weight formula of truth(), divided by the SM weight)."""
+    n = len(x)
+    v = np.stack([np.ones(n), 0.5 * x[:, 0] + 0.2, 0.4 * x[:, 1] - 0.3], axis=1)
+    a = v[:, :, None] * v[:, None, :] + 0.05 * np.eye(3)
+    rows, cols = np.tril_indices(3)
+    s = a[:, rows, cols] * np.where(rows == cols, 1.0, 2.0)
+    return s / (s @ expanded([1, 0, 0]))[:, None]
+
+
+def toy_features(n, seed):
+    """Features of a toy event set: x0, x1 uniform, x2 an era index 0-2."""
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(0, 1, (n, 3))
+    x[:, 2] = rng.integers(0, 3, n)
+    return x
+
+
+def toy_seeds(root, members=MEMBERS):
+    """Fake training configs and model.pt files of the toy ensemble's networks, as config['seeds']."""
+    names = list(POINTS) + ['sm']
+    seeds = {}
+    for e in members:
+        paths = []
+        for name in names:
+            directory = root / f'seed_{e}' / name
+            directory.mkdir(parents=True)
+            (directory / 'model.pt').write_bytes(f'{name} {e}'.encode())
+            (directory / 'training.yml').write_text(yaml.safe_dump({'name': str(directory)}))
+            paths.append(str(directory / 'training.yml'))
+        seeds[e] = {'networks': paths[:-1], 'sm': paths[-1]}
+    return seeds
+
+
+def toy_cache(path, config, x, mask=None):
+    """
+    Toy ensemble cache for features x (true ratios with NOISE per member), written through SeedCollector and
+    write_cache with config's data and seeds; mask replaces the kept columns written to mask_cache.npy.
+    """
+    names = list(POINTS) + ['sm']
+    Theta = np.stack([expanded((1, *POINTS[n])) for n in names[:-1]] + [expanded((1, 0, 0))])
+    R_true = Theta @ toy_gamma(x).T
+    collector = SeedCollector(config['seeds'], path)
+    Gamma, rank = 0, {}
+    for e in config['seeds']:
+        rng = np.random.default_rng(200 + e)
+        fit = fake_fit(Theta, R_true * (1 + NOISE * rng.standard_normal(R_true.shape)))
+        collector(e, fit)
+        Gamma, rank[e] = Gamma + fit.Gamma / len(config['seeds']), int(fit.rank)
+    ensemble = types.SimpleNamespace(
+        Gamma=Gamma,
+        mask=torch.ones(Theta.shape[1], dtype=torch.bool) if mask is None else mask,
+        finite=torch.ones(len(x), dtype=torch.bool),
+        rank=rank,
+    )
+    write_cache(path, config, ensemble)
+
+
+def background_dataset(x, seed, negative=0.0):
+    """Combined-format holdout of a background (features, coefs, ids, event_id, syst_ratio, w_ref)."""
+    n = len(x)
+    rng = np.random.default_rng(seed)
+    w_ref = rng.uniform(0.5, 1.5, n) * np.where(rng.uniform(size=n) < negative, -1.0, 1.0)
+    return torch.utils.data.TensorDataset(
+        torch.from_numpy(x).float(),
+        torch.zeros(n, 6, dtype=torch.float64),
+        torch.zeros(n, 3),
+        torch.arange(n),
+        torch.zeros(n, 1),
+        torch.from_numpy(w_ref)[:, None].float(),
+    )
+
+
+def background_network(directory, process, seed):
+    """An untrained background network (linear output) with its training.yml and complete/performance.yml."""
+    (directory / 'complete').mkdir(parents=True)
+    torch.manual_seed(1000 + seed + (0 if process == 'tW' else 100))
+    net = Net(3, 'cpu', BG_NETWORK)
+    net.set_feature_normalization(torch.tensor([0.5, 0.5, 1.0]), torch.tensor([0.3, 0.3, 0.8]))
+    torch.save(net.state_dict(), directory / 'model.pt')
+    (directory / 'training.yml').write_text(yaml.safe_dump({'name': str(directory), 'network': BG_NETWORK}))
+    (directory / 'complete' / 'performance.yml').write_text(
+        yaml.safe_dump({'process': process, 'reference_point': BG_C0})
+    )
+    return str(directory / 'training.yml')
+
+
+@pytest.fixture(scope='module')
+def backgrounds(tmp_path_factory):
+    """
+    Validation config with backgrounds and background_networks, the signal and background ensemble caches written
+    from the toy, and the features of every event set.
+    """
+    root = tmp_path_factory.mktemp('backgrounds')
+    x = {'signal': toy_features(N_EVENTS, 0)}
+    (root / 'signal').mkdir()
+    torch.save(torch.utils.data.TensorDataset(torch.from_numpy(x['signal']).float()), root / 'signal' / 'validation.p')
+    directories, networks = {}, {}
+    for i, (p, n) in enumerate(BACKGROUNDS.items()):
+        x[p] = toy_features(n, 10 + i)
+        directory = root / 'backgrounds' / p
+        directory.mkdir(parents=True)
+        torch.save(background_dataset(x[p], 20 + i, negative=0.2 if p == 'Others' else 0.0), directory / 'validation.p')
+        (directory / 'sample.yml').write_text(yaml.safe_dump({'eft': False, 'reference_point': BG_C0}))
+        directories[p] = str(directory)
+        networks[p] = {e: background_network(root / 'bg_networks' / p / f'seed_{e}', p, e) for e in MEMBERS}
+    config = {
+        'name': str(root / 'validation'),
+        'data': str(root / 'signal' / 'validation.p'),
+        'c0': BG_C0,
+        'wcs': WCS,
+        'lumi': [1.0, 2.0, 3.0],
+        'year_loc': 2,
+        'device': 'cpu',
+        'features': FEATURES,
+        'seeds': toy_seeds(root / 'eft_networks'),
+        'backgrounds': directories,
+        'background_networks': networks,
+    }
+    toy_cache(f'{config["name"]}/ensemble', config, x['signal'])
+    for p, directory in directories.items():
+        toy_cache(f'{config["name"]}/ensemble_{p}', {**config, 'data': f'{directory}/validation.p'}, x[p])
+    return types.SimpleNamespace(config=config, x=x, root=root)
+
+
+def background_sets(config):
+    return {'signal': config['data'], **{p: f'{d}/validation.p' for p, d in config['backgrounds'].items()}}
+
+
+def test_network_hash(backgrounds):
+    seeds = backgrounds.config['seeds']
+    hashes = model_hashes(seeds)
+    for e in MEMBERS:
+        assert hashes[e] == [network_hash(path) for path in seeds[e]['networks'] + [seeds[e]['sm']]]
+
+
+def test_load_ensemble_data_override(backgrounds):
+    config = backgrounds.config
+    data = f'{config["backgrounds"]["tW"]}/validation.p'
+    path = f'{config["name"]}/ensemble_tW'
+    cache = val.load_ensemble(config, None, data=data, path=path)
+    assert cache.manifest['data'] == data and cache.Gamma.shape[1] == BACKGROUNDS['tW']
+    assert config['data'] != data  # the caller's config is unchanged
+    with pytest.raises(SystemExit, match='other data'):
+        val.load_ensemble(config, None, path=path)
+    assert val.load_ensemble(config, None).manifest['data'] == config['data']
+
+
+def test_check_backgrounds(backgrounds, tmp_path):
+    config = backgrounds.config
+    assert val.check_backgrounds(config) == (list(BACKGROUNDS), MEMBERS)
+    with pytest.raises(SystemExit, match='background_networks'):
+        val.check_backgrounds({k: v for k, v in config.items() if k != 'background_networks'})
+    with pytest.raises(SystemExit, match='names'):
+        val.check_backgrounds({**config, 'backgrounds': {'tW': config['backgrounds']['tW']}})
+    networks = {**config['background_networks'], 'Others': {0: config['background_networks']['Others'][0]}}
+    with pytest.raises(SystemExit, match='seeds'):
+        val.check_backgrounds({**config, 'background_networks': networks})
+    swapped = {'tW': config['background_networks']['Others'], 'Others': config['background_networks']['tW']}
+    with pytest.raises(SystemExit, match="has process 'Others'"):
+        val.check_backgrounds({**config, 'background_networks': swapped})
+    with pytest.raises(SystemExit, match='reference_point'):
+        val.check_backgrounds({**config, 'c0': [1.0, 0.0, 0.0]})
+    (tmp_path / 'sample.yml').write_text(yaml.safe_dump({'eft': True}))
+    with pytest.raises(SystemExit, match='not a background sample') as error:
+        val.check_backgrounds({**config, 'backgrounds': {**config['backgrounds'], 'tW': str(tmp_path)}})
+    assert 'no validation.p' in str(error.value)  # every failure is listed
+
+
+def test_background_ensembles(backgrounds, tmp_path, monkeypatch):
+    config = backgrounds.config
+    signal = EnsembleCache(f'{config["name"]}/ensemble')
+    caches = val.background_ensembles(config, signal)
+    assert list(caches) == list(BACKGROUNDS)
+    for p, cache in caches.items():
+        assert cache.manifest['data'] == f'{config["backgrounds"][p]}/validation.p'
+        assert cache.manifest['model_hash'] == signal.manifest['model_hash']
+        assert np.array_equal(cache.mask, signal.mask) and cache.finite.shape == (BACKGROUNDS[p],)
+
+    # a stale or missing cache is fitted (load_ensemble with refit) on the background's own features
+    calls = []
+
+    def fake_load(config, features, refit=False, data=None, path=None):
+        calls.append((refit, None if features is None else tuple(features.shape), data, path))
+        return EnsembleCache(path)
+
+    monkeypatch.setattr(val, 'load_ensemble', fake_load)
+    val.background_ensembles(config, signal)
+    assert all(refit is False and shape is None for refit, shape, _, _ in calls)
+    calls.clear()
+    val.background_ensembles(config, signal, refit=True)
+    assert [shape for _, shape, _, _ in calls] == [(n, 3) for n in BACKGROUNDS.values()]
+    assert all(refit for refit, _, _, _ in calls)
+    monkeypatch.undo()
+
+    # a background cache that keeps other columns of T(theta) stops the run
+    other = {**config, 'name': str(tmp_path / 'validation')}
+    mask = torch.ones(6, dtype=torch.bool)
+    mask[-1] = False
+    for p, directory in config['backgrounds'].items():
+        toy_cache(f'{other["name"]}/ensemble_{p}', {**other, 'data': f'{directory}/validation.p'}, backgrounds.x[p], mask)
+    with pytest.raises(SystemExit, match='other columns'):
+        val.background_ensembles(other, signal)
+
+
+def test_background_ratios(backgrounds, monkeypatch):
+    config = backgrounds.config
+    sets = background_sets(config)
+    out = val.background_ratios(config, sets, refit=True)
+    path = f'{config["name"]}/background_ratios'
+    for name, n in [('signal', N_EVENTS), *BACKGROUNDS.items()]:
+        assert out[name]['r_hat'].shape == (len(BACKGROUNDS), len(MEMBERS), n)
+        assert out[name]['r_hat'].dtype == np.float32 and out[name]['finite'].all()
+        assert list(out[name]['processes']) == list(BACKGROUNDS) and list(out[name]['seeds']) == MEMBERS
+        features = torch.from_numpy(backgrounds.x[name]).float()
+        for i, q in enumerate(BACKGROUNDS):
+            for j, e in enumerate(MEMBERS):
+                expected = torch.exp(NetworkRatio(config['background_networks'][q][e], 3).log_ratio(features).double())
+                assert np.allclose(out[name]['r_hat'][i, j], expected.numpy(), rtol=1e-6)
+        with np.load(f'{path}/{name}.npz') as f:
+            assert np.array_equal(f['r_hat'], out[name]['r_hat'])
+    manifest = yaml.safe_load(open(f'{path}/manifest.yml'))
+    assert list(manifest) == ['networks', 'model_hash', 'reference_point', 'data', 'created']
+    assert manifest['reference_point'] == BG_C0 and manifest['data'] == sets
+    assert manifest['model_hash']['tW'][0] == network_hash(config['background_networks']['tW'][0])
+
+    # a matching cache is read, not evaluated again
+    def no_networks(*args, **kwargs):
+        raise AssertionError('networks evaluated for a matching cache')
+
+    monkeypatch.setattr(val, 'NetworkRatio', no_networks)
+    again = val.background_ratios(config, sets)
+    assert np.array_equal(again['Others']['r_hat'], out['Others']['r_hat'])
+    monkeypatch.undo()
+    stored = val.ratio_manifest(config, sets)
+    assert val.ratios_match(path, stored)
+    assert not val.ratios_match(path, {**stored, 'reference_point': [1.0, 0.0, 0.0]})
+    assert not val.ratios_match(path, {**stored, 'data': {'signal': config['data']}})
+    hashes = {**stored['model_hash'], 'tW': {**stored['model_hash']['tW'], 0: 'retrained'}}
+    assert not val.ratios_match(path, {**stored, 'model_hash': hashes})
+
+
+def test_background_diagnostics(backgrounds):
+    config = backgrounds.config
+    signal = EnsembleCache(f'{config["name"]}/ensemble')
+    caches = val.background_ensembles(config, signal)
+    ratios = val.background_ratios(config, background_sets(config))
+    diagnostics = val.background_diagnostics(config, caches, ratios)
+    assert list(diagnostics['backgrounds']) == list(BACKGROUNDS) and diagnostics['seeds'] == MEMBERS
+    for p, entry in diagnostics['backgrounds'].items():
+        assert entry['events'] == BACKGROUNDS[p]
+        assert entry['dropped'] == {'ensemble': 0.0, 'ratios': 0.0, 'either': 0.0}
+        for key in ('theta_sm', 'theta_g'):
+            assert entry['nonpositive'][key]['mean'] == 0.0 and list(entry['nonpositive'][key]['members']) == MEMBERS
+        tensors = torch.load(f'{config["backgrounds"][p]}/validation.p', weights_only=False).tensors
+        w = (torch.tensor(config['lumi'])[tensors[0][:, 2].long()] * tensors[5][:, 0] * 1000).double().numpy()
+        r_sm = expanded([1, 0, 0]) @ np.asarray(caches[p].Gamma, dtype=np.float64)
+        assert np.isclose(entry['yield']['sum_w'], w.sum(), rtol=1e-5)
+        assert np.isclose(entry['yield']['ratio'], np.sum(w * r_sm) / w.sum(), rtol=1e-5)
+        assert np.isclose(entry['yield']['ratio'], 1.0, rtol=0.01)  # the toy's r_hat(theta_SM) = 1 up to NOISE
+    for q in BACKGROUNDS:
+        assert list(diagnostics['seed_spread'][q]) == ['signal', q]
+        r = ratios[q]['r_hat'][list(BACKGROUNDS).index(q)].astype(np.float64)
+        assert np.isclose(diagnostics['seed_spread'][q][q]['median'], np.median(r.std(axis=0) / r.mean(axis=0)))
+
+
+def test_run_backgrounds(backgrounds, tmp_path):
+    config = backgrounds.config
+    path = tmp_path / 'validation.yml'
+    path.write_text(yaml.safe_dump(config))
+    val.main(str(path), backgrounds=True)
+    diagnostics = yaml.safe_load(open(f'{config["name"]}/background_diagnostics.yml'))
+    assert list(diagnostics) == ['backgrounds', 'seed_spread', 'seeds']
+    assert not (backgrounds.root / 'validation' / 'plots').exists()  # the bias test did not run
+    with pytest.raises(SystemExit, match="'signal'"):
+        val.run_backgrounds({**config, 'backgrounds': {'signal': config['backgrounds']['tW']}})
