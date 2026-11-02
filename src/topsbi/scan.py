@@ -1,5 +1,5 @@
 from matplotlib.transforms import blended_transform_factory
-from topsbi.tools.data import get_lower_tri, kept_columns, lumi_per_event
+from topsbi.tools.data import NUISANCE_COLUMNS, get_lower_tri, kept_columns, load_combined, lumi_per_event
 from topsbi.tools.ensembleCache import EnsembleCache
 from topsbi.tools.nuisanceCache import NuisanceCache
 from topsbi.tools.plots import _no_tex_mapping, wc_tex
@@ -42,6 +42,8 @@ SCAN_KEYS = (
 TARGET_KEYS = ('theta', 'nu', 'kind', 'seed')
 UNCERTAINTY_KEYS = ('members', 'n_boot', 'subsets', 'seed')
 WILKS_KEYS = ('scan', 'toys', 'first_seed', 'randomize_nu_obs')
+BACKGROUND_KEYS = ('yields', 'card_yields', 'rate_only')
+RATE_ONLY_KEYS = ('shape', 'data', 'yield')
 
 
 def load_config(config_path):
@@ -49,10 +51,13 @@ def load_config(config_path):
     The scan config, completed from the EFT validation config it names (ensemble): data, c0, wcs, lumi, year_loc and
     zero_terms are taken from there (a scan config that sets one of them stops the run). eft_cache is {name}/ensemble
     of that config; nuisance_cache is {name}/nuisance of the nuisance validation config (nuisance), if one is named.
+    With backgrounds, background_caches and background_ratios are the caches of the EFT validation config's background
+    processes (background_caches).
 
     Args:
         config_path: scan config yml (name, ensemble, sm_yield, scans; optional nuisance, processes, process_column,
-            rate_systematics, box, n_threads, plot_lumi; the keys of a scan entry are listed in check_scans)
+            rate_systematics, backgrounds, box, n_threads, plot_lumi; the keys of a scan entry are listed in
+            check_scans)
     Returns:
         config dict
     """
@@ -73,8 +78,92 @@ def load_config(config_path):
             config['nuisance_cache'] = f'{yaml.safe_load(f)["name"]}/nuisance'
     config.setdefault('processes', ['all'])
     config.setdefault('rate_systematics', {})
+    if config.get('backgrounds') is not None:
+        config['background_caches'], config['background_ratios'] = background_caches(config, eft)
     config['device'] = 'cpu'
     return config
+
+
+def background_caches(config, eft):
+    """
+    The caches of the background processes named in the EFT validation config (eft['backgrounds']), checked against
+    the signal caches so that every event set is described by the same ensemble, nuisance model and background
+    networks: per process p the EFT ensemble {eft name}/ensemble_<p> (data the process's validation.p; c0, wcs, lumi,
+    seeds, model.pt hashes and mask equal to config['eft_cache']), with a nuisance config the signal nuisances
+    {nuisance name}/nuisance_<p> (data the process's validation.p; ensemble, theta_ref, nuisances, seeds and model.pt
+    hashes equal to config['nuisance_cache']), and the background-network ratios {eft name}/background_ratios
+    (networks eft['background_networks'], reference point c0, event sets 'signal' = config['data'] and every process's
+    validation.p). Exits listing every failure.
+
+    Args:
+        config: scan config being completed by load_config (ensemble, data, c0, processes, eft_cache, nuisance_cache
+            if a nuisance config is named)
+        eft: the EFT validation config (name, backgrounds, background_networks)
+    Returns:
+        caches: {process: {'data': validation.p, 'eft_cache': directory, 'nuisance_cache': directory or None}}, in the
+            order of eft['backgrounds']
+        ratios: directory of the background-network ratios
+    """
+    if not eft.get('backgrounds') or not eft.get('background_networks'):
+        sys.exit(f'[error]: backgrounds needs backgrounds and background_networks in {config["ensemble"]}')
+
+    def manifest(path, name):
+        with open(f'{path}/{name}') as f:
+            return yaml.safe_load(f)
+
+    errors = []
+    clash = sorted(set(eft['backgrounds']) & set(config['processes']))
+    if clash:
+        errors.append(f'background processes {clash} are also signal processes {config["processes"]}')
+    signal = manifest(config['eft_cache'], 'ensemble.yml')
+    signal_mask = np.load(f'{config["eft_cache"]}/mask_cache.npy')
+    nuisance = manifest(config['nuisance_cache'], 'nuisance.yml') if config.get('nuisance_cache') else None
+    caches = {}
+    for p, directory in eft['backgrounds'].items():
+        data = f'{directory}/validation.p'
+        entry = {'data': data, 'eft_cache': f'{eft["name"]}/ensemble_{p}', 'nuisance_cache': None}
+        path = entry['eft_cache']
+        if not os.path.exists(f'{path}/ensemble.yml'):
+            errors.append(f'{p}: no EFT ensemble cache {path} (python -m topsbi.validation -c <config> --backgrounds)')
+        else:
+            stored = manifest(path, 'ensemble.yml')
+            if stored['data'] != data:
+                errors.append(f'{p}: {path} was built from {stored["data"]}, not {data}')
+            for key in ('c0', 'wcs', 'lumi', 'seeds', 'model_hash'):
+                if stored.get(key) != signal.get(key):
+                    errors.append(f'{p}: {path} has another {key} than {config["eft_cache"]}')
+            if not np.array_equal(np.load(f'{path}/mask_cache.npy'), signal_mask):
+                errors.append(f'{p}: {path} keeps other terms of T(theta) than {config["eft_cache"]}')
+        if nuisance is not None:
+            path = entry['nuisance_cache'] = f'{os.path.dirname(config["nuisance_cache"])}/nuisance_{p}'
+            if not os.path.exists(f'{path}/nuisance.yml'):
+                errors.append(
+                    f'{p}: no nuisance cache {path} (python -m topsbi.nuisance_validation -c <config> --backgrounds)'
+                )
+            else:
+                stored = manifest(path, 'nuisance.yml')
+                if stored['data'] != data:
+                    errors.append(f'{p}: {path} was built from {stored["data"]}, not {data}')
+                for key in ('ensemble', 'theta_ref', 'nuisances', 'seeds', 'model_hash'):
+                    if stored.get(key) != nuisance.get(key):
+                        errors.append(f'{p}: {path} has another {key} than {config["nuisance_cache"]}')
+        caches[p] = entry
+    ratios = f'{eft["name"]}/background_ratios'
+    if not os.path.exists(f'{ratios}/manifest.yml'):
+        errors.append(f'no background-ratio cache {ratios} (python -m topsbi.validation -c <config> --backgrounds)')
+    else:
+        stored = manifest(ratios, 'manifest.yml')
+        networks = {q: {seed: paths[seed] for seed in sorted(paths)} for q, paths in eft['background_networks'].items()}
+        if stored['networks'] != networks:
+            errors.append(f'{ratios} was built from other background networks than {config["ensemble"]}')
+        if stored['reference_point'] != [float(c) for c in config['c0']]:
+            errors.append(f'{ratios} has reference point {stored["reference_point"]}, not c0 {config["c0"]}')
+        sets = {'signal': config['data'], **{p: entry['data'] for p, entry in caches.items()}}
+        if stored['data'] != sets:
+            errors.append(f'{ratios} was built on event sets {stored["data"]}, not {sets}')
+    if errors:
+        sys.exit('[error]: background caches:\n  ' + '\n  '.join(errors))
+    return caches, ratios
 
 
 def rate_log_kappa(rate_systematics, processes, process):
@@ -112,7 +201,9 @@ def load_inputs(config, members=False):
     The inputs of every scan, on the events kept by the EFT ensemble and, if named, the nuisance ensemble: the weight
     coefficients coefs = L_era s_q(z) x 1000 (so w^s(theta) = coefs . T(theta)[keep_q]), w0 = w^s(theta_0), era and
     process of each event, the ensemble's Gamma and mask, the nuisances' f_hat, the rate systematics' log kappa, and
-    scale = sm_yield / sum_i w^s_i(theta_SM), which brings yields of config['data'] to the expected yield.
+    scale = sm_yield / sum_i w^s_i(theta_SM), which brings yields of config['data'] to the expected yield. With
+    backgrounds, the events the background-ratio cache keeps on config['data'] as well, rate systematics may name
+    background and rate-only processes, and backgrounds holds the background part (load_background_inputs).
 
     Args:
         config: scan config (load_config)
@@ -121,7 +212,8 @@ def load_inputs(config, members=False):
         SimpleNamespace: coefs [N, n_kept], keep_q (kept columns of T(theta) for coefs), w0 [N], era [N],
         process [N], Gamma [K, N], mask (kept columns of T(theta) for Gamma), seed_Gamma {e: [K, N]} (members only),
         f_hat [n_n, 2, N], nuisances, log_kappa [n_rate, 2, N], rate_names, processes, wcs, scale, events (kept
-        events of config['data']); arrays are float64 torch tensors (era, process: int64; masks: bool)
+        events of config['data']), backgrounds (load_background_inputs; None without backgrounds); arrays are
+        float64 torch tensors (era, process: int64; masks: bool)
     """
     eft = EnsembleCache(config['eft_cache'])
     if eft.manifest['data'] != config['data'] or eft.manifest['c0'] != config['c0']:
@@ -133,6 +225,9 @@ def load_inputs(config, members=False):
         if nuisance.manifest['ensemble'] != config['ensemble'] or nuisance.theta_ref != config['c0']:
             sys.exit(f'[error]: {config["nuisance_cache"]} was not built from {config["ensemble"]} at c0')
         keep &= nuisance.finite
+    if config.get('background_caches'):
+        with np.load(f'{config["background_ratios"]}/signal.npz') as f:
+            keep &= f['finite']
     print(f'{keep.sum()} of {len(keep)} events kept by every member')
 
     def gamma(G, finite):
@@ -160,7 +255,8 @@ def load_inputs(config, members=False):
     for p, n in zip(processes, torch.bincount(process, minlength=len(processes)).tolist()):
         if n == 0:
             print(f'[warning]: no events of process {p}')
-    rate_names, log_kappa = rate_log_kappa(config['rate_systematics'], processes, process.numpy())
+    rate_processes = processes + (background_components(config)[0] if config.get('background_caches') else [])
+    rate_names, log_kappa = rate_log_kappa(config['rate_systematics'], rate_processes, process.numpy())
 
     out = types.SimpleNamespace(
         coefs=coefs,
@@ -180,10 +276,171 @@ def load_inputs(config, members=False):
         scale=scale,
         events=keep,
     )
+    out.backgrounds = load_background_inputs(config, out, members) if config.get('background_caches') else None
     if nuisance is not None:
         out.f_hat = torch.from_numpy(np.asarray(nuisance.f_hat[..., keep[nuisance.finite]], dtype=np.float64))
         out.nuisances = [n['name'] for n in nuisance.nuisances]
     return out
+
+
+def background_components(config):
+    """
+    Background components of a scan config with backgrounds: the background processes (background_caches order),
+    then the rate-only processes, and the background process whose events and network give each one's shape.
+
+    Args:
+        config: scan config (load_config) with backgrounds
+    Returns:
+        components, shapes: lists of process names
+    """
+    background = list(config['background_caches'])
+    rate_only = (config['backgrounds'] or {}).get('rate_only') or {}
+    return background + list(rate_only), background + [entry['shape'] for entry in rate_only.values()]
+
+
+def background_events(directory, config, split='validation'):
+    """
+    The events of one split of a background sample (the nominal directory of its combined sample): each event's
+    weight L_era w_ref x 1000 in float64 (negative weights kept) and era, and the split's weight fraction of the sample
+    (sample.yml split).
+
+    Args:
+        directory: nominal directory of the combined sample
+        config: scan config with lumi and optional year_loc (default 21)
+        split: train or validation
+    Returns:
+        weights [N] float64 tensor, era [N] int64 tensor, weight_fraction float
+    """
+    with open(f'{directory}/sample.yml') as f:
+        fraction = float(yaml.safe_load(f)['split'][split]['weight_fraction'])
+    tensors = load_combined(f'{directory}/{split}.p', 'nominal', ('features', 'w_ref'))
+    columns = dict(zip(NUISANCE_COLUMNS['nominal'], tensors))
+    era = columns['features'][:, config.get('year_loc', 21)].long()
+    weights = lumi_per_event(era, config) * columns['w_ref'][:, 0].to(torch.float64) * 1000
+    return weights, era, fraction
+
+
+def load_background_inputs(config, inputs, members=False):
+    """
+    The background part of the scan inputs, for a config with backgrounds. Components c (background_components) are
+    the background processes, then the rate-only processes; the shape q_c of a component is the background process
+    whose events and network describe it, and its yield lambda_c is own (background process: sum of L_era w_ref x 1000
+    over its validation.p over that split's weight fraction; rate-only: the same over every split of its sample, or
+    the fixed yield) or card (card_yields). Its term in the per-event ratio to theta_0 is
+    b_c(x) = c_c <r_hat(x; q_c)>_e, the seed mean of the background network of q_c, with
+    c_c = lambda_c / (scale sum_j w0_j <r_hat(x_j; q_c)>_e) over the kept signal events, so that the learned rate of
+    component c at nu = 0 is lambda_c. On every background event set p, on the events the ensemble, nuisance and ratio
+    caches keep: Gamma and f_hat of the signal term (ensemble_<p>, nuisance_<p>), b_c of every component, and each
+    component's expected weights at nu = 0 in expected-yield units, w_c = L_era w_ref x 1000 x lambda_c / (sum over the
+    kept events of p) for the components of shape p, 0 for the others.
+
+    Args:
+        config: scan config (load_config) with backgrounds
+        inputs: load_inputs result, its signal events restricted to those the ratio cache keeps (events, w0, scale)
+        members: also read every member's Gamma on each background event set
+    Returns:
+        SimpleNamespace: components, shapes, yields [n_c] (lambda_c), norm [n_c] (c_c), signal_b [n_c, N] (b_c on the
+        signal events), log_kappa [n_rate, 2, n_c] (log kappa^Down, log kappa^Up of every rate systematic for each
+        component, rows as inputs.rate_names), signal_log_kappa [n_rate, 2] (the signal process's log kappa, for the
+        signal term on background events), sets {p: SimpleNamespace(Gamma [K, N_p], seed_Gamma {e: [K, N_p]} or
+        None, f_hat [n_n, 2, N_p] or None, b [n_c, N_p], w [n_c, N_p], era [N_p], events (kept rows of validation.p))};
+        float64 torch tensors
+    """
+    options = config['backgrounds'] or {}
+    caches = config['background_caches']
+    background = list(caches)
+    components, shapes = background_components(config)
+    rate_only = options.get('rate_only') or {}
+    shape_index = [background.index(s) for s in shapes]
+
+    def ratios(name):
+        with np.load(f'{config["background_ratios"]}/{name}.npz') as f:
+            if list(f['processes']) != background:
+                sys.exit(
+                    f'[error]: {config["background_ratios"]}/{name}.npz has processes {list(f["processes"])}, '
+                    f'not {background}'
+                )
+            return f['r_hat'], f['finite']
+
+    def seed_mean(r_hat, rows):
+        return torch.from_numpy(r_hat[:, :, rows].astype(np.float64).mean(1))
+
+    def gamma(G, finite, keep):
+        return torch.from_numpy(np.asarray(G[:, keep[finite]], dtype=np.float64))
+
+    signal_mean = seed_mean(ratios('signal')[0], inputs.events)
+    own, raw = {}, {}
+    for p, entry in caches.items():
+        eft = EnsembleCache(entry['eft_cache'])
+        keep = eft.finite.copy()
+        nuisance = NuisanceCache(entry['nuisance_cache']) if entry['nuisance_cache'] else None
+        if nuisance is not None:
+            keep &= nuisance.finite
+        r_hat, finite = ratios(p)
+        keep &= finite
+        print(f'{p}: {keep.sum()} of {len(keep)} events kept by every member')
+        weights, era, fraction = background_events(os.path.dirname(entry['data']), config)
+        own[p] = weights.sum().item() / fraction
+        rows = torch.from_numpy(keep)
+        raw[p] = dict(
+            Gamma=gamma(eft.Gamma, eft.finite, keep),
+            seed_Gamma={e: gamma(eft.seed_Gamma[e], eft.seed_finite[e], keep) for e in eft.seeds} if members else None,
+            f_hat=None
+            if nuisance is None
+            else torch.from_numpy(np.asarray(nuisance.f_hat[..., keep[nuisance.finite]], dtype=np.float64)),
+            mean=seed_mean(r_hat, keep),
+            weights=weights[rows],
+            era=era[rows],
+            events=keep,
+        )
+    for p, entry in rate_only.items():
+        if 'yield' in entry:
+            own[p] = float(entry['yield'])
+        elif 'data' in entry:
+            with open(f'{entry["data"]}/sample.yml') as f:
+                splits = list(yaml.safe_load(f)['split'])
+            parts = [background_events(entry['data'], config, split) for split in splits]
+            own[p] = sum(w.sum().item() for w, _, _ in parts) / sum(fraction for _, _, fraction in parts)
+    card = options.get('card_yields') or {}
+    use_card = options.get('yields', 'own') == 'card'
+    yields = torch.tensor([float(card[c]) if use_card else own[c] for c in components], dtype=torch.float64)
+    norm = yields / (inputs.scale * (inputs.w0 * signal_mean[shape_index]).sum(1))
+    sets = {}
+    for p, r in raw.items():
+        w = torch.zeros(len(components), len(r['weights']), dtype=torch.float64)
+        for c, shape in enumerate(shapes):
+            if shape == p:
+                w[c] = r['weights'] * yields[c] / r['weights'].sum()
+        sets[p] = types.SimpleNamespace(
+            Gamma=r['Gamma'],
+            seed_Gamma=r['seed_Gamma'],
+            f_hat=r['f_hat'],
+            b=norm[:, None] * r['mean'][shape_index],
+            w=w,
+            era=r['era'],
+            events=r['events'],
+        )
+    first = len(config['processes'])
+    _, log_kappa = rate_log_kappa(
+        config.get('rate_systematics') or {},
+        list(config['processes']) + components,
+        np.arange(first, first + len(components)),
+    )
+    _, signal_log_kappa = rate_log_kappa(
+        config.get('rate_systematics') or {},
+        list(config['processes']) + components,
+        np.zeros(1, dtype=np.int64),
+    )
+    return types.SimpleNamespace(
+        components=components,
+        shapes=shapes,
+        yields=yields,
+        norm=norm,
+        signal_b=norm[:, None] * signal_mean[shape_index],
+        log_kappa=torch.from_numpy(log_kappa),
+        signal_log_kappa=torch.from_numpy(signal_log_kappa[..., 0]),
+        sets=sets,
+    )
 
 
 def nuisance_terms(f_hat, log_kappa):
@@ -400,11 +657,62 @@ def positive_events(Gammas, mask, box=None, points=None, chunk=64):
     return keep
 
 
-def nll_terms(inputs, keep, target, Gamma=None, nu_obs=None):
+def positive_background_events(backgrounds, mask, box=None, points=None, members=False):
+    """
+    The background events inside the event selection: those whose signal term r_hat(x; theta) = T(theta)[mask] . Gamma
+    is positive for the ensemble mean and, with members, every member's Gamma, over box and at points (positive_events),
+    the rule that selects the signal events, so that the selection removes one region of x from every event set and
+    cuts the signal and background models alike.
+
+    Args:
+        backgrounds: load_inputs result's backgrounds (load_background_inputs)
+        mask: kept columns of T(theta)
+        box: [n_wcs, 2] lower / upper value of each WC (fixed WCs: lower = upper), or None
+        points: [n_points, n_wcs] WC points, or None
+        members: also every member's Gamma (needs load_inputs(..., members=True))
+    Returns:
+        {p: [N_p] bool tensor} for every background event set p
+    """
+    keep = {}
+    for p, s in backgrounds.sets.items():
+        if members and s.seed_Gamma is None:
+            raise ValueError(
+                "members needs the members' Gamma on the background events (load_inputs(..., members=True))"
+            )
+        Gammas = [s.Gamma] + (list(s.seed_Gamma.values()) if members else [])
+        keep[p] = positive_events(Gammas, mask, box=box, points=points)
+    return keep
+
+
+def background_dropped(backgrounds, keep):
+    """
+    Share of each background component's yield at nu = 0 carried by the background events the selection removes.
+
+    Args:
+        backgrounds: load_inputs result's backgrounds (load_background_inputs)
+        keep: {p: [N_p] bool} (positive_background_events)
+    Returns:
+        {component: fraction}
+    """
+    out = {}
+    for c, (name, shape) in enumerate(zip(backgrounds.components, backgrounds.shapes)):
+        w = backgrounds.sets[shape].w[c]
+        out[name] = float(w[~keep[shape]].sum() / w.sum())
+    return out
+
+
+def nll_terms(
+    inputs, keep, target, Gamma=None, nu_obs=None, background_keep=None, background_target=None, background_Gamma=None
+):
     """
     The per-event arrays of one negative log-likelihood, restricted to the selected events (keep): Gamma, coefs, w0,
     the nuisance parts A, B (nuisance_terms) and the target weights w^t, and the centre nu_obs of the nuisance
-    constraint (global observables). Events with w^t = 0 enter the rate only.
+    constraint (global observables). Events with w^t = 0 enter the rate only. With backgrounds (inputs.backgrounds),
+    also bkg: the background components' terms b_c on the selected signal events, the slope and symmetric parts of
+    their rate systematics (A, B [n_nu, n_c], zero rows for the shape nuisances), their yields at nu = 0 on the
+    selected background events (truth_yield, for rate truth), and per background event set its selected events with
+    w^t != 0: Gamma, the nuisance parts A, B of the signal term there (its f_hat and the signal process's rate
+    systematics), b_c and w^t.
 
     Args:
         inputs: load_inputs result
@@ -413,9 +721,14 @@ def nll_terms(inputs, keep, target, Gamma=None, nu_obs=None):
         Gamma: [K, N] Gamma to use (a member's), default the ensemble mean
         nu_obs: [n_nu] centre of the constraint exp(-|nu - nu_obs|^2 / 2) (shape, then rate nuisances); default 0,
             nu_t for an Asimov at nu_t, a draw from N(nu_t, 1) for a frequentist toy
+        background_keep: {p: [N_p] bool} (positive_background_events), required with backgrounds
+        background_target: {p: [N_p] target weights on the background events}, required with backgrounds
+        background_Gamma: {p: [K, N_p]} Gamma to use on the background events (a member's), default the ensemble mean
     Returns:
         SimpleNamespace: Gamma, coefs, w0, A, B (selected events), on (selected events with w^t != 0), wt (w^t on
-        them), nu_obs, mask, keep_q, scale
+        them), nu_obs, mask, keep_q, scale, bkg (None without backgrounds: SimpleNamespace(signal_b [n_c, N_sel], A,
+        B [n_nu, n_c], truth_yield [n_c], sets [SimpleNamespace(Gamma [K, n_on], A, B [n_nu, n_on], b [n_c, n_on],
+        wt [n_on])]))
     """
     Gamma = inputs.Gamma if Gamma is None else Gamma
     keep = torch.as_tensor(keep, dtype=torch.bool)
@@ -425,6 +738,46 @@ def nll_terms(inputs, keep, target, Gamma=None, nu_obs=None):
     nu_obs = (
         torch.zeros(A.shape[0], dtype=torch.float64) if nu_obs is None else torch.as_tensor(nu_obs, dtype=torch.float64)
     )
+    bkg = None
+    backgrounds = getattr(inputs, 'backgrounds', None)
+    if backgrounds is not None:
+        if background_keep is None or background_target is None:
+            raise ValueError('a scan with backgrounds needs background_keep and background_target')
+        n_shape = A.shape[0] - backgrounds.log_kappa.shape[0]
+
+        def rate_parts(log_kappa):
+            a, b = nuisance_terms(None, log_kappa)
+            pad = torch.zeros(n_shape, a.shape[1], dtype=torch.float64)
+            return torch.cat([pad, a]), torch.cat([pad, b])
+
+        A_c, B_c = rate_parts(backgrounds.log_kappa)
+        A_signal, B_signal = rate_parts(backgrounds.signal_log_kappa[..., None])
+        truth_yield = torch.zeros(len(backgrounds.components), dtype=torch.float64)
+        sets = []
+        for p, s in backgrounds.sets.items():
+            selected = torch.as_tensor(background_keep[p], dtype=torch.bool)
+            truth_yield += s.w[:, selected].sum(1)
+            wt = torch.as_tensor(background_target[p], dtype=torch.float64)[selected]
+            rows = torch.nonzero(selected).flatten()[wt != 0]
+            n_on = len(rows)
+            if s.f_hat is None:
+                A_p, B_p = A_signal.expand(-1, n_on), B_signal.expand(-1, n_on)
+            else:
+                a, b = nuisance_terms(s.f_hat[..., rows], torch.zeros(0, 2, n_on, dtype=torch.float64))
+                A_p = torch.cat([a, A_signal[n_shape:].expand(-1, n_on)])
+                B_p = torch.cat([b, B_signal[n_shape:].expand(-1, n_on)])
+            sets.append(
+                types.SimpleNamespace(
+                    Gamma=(s.Gamma if background_Gamma is None else background_Gamma[p])[:, rows],
+                    A=A_p,
+                    B=B_p,
+                    b=s.b[:, rows],
+                    wt=wt[wt != 0],
+                )
+            )
+        bkg = types.SimpleNamespace(
+            signal_b=backgrounds.signal_b[:, keep], A=A_c, B=B_c, truth_yield=truth_yield, sets=sets
+        )
     return types.SimpleNamespace(
         Gamma=Gamma[:, keep],
         coefs=inputs.coefs[keep],
@@ -437,21 +790,26 @@ def nll_terms(inputs, keep, target, Gamma=None, nu_obs=None):
         mask=inputs.mask,
         keep_q=inputs.keep_q,
         scale=inputs.scale,
+        bkg=bkg,
     )
 
 
 def nll(theta, nu, terms, ratio='learned', rate='learned'):
     """
     Negative log of the extended likelihood with a normalised shape,
-    NLL(theta, nu) = lambda - W log lambda - sum_i w^t_i log r_i + W log sum_j w0_j r_j + |nu - nu_obs|^2 / 2
-    (constants dropped), W = sum_i w^t_i, where r_i(theta, nu) is the per-event ratio to theta_0, lambda(theta, nu)
-    the expected yield and nu_obs the centre of the nuisance constraint (nll_terms); differentiable in theta and nu.
-    With rate = 'learned' (lambda = scale sum_j w0_j r_j) and nu_obs = 0 it equals eqn:ratio_scans,
-    lambda - sum_i w^t_i log r_i + |nu|^2 / 2, up to a constant.
+    NLL(theta, nu) = lambda - W log lambda - sum_i w^t_i log d_i + W log D + |nu - nu_obs|^2 / 2
+    (constants dropped), W = sum_i w^t_i, where d_i(theta, nu) is the per-event density ratio to the signal at theta_0,
+    D = sum_j w0_j d_j over the selected signal events, lambda(theta, nu) the expected yield and nu_obs the centre of
+    the nuisance constraint (nll_terms); differentiable in theta and nu. Without backgrounds d_i = r_i, the signal
     ratio: 'learned', r_i = r_hat(x_i; theta) exp(nu-part_i) (log_ratio), or 'truth',
-    r_i = w^s_i(theta) / w^s_i(theta_0) exp(nu-part_i); rate: 'learned', lambda = scale sum_j w0_j r_j, or 'truth',
-    lambda = scale sum_j w^s_j(theta) exp(nu-part_j). The nuisance part (nu-part_i = sum_n a_n nu_n + b_n h(nu_n)) is
-    the learned one in every case.
+    r_i = w^s_i(theta) / w^s_i(theta_0) exp(nu-part_i); rate: 'learned', lambda = scale D, or 'truth',
+    lambda = scale sum_j w^s_j(theta) exp(nu-part_j). With rate = 'learned' and nu_obs = 0 it equals
+    eqn:ratio_scans, lambda - sum_i w^t_i log r_i + |nu|^2 / 2, up to a constant. With backgrounds (terms.bkg) the
+    density is the mixture d_i = r_i + sum_c kappa_c(nu) b_c(x_i), kappa_c(nu) = exp(sum_k a_kc nu_k + b_kc h(nu_k))
+    the rate systematics of component c, the sum over i runs over the selected signal and background events (the
+    signal term on a background event from its own Gamma and f_hat), and rate 'truth' adds
+    sum_c kappa_c(nu) truth_yield_c; ratio must be 'learned'. The nuisance part
+    (nu-part_i = sum_n a_n nu_n + b_n h(nu_n)) is the learned one in every case.
 
     Args:
         theta: [n_wcs] float64 tensor, without the SM entry
@@ -466,12 +824,30 @@ def nll(theta, nu, terms, ratio='learned', rate='learned'):
     w_theta = terms.coefs @ T[terms.keep_q] if 'truth' in (ratio, rate) else None
     base = T[terms.mask] @ terms.Gamma if ratio == 'learned' else w_theta / terms.w0
     r = base * torch.exp(shift)
-    log_r = torch.log(base[terms.on]) + shift[terms.on]
-    shape = (terms.w0 * r).sum()
-    lam = terms.scale * (shape if rate == 'learned' else (w_theta * torch.exp(shift)).sum())
-    W = terms.wt.sum()
+    bkg = getattr(terms, 'bkg', None)
+    if bkg is None:
+        log_d = torch.log(base[terms.on]) + shift[terms.on]
+        shape = (terms.w0 * r).sum()
+        data, W = (terms.wt * log_d).sum(), terms.wt.sum()
+        background_rate = 0.0
+    else:
+        if ratio != 'learned':
+            raise ValueError("backgrounds need ratio 'learned' (background events have no s_q(z) for the signal term)")
+        kappa = torch.exp(nu @ bkg.A + step_h(nu) @ bkg.B)
+        d = r + kappa @ bkg.signal_b
+        shape = (terms.w0 * d).sum()
+        data, W = (terms.wt * torch.log(d[terms.on])).sum(), terms.wt.sum()
+        for s in bkg.sets:
+            d_s = (T[terms.mask] @ s.Gamma) * torch.exp(nu @ s.A + step_h(nu) @ s.B) + kappa @ s.b
+            data = data + (s.wt * torch.log(d_s)).sum()
+            W = W + s.wt.sum()
+        background_rate = kappa @ bkg.truth_yield
+    if rate == 'learned':
+        lam = terms.scale * shape
+    else:
+        lam = terms.scale * (w_theta * torch.exp(shift)).sum() + background_rate
     constraint = ((nu - terms.nu_obs) ** 2).sum() / 2
-    return lam - W * torch.log(lam) - (terms.wt * log_r).sum() + W * torch.log(shape) + constraint
+    return lam - W * torch.log(lam) - data + W * torch.log(shape) + constraint
 
 
 def target_weights(inputs, theta_t, nu_t=None, kind='asimov', keep=None, seed=None):
@@ -1414,7 +1790,7 @@ def check_scans(config):
     (names or 'all': further WCs whose box enters the event selection), nu_bound, cls, max_selections, box
     ({wc: [lo, hi]}, over the top-level box),
     overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty) and label
-    (legend text).
+    (legend text). With backgrounds, the backgrounds block is checked by check_background_options.
 
     Args:
         config: scan config (load_config)
@@ -1465,6 +1841,87 @@ def check_scans(config):
                 sys.exit(f'[error]: scan {label}: overlay {other} does not scan {pois}')
         _check_names(entry.get('box', {}), config['wcs'], 'WCs in box', label)
     _check_names(config.get('box', {}), config['wcs'], 'WCs in box', 'top-level')
+    if config.get('backgrounds') is not None:
+        check_background_options(config)
+
+
+def check_background_options(config):
+    """
+    Check the backgrounds block of a scan config, whose background processes load_config has resolved
+    (background_caches): yields, own (default: each process's yield from its own sample) or card (card_yields);
+    card_yields ({process: yield}, required with yields card for every background and rate-only process, ignored with
+    own); rate_only ({process: {shape, data or yield}}): processes without events or network whose yield is added to
+    that of the background process shape and takes its shape, with the own yield from the nominal directory of the
+    process's combined sample (data: validation.p and sample.yml with eft false; every split of it counts, as no
+    network holds events out) or a fixed yield (exactly one of the two with own yields); and that every process a rate
+    systematic names is a signal, background or rate-only process. Exits listing every failure.
+
+    Args:
+        config: scan config (load_config) with backgrounds
+    """
+
+    def positive(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+    options = config['backgrounds'] or {}
+    signal = list(config['processes'])
+    backgrounds = list(config['background_caches'])
+    errors = []
+    if len(signal) != 1:
+        errors.append(
+            f'backgrounds need exactly one signal process, not {signal} (the signal term on background events)'
+        )
+    unknown = sorted(set(options) - set(BACKGROUND_KEYS))
+    if unknown:
+        errors.append(f'unknown keys {unknown}')
+    yields = options.get('yields', 'own')
+    if yields not in ('own', 'card'):
+        errors.append(f'yields must be own or card, not {yields}')
+    rate_only = options.get('rate_only') or {}
+    for p, entry in rate_only.items():
+        if p in signal or p in backgrounds:
+            errors.append(f'rate_only process {p} is also a signal or background process')
+        unknown = sorted(set(entry) - set(RATE_ONLY_KEYS))
+        if unknown:
+            errors.append(f'rate_only {p}: unknown keys {unknown}')
+        if entry.get('shape') not in backgrounds:
+            errors.append(
+                f'rate_only {p}: shape must be one of the background processes {backgrounds}, not {entry.get("shape")}'
+            )
+        if yields == 'own' and ('data' in entry) == ('yield' in entry):
+            errors.append(f'rate_only {p}: needs exactly one of data and yield with own yields')
+        if 'data' in entry:
+            directory = entry['data']
+            if not os.path.exists(f'{directory}/validation.p'):
+                errors.append(f'rate_only {p}: no validation.p in {directory}')
+            if not os.path.exists(f'{directory}/sample.yml'):
+                errors.append(f'rate_only {p}: no sample.yml in {directory}')
+            else:
+                with open(f'{directory}/sample.yml') as f:
+                    if yaml.safe_load(f).get('eft', True):
+                        errors.append(f'rate_only {p}: {directory} is not a background sample (sample.yml eft)')
+        if 'yield' in entry and not positive(entry['yield']):
+            errors.append(f'rate_only {p}: yield must be a positive number, not {entry["yield"]}')
+    card = options.get('card_yields') or {}
+    if yields == 'card':
+        missing = [p for p in backgrounds + list(rate_only) if p not in card]
+        if missing:
+            errors.append(f'yields card needs card_yields for {missing}')
+    unknown = sorted(set(card) - set(backgrounds) - set(rate_only))
+    if unknown:
+        errors.append(f'card_yields names {unknown}, which are not background or rate-only processes')
+    for p, value in card.items():
+        if not positive(value):
+            errors.append(f'card_yields {p} must be a positive number, not {value}')
+    known = signal + backgrounds + list(rate_only)
+    for name, syst in (config.get('rate_systematics') or {}).items():
+        unknown = sorted(set(syst.get('processes', [])) - set(known))
+        if unknown:
+            errors.append(
+                f'rate systematic {name}: processes {unknown} are not signal, background or rate-only processes'
+            )
+    if errors:
+        sys.exit('[error]: backgrounds:\n  ' + '\n  '.join(errors))
 
 
 def scan_settings(config, label, inputs):

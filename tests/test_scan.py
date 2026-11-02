@@ -1,8 +1,23 @@
 import numpy as np
+import os
+import pytest
 import torch
 import types
+import yaml
 
-from topsbi.scan import scan, scan_settings, target_weights
+from topsbi.scan import (
+    background_caches,
+    background_dropped,
+    check_background_options,
+    load_background_inputs,
+    nll,
+    nll_terms,
+    positive_background_events,
+    positive_events,
+    scan,
+    scan_settings,
+    target_weights,
+)
 
 WCS = ['cA', 'cB']
 
@@ -73,3 +88,292 @@ def test_scan_settings_theta_base():
     assert list(scan_settings(config, 't', inputs)[0]['theta_base']) == [0.0, 1.5]
     assert list(scan_settings(config, 'd', inputs)[0]['theta_base']) == [0.0, 0.7]
     assert list(scan_settings(config, 'z', inputs)[0]['theta_base']) == [0.0, 0.0]
+
+
+def write_caches(tmp_path):
+    """Signal and tW caches whose manifests agree; returns the scan config being completed and the EFT config."""
+    eft_name, nu_name = tmp_path / 'validation', tmp_path / 'nuisance_validation'
+    data, tw = str(tmp_path / 'signal/validation.p'), str(tmp_path / 'tW/nominal')
+    networks = {'tW': {1: 'tw_1.yml', 0: 'tw_0.yml'}}
+    ensemble = {'c0': [1.0, 1.5], 'wcs': ['cA'], 'lumi': [1.0], 'seeds': {0: {'networks': ['a.yml']}},
+                'model_hash': {0: ['h']}}
+    nuisance = {'ensemble': 'eft.yml', 'theta_ref': [1.0, 1.5], 'nuisances': [{'name': 'n1'}], 'seeds': {0: {}},
+                'model_hash': {0: [['g']]}}
+    for path, name, content in [
+        (eft_name / 'ensemble', 'ensemble.yml', dict(ensemble, data=data)),
+        (eft_name / 'ensemble_tW', 'ensemble.yml', dict(ensemble, data=f'{tw}/validation.p')),
+        (nu_name / 'nuisance', 'nuisance.yml', dict(nuisance, data=data)),
+        (nu_name / 'nuisance_tW', 'nuisance.yml', dict(nuisance, data=f'{tw}/validation.p')),
+        (eft_name / 'background_ratios', 'manifest.yml',
+         {'networks': {'tW': {0: 'tw_0.yml', 1: 'tw_1.yml'}}, 'model_hash': {}, 'reference_point': [1.0, 1.5],
+          'data': {'signal': data, 'tW': f'{tw}/validation.p'}}),
+    ]:
+        os.makedirs(path, exist_ok=True)
+        with open(path / name, 'w') as f:
+            yaml.safe_dump(content, f)
+    for path in (eft_name / 'ensemble', eft_name / 'ensemble_tW'):
+        np.save(path / 'mask_cache.npy', np.array([True, True, False]))
+    config = {'ensemble': 'eft.yml', 'data': data, 'c0': [1, 1.5], 'processes': ['tt'],
+              'eft_cache': str(eft_name / 'ensemble'), 'nuisance_cache': str(nu_name / 'nuisance')}
+    eft = {'name': str(eft_name), 'backgrounds': {'tW': tw}, 'background_networks': networks}
+    return config, eft
+
+
+def test_background_caches_match(tmp_path):
+    """Matching caches resolve to the per-process directories and the ratio cache."""
+    config, eft = write_caches(tmp_path)
+    caches, ratios = background_caches(config, eft)
+    assert caches['tW']['eft_cache'].endswith('validation/ensemble_tW')
+    assert caches['tW']['nuisance_cache'].endswith('nuisance_validation/nuisance_tW')
+    assert caches['tW']['data'].endswith('tW/nominal/validation.p')
+    assert ratios.endswith('validation/background_ratios')
+
+
+def test_background_caches_mismatch(tmp_path, capsys):
+    """Every disagreement with the signal caches is reported, then the run stops."""
+    config, eft = write_caches(tmp_path)
+    for path, name, key, value in [
+        (f'{eft["name"]}/ensemble_tW', 'ensemble.yml', 'model_hash', {0: ['other']}),
+        (f'{tmp_path}/nuisance_validation/nuisance_tW', 'nuisance.yml', 'theta_ref', [1.0, 0.0]),
+        (f'{eft["name"]}/background_ratios', 'manifest.yml', 'reference_point', [1.0, 0.0]),
+    ]:
+        with open(f'{path}/{name}') as f:
+            content = yaml.safe_load(f)
+        content[key] = value
+        with open(f'{path}/{name}', 'w') as f:
+            yaml.safe_dump(content, f)
+    np.save(f'{eft["name"]}/ensemble_tW/mask_cache.npy', np.array([True, False, False]))
+    with pytest.raises(SystemExit) as stop:
+        background_caches(config, eft)
+    message = str(stop.value)
+    for text in ('another model_hash', 'other terms of T(theta)', 'another theta_ref', 'has reference point'):
+        assert text in message
+
+
+def background_config(tmp_path, **options):
+    """A scan config after load_config with backgrounds tW and Others and a DY combined-sample directory."""
+    dy = tmp_path / 'DY/nominal'
+    os.makedirs(dy, exist_ok=True)
+    (dy / 'validation.p').write_bytes(b'')
+    with open(dy / 'sample.yml', 'w') as f:
+        yaml.safe_dump({'process': 'DY', 'eft': False}, f)
+    return {
+        'processes': ['tt'],
+        'background_caches': {'tW': {}, 'Others': {}},
+        'rate_systematics': {'lumi': {'kappa': 1.016}, 'smxsec_DY': {'kappa': 1.15, 'processes': ['DY']}},
+        'backgrounds': dict({'rate_only': {'DY': {'shape': 'Others', 'data': str(dy)}}}, **options),
+    }
+
+
+def test_background_options_valid(tmp_path):
+    """Own yields with DY from its sample, and card yields for every process, pass."""
+    check_background_options(background_config(tmp_path))
+    check_background_options(
+        background_config(tmp_path, yields='card', card_yields={'tW': 5000.0, 'Others': 1200.0, 'DY': 300.0})
+    )
+
+
+def test_background_options_invalid(tmp_path):
+    """Every problem of the block is reported, then the run stops."""
+    config = background_config(tmp_path, yields='card', card_yields={'tW': -1.0, 'ttH': 3.0}, extra=1)
+    config['backgrounds']['rate_only']['DY']['shape'] = 'tt'
+    config['rate_systematics']['smxsec_ttZ'] = {'kappa': 1.1, 'processes': ['ttZ']}
+    with pytest.raises(SystemExit) as stop:
+        check_background_options(config)
+    message = str(stop.value)
+    for text in (
+        "unknown keys ['extra']",
+        'shape must be one of the background processes',
+        "card_yields for ['Others', 'DY']",
+        "names ['ttH']",
+        'card_yields tW must be a positive number',
+        "processes ['ttZ']",
+    ):
+        assert text in message
+    config = background_config(tmp_path)
+    config['backgrounds']['rate_only']['DY']['yield'] = 250.0
+    with pytest.raises(SystemExit) as stop:
+        check_background_options(config)
+    assert 'exactly one of data and yield' in str(stop.value)
+
+
+def write_background_sample(directory, weights, eras, fractions):
+    """A combined background sample (nominal layout, era in feature column 0) with the given per-split weights."""
+    os.makedirs(directory, exist_ok=True)
+    for split, values in weights.items():
+        n = len(values)
+        features = torch.stack([torch.tensor(eras[split], dtype=torch.float32), torch.zeros(n)], 1)
+        w_ref = torch.tensor(values, dtype=torch.float64)[:, None]
+        dataset = torch.utils.data.TensorDataset(
+            features, torch.zeros(n, 1), torch.zeros(n, 2), torch.arange(n), torch.ones(n, 1), w_ref
+        )
+        torch.save(dataset, f'{directory}/{split}.p')
+    with open(f'{directory}/sample.yml', 'w') as f:
+        yaml.safe_dump({'eft': False, 'split': {s: {'weight_fraction': v} for s, v in fractions.items()}}, f)
+
+
+def test_load_background_inputs(tmp_path, monkeypatch):
+    """Yields, normalisation, per-set weights and rate systematics of the background components."""
+    import topsbi.scan as scan_module
+
+    tw_dir, others_dir, dy_dir = tmp_path / 'tW', tmp_path / 'Others', tmp_path / 'DY'
+    write_background_sample(tw_dir, {'validation': [0.5, 1.0, 1.5]}, {'validation': [0, 1, 1]}, {'validation': 0.25})
+    write_background_sample(
+        others_dir, {'validation': [2.0, -0.5, 1.0, 3.0]}, {'validation': [0, 0, 1, 1]}, {'validation': 0.5}
+    )
+    write_background_sample(
+        dy_dir, {'train': [1.0, 1.0], 'validation': [2.0]}, {'train': [0, 1], 'validation': [1]},
+        {'train': 0.6, 'validation': 0.4},
+    )
+    n_signal, K = 6, 3
+    rng = np.random.default_rng(1)
+    ratios = tmp_path / 'background_ratios'
+    os.makedirs(ratios)
+    sizes = {'signal': n_signal, 'tW': 3, 'Others': 4}
+    finite = {'signal': np.ones(6, bool), 'tW': np.ones(3, bool), 'Others': np.array([True, True, False, True])}
+    for name, n in sizes.items():
+        np.savez(
+            ratios / f'{name}.npz', r_hat=rng.uniform(0.5, 2.0, (2, 2, n)).astype(np.float32),
+            processes=np.array(['tW', 'Others']), seeds=np.array([0, 1]), finite=finite[name],
+        )
+
+    def ensemble(n):
+        return types.SimpleNamespace(
+            finite=np.ones(n, bool), Gamma=rng.normal(size=(K, n)), seeds=[0],
+            seed_Gamma={0: rng.normal(size=(K, n))}, seed_finite={0: np.ones(n, bool)},
+        )
+
+    caches = {'tW/ens': ensemble(3), 'Others/ens': ensemble(4)}
+    monkeypatch.setattr(scan_module, 'EnsembleCache', lambda path: caches[path])
+    config = {
+        'processes': ['tt'],
+        'lumi': [1.0, 2.0],
+        'year_loc': 0,
+        'rate_systematics': {'lumi': {'kappa': 1.016}, 'smxsec_DY': {'kappa': 1.15, 'processes': ['DY']}},
+        'backgrounds': {'rate_only': {'DY': {'shape': 'Others', 'data': str(dy_dir)}}},
+        'background_caches': {
+            'tW': {'data': str(tw_dir / 'validation.p'), 'eft_cache': 'tW/ens', 'nuisance_cache': None},
+            'Others': {'data': str(others_dir / 'validation.p'), 'eft_cache': 'Others/ens', 'nuisance_cache': None},
+        },
+        'background_ratios': str(ratios),
+    }
+    inputs = types.SimpleNamespace(
+        events=np.ones(n_signal, bool), w0=torch.tensor(rng.uniform(1.0, 2.0, n_signal), dtype=torch.float64),
+        scale=3.0,
+    )
+    b = load_background_inputs(config, inputs, members=True)
+    assert b.components == ['tW', 'Others', 'DY'] and b.shapes == ['tW', 'Others', 'Others']
+    tw_yield = (0.5 * 1 + 1.0 * 2 + 1.5 * 2) * 1000 / 0.25
+    others_yield = (2.0 * 1 - 0.5 * 1 + 1.0 * 2 + 3.0 * 2) * 1000 / 0.5
+    dy_yield = (1.0 * 1 + 1.0 * 2 + 2.0 * 2) * 1000 / 1.0
+    assert np.allclose(b.yields.numpy(), [tw_yield, others_yield, dy_yield])
+    assert np.allclose((inputs.scale * inputs.w0 * b.signal_b).sum(1).numpy(), b.yields.numpy())
+    others = b.sets['Others']
+    assert others.events.tolist() == [True, True, False, True]
+    assert others.Gamma.shape == (K, 3) and set(others.seed_Gamma) == {0}
+    assert np.allclose(b.sets['tW'].w.sum(1).numpy(), [tw_yield, 0.0, 0.0])
+    assert np.allclose(others.w.sum(1).numpy(), [0.0, others_yield, dy_yield])
+    assert np.allclose(others.w[2].numpy(), others.w[1].numpy() * dy_yield / others_yield)
+    assert np.allclose((others.b[2] / others.b[1]).numpy(), (b.norm[2] / b.norm[1]).item())
+    assert np.allclose(b.log_kappa[1].numpy(), [[0.0, 0.0, -np.log(1.15)], [0.0, 0.0, np.log(1.15)]])
+    assert np.allclose(b.log_kappa[0, 1].numpy(), np.log(1.016))
+    assert np.allclose(b.signal_log_kappa.numpy(), [[-np.log(1.016), np.log(1.016)], [0.0, 0.0]])
+    config['backgrounds'].update(yields='card', card_yields={'tW': 10.0, 'Others': 20.0, 'DY': 5.0})
+    assert np.allclose(load_background_inputs(config, inputs).yields.numpy(), [10.0, 20.0, 5.0])
+
+
+def test_positive_background_events():
+    """Background events are selected by the sign of the signal term over the box, as signal events are, members too."""
+    inputs = exact_inputs(n=50, seed=2)
+    Gamma = inputs.Gamma.clone()
+    Gamma[1, :5] = -10.0  # cA slope: negative at cA = 1 for the first five events
+    member = Gamma.clone()
+    member[1, 5:7] = -10.0  # and for two more in the member
+    w = torch.stack([torch.ones(50), 2 * torch.ones(50)]).to(torch.float64)
+    backgrounds = types.SimpleNamespace(
+        components=['tW', 'DY'],
+        shapes=['tW', 'tW'],
+        sets={'tW': types.SimpleNamespace(Gamma=Gamma, seed_Gamma={0: member}, w=w)},
+    )
+    box = np.array([[0.0, 1.0], [0.0, 0.0]])
+    keep = positive_background_events(backgrounds, inputs.mask, box=box)
+    assert torch.equal(keep['tW'], positive_events([Gamma], inputs.mask, box=box))
+    assert not keep['tW'][:5].any() and keep['tW'][5:].all()
+    keep = positive_background_events(backgrounds, inputs.mask, box=box, members=True)
+    assert not keep['tW'][:7].any() and keep['tW'][7:].all()
+    assert background_dropped(backgrounds, keep) == pytest.approx({'tW': 7 / 50, 'DY': 7 / 50})
+    backgrounds.sets['tW'].seed_Gamma = None
+    with pytest.raises(ValueError):
+        positive_background_events(backgrounds, inputs.mask, box=box, members=True)
+
+
+def mixture_inputs(beta=0.1, seed=0):
+    """
+    exact_inputs with rate systematics lumi (every process, kappa 1.02) and smxsec_B (background only, 1.2) and one
+    background component B whose events are the signal events reweighted by beta (1 + 0.5 tanh(coefs_1)): its term
+    b(x) is exact, and its truth yield equals its learned yield.
+    """
+    inputs = exact_inputs(seed=seed)
+    n = len(inputs.w0)
+    inputs.rate_names = ['lumi', 'smxsec_B']
+    inputs.log_kappa = torch.zeros(2, 2, n, dtype=torch.float64)
+    inputs.log_kappa[0] = torch.tensor([-np.log(1.02), np.log(1.02)], dtype=torch.float64)[:, None]
+    b = beta * (1 + 0.5 * torch.tanh(inputs.coefs[:, 1]))
+    log_kappa_b = torch.tensor([[[-np.log(1.02)], [np.log(1.02)]], [[-np.log(1.2)], [np.log(1.2)]]], dtype=torch.float64)
+    inputs.backgrounds = types.SimpleNamespace(
+        components=['B'],
+        shapes=['B'],
+        log_kappa=log_kappa_b,
+        signal_log_kappa=torch.tensor([[-np.log(1.02), np.log(1.02)], [0.0, 0.0]], dtype=torch.float64),
+        signal_b=b[None],
+        sets={
+            'B': types.SimpleNamespace(
+                Gamma=inputs.Gamma, seed_Gamma=None, f_hat=None, b=b[None], w=(inputs.scale * inputs.w0 * b)[None],
+                era=None, events=np.ones(n, bool),
+            )
+        },
+    )
+    return inputs
+
+
+def mixture_terms(inputs, theta_t, nu_t):
+    """nll_terms of an Asimov dataset at (theta_t, nu_t), every event selected, nu_obs = nu_t."""
+    n = len(inputs.w0)
+    target = target_weights(inputs, theta_t, nu_t)
+    kappa = 1.02 ** nu_t[0] * 1.2 ** nu_t[1]
+    background_target = {'B': inputs.backgrounds.sets['B'].w[0] * kappa}
+    return nll_terms(
+        inputs, torch.ones(n, dtype=torch.bool), target, nu_obs=nu_t,
+        background_keep={'B': torch.ones(n, dtype=torch.bool)}, background_target=background_target,
+    )
+
+
+def test_mixture_asimov_stationary():
+    """An Asimov dataset with a background is a stationary point of the mixture NLL at (theta_t, nu_t), both rates."""
+    inputs = mixture_inputs()
+    theta_t, nu_t = np.array([0.7, -0.4]), np.array([0.3, 0.5])
+    terms = mixture_terms(inputs, theta_t, nu_t)
+    for rate in ('learned', 'truth'):
+        theta = torch.tensor(theta_t, dtype=torch.float64, requires_grad=True)
+        nu = torch.tensor(nu_t, dtype=torch.float64, requires_grad=True)
+        nll(theta, nu, terms, rate=rate).backward()
+        assert torch.allclose(theta.grad, torch.zeros(2, dtype=torch.float64), atol=1e-8)
+        assert torch.allclose(nu.grad, torch.zeros(2, dtype=torch.float64), atol=1e-8)
+        off = torch.tensor([0.3, 0.0], dtype=torch.float64, requires_grad=True)
+        nll(torch.tensor(theta_t, dtype=torch.float64), off, terms, rate=rate).backward()
+        assert off.grad[1] < -1e-3
+
+
+def test_mixture_zero_background():
+    """A background with zero yield reproduces the NLL without backgrounds; ratio truth with backgrounds stops."""
+    inputs = mixture_inputs(beta=0.0)
+    theta_t, nu_t = np.array([0.7, -0.4]), np.array([0.3, 0.0])
+    with_b = mixture_terms(inputs, theta_t, nu_t)
+    inputs.backgrounds = None
+    without = nll_terms(inputs, torch.ones(len(inputs.w0), dtype=torch.bool), target_weights(inputs, theta_t, nu_t),
+                        nu_obs=nu_t)
+    theta, nu = torch.tensor([0.2, 0.1], dtype=torch.float64), torch.tensor([-0.4, 0.7], dtype=torch.float64)
+    for rate in ('learned', 'truth'):
+        assert torch.allclose(nll(theta, nu, with_b, rate=rate), nll(theta, nu, without, rate=rate), rtol=1e-12)
+    with pytest.raises(ValueError):
+        nll(theta, nu, with_b, ratio='truth')
