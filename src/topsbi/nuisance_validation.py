@@ -35,8 +35,9 @@ import numpy as np
 
 import argparse, os, shutil, sys, torch, yaml
 
-# taken from the EFT validation config, so both ensembles see the same events, reference point and luminosities
-SHARED_KEYS = ('data', 'c0', 'wcs', 'lumi', 'features', 'year_loc')
+# taken from the EFT validation config, so both ensembles see the same events, reference point and luminosities;
+# backgrounds (optional) names the background event sets of the --backgrounds step
+SHARED_KEYS = ('data', 'c0', 'wcs', 'lumi', 'features', 'year_loc', 'backgrounds')
 # max over nu of |d (nu S(nu)) / d nu| for Combine's smooth step, at nu = +-1/sqrt(3): log r_hat(x; nu) is monotonic in
 # nu for every nu exactly when |f_hat^slope| >= MONOTONIC * |f_hat^sym|
 MONOTONIC = 7 * np.sqrt(3) / 9
@@ -72,20 +73,25 @@ def load_config(config_path):
     return config
 
 
-def load_nuisance_ensemble(config, features, refit=False):
+def load_nuisance_ensemble(config, features, refit=False, data=None, path=None):
     """
-    The nuisance cache of config: read from {name}/nuisance when it matches config (EFT ensemble, data, networks and
-    their model.pt), otherwise built and written, but only when refit is set. Its reference point theta_ref must be
-    the EFT reference point c0, since the two ensembles are combined as log r_hat(x; theta) + log r_hat(x; nu).
+    The nuisance cache of config: read from path when it matches config (EFT ensemble, data, networks and their
+    model.pt), otherwise built and written, but only when refit is set. Its reference point theta_ref must be the EFT
+    reference point c0, since the two ensembles are combined as log r_hat(x; theta) + log r_hat(x; nu).
 
     Args:
         config: nuisance validation config, completed by load_config
-        features: [N, n_features] raw network inputs of config['data']
+        features: [N, n_features] raw network inputs of the data the cache is for
         refit: build the cache and replace it even if one exists
+        data: path of the dataset features come from, in place of config['data'] (e.g. a background validation.p)
+        path: cache directory, in place of {name}/nuisance
     Returns:
         NuisanceCache
     """
-    path = f'{config["name"]}/nuisance'
+    if data is not None:
+        config = {**config, 'data': data}
+    if path is None:
+        path = f'{config["name"]}/nuisance'
     if not refit:
         if not os.path.exists(f'{path}/nuisance.yml'):
             sys.exit(f'[error]: no nuisance cache in {path}; rerun with --refit to build one')
@@ -114,6 +120,36 @@ def load_nuisance_ensemble(config, features, refit=False):
             f'the EFT ensemble at c0 = {config["c0"]}'
         )
     return cache
+
+
+def background_nuisances(config, refit=False):
+    """
+    The nuisance ensemble on the holdout events of every background process: {name}/nuisance_<p>/, with the layout of
+    {name}/nuisance (docs/ensemble.md) and its manifest data set to the background's validation.p. A cache is read
+    when it matches config (with that data path), otherwise it is built and written; refit rebuilds every one.
+
+    Args:
+        config: nuisance validation config, completed by load_config, with backgrounds ({process: nominal directory
+            of its combined sample})
+        refit: build every background cache and replace it even if it matches
+    Returns:
+        {process: NuisanceCache}, in the order of config['backgrounds']
+    """
+    caches = {}
+    for p, directory in config['backgrounds'].items():
+        data = f'{directory}/validation.p'
+        path = f'{config["name"]}/nuisance_{p}'
+        build = (
+            refit
+            or not os.path.exists(f'{path}/nuisance.yml')
+            or not NuisanceCache(path).matches({**config, 'data': data})
+        )
+        features = None
+        if build:
+            print(f'[info]: evaluating the nuisance networks on {p} ({data}) into {path}')
+            features = torch.load(data, weights_only=False, mmap=True).tensors[0].clone()
+        caches[p] = load_nuisance_ensemble(config, features, refit=build, data=data, path=path)
+    return caches
 
 
 class ClosureTargets:
@@ -814,23 +850,72 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
         )
 
 
-def main(config_path, refit=False):
+def run_backgrounds(config, refit=False):
+    """
+    The background step (--backgrounds; docs/ensemble.md, background caches): reads the signal nuisance cache (a
+    missing or stale one stops the run unless refit), builds or reads {name}/nuisance_<p>/ for every background
+    process and writes {name}/background_diagnostics.yml: per event set, its data, its events and the fraction of
+    them dropped by the filter of every member together and by each member's filter.
+
+    Args:
+        config: nuisance validation config, completed by load_config, with backgrounds ({process: nominal directory
+            of its combined sample}) from the EFT validation config
+        refit: build the signal and background caches and replace them even if they match
+    """
+    if not config.get('backgrounds'):
+        sys.exit(f'[error]: --backgrounds needs the key backgrounds in the EFT validation config {config["ensemble"]}')
+    if 'signal' in config['backgrounds']:
+        sys.exit("[error]: 'signal' is the name of the signal event set; rename that background process")
+    missing = [p for p, directory in config['backgrounds'].items() if not os.path.exists(f'{directory}/validation.p')]
+    if missing:
+        sys.exit(f'[error]: no validation.p in the background directories of {missing}')
+    features = torch.load(config['data'], weights_only=False, mmap=True).tensors[0].clone() if refit else None
+    caches = {'signal': load_nuisance_ensemble(config, features, refit)}
+    del features
+    caches.update(background_nuisances(config, refit))
+    sets = {'signal': config['data'], **{p: f'{d}/validation.p' for p, d in config['backgrounds'].items()}}
+    diagnostics = {'seeds': [int(e) for e in caches['signal'].seeds], 'event_sets': {}}
+    for name, cache in caches.items():
+        diagnostics['event_sets'][name] = {
+            'data': sets[name],
+            'events': int(len(cache.finite)),
+            'dropped': float(1 - cache.finite.mean()),
+            'dropped_members': {int(e): float(1 - cache.seed_finite[e].mean()) for e in cache.seeds},
+        }
+    path = f'{config["name"]}/background_diagnostics.yml'
+    with open(path, 'w') as f:
+        yaml.safe_dump(diagnostics, f, sort_keys=False)
+    for name, entry in diagnostics['event_sets'].items():
+        print(
+            f'[info]: {name}: {entry["events"]} events, {100 * entry["dropped"]:.3f}% dropped '
+            f'(largest member: {100 * max(entry["dropped_members"].values()):.3f}%)'
+        )
+    print(f'[info]: nuisance caches on the background events written; see {path}')
+
+
+def main(config_path, refit=False, backgrounds=False):
     """
     Run the validation of the nuisance ensemble (docs/validation.md): check 1, the closure of every nuisance network
     averaged over members in every network input; check 2, the closure of the symmetric part and the slope of the
     interpolation in nu and its shape; check 3, the closure of the weight_shift networks at other WC points
     (factorisation in theta); check 4, the closure of the combined learned ratio r_hat(x; theta) r_hat(x; nu) of the
     scans at those points, and of the nuisance shift alone on top of the learned EFT ratio; writes
-    nuisance_diagnostics.yml, nuisance_sums.npz and plots/ (plot_results) under config['name'].
+    nuisance_diagnostics.yml, nuisance_sums.npz and plots/ (plot_results) under config['name']. With backgrounds,
+    only the background step runs instead (run_backgrounds).
 
     Args:
         config_path: nuisance validation config yml
         refit: build the nuisance cache and replace it
+        backgrounds: build the nuisance caches on the background events (key backgrounds of the EFT validation
+            config) and stop
     """
     config = load_config(config_path)
     torch.set_num_threads(config.get('n_threads', 1))
     name = config['name']
     os.makedirs(name, mode=0o755, exist_ok=True)
+    if backgrounds:
+        run_backgrounds(config, refit)
+        return
     if 'lumi' not in config:
         sys.exit(f'[error]: {config["ensemble"]} needs lumi, the luminosity of each era')
 
@@ -924,9 +1009,14 @@ if __name__ == "__main__":
         action='store_true',
         help='redraw the plots from nuisance_diagnostics.yml and nuisance_sums.npz, without the checks',
     )
+    parser.add_argument(
+        '--backgrounds',
+        action='store_true',
+        help='build the nuisance caches on the background events (backgrounds of the EFT validation config)',
+    )
     args = parser.parse_args()
     if args.plots_only:
         config = load_config(args.config)
         plot_results(config['name'], config['features'], config.get('shape', {}).get('n_sigma', 3.0))
     else:
-        main(args.config, args.refit)
+        main(args.config, args.refit, args.backgrounds)
