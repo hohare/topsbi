@@ -1,5 +1,13 @@
 from matplotlib.transforms import blended_transform_factory
-from topsbi.tools.data import NUISANCE_COLUMNS, get_lower_tri, kept_columns, load_combined, lumi_per_event
+from topsbi.tools.data import (
+    NUISANCE_COLUMNS,
+    event_keys,
+    get_lower_tri,
+    kept_columns,
+    load_combined,
+    lumi_per_event,
+    splitmix64,
+)
 from topsbi.tools.ensembleCache import EnsembleCache
 from topsbi.tools.nuisanceCache import NuisanceCache
 from topsbi.tools.plots import _no_tex_mapping, wc_tex
@@ -37,6 +45,7 @@ SCAN_KEYS = (
     'max_selections',
     'overlay',
     'uncertainty',
+    'calibration',
     'label',
 )
 TARGET_KEYS = ('theta', 'nu', 'kind', 'seed')
@@ -44,6 +53,8 @@ UNCERTAINTY_KEYS = ('members', 'n_boot', 'subsets', 'seed')
 WILKS_KEYS = ('scan', 'toys', 'first_seed', 'randomize_nu_obs')
 BACKGROUND_KEYS = ('yields', 'card_yields', 'rate_only')
 RATE_ONLY_KEYS = ('shape', 'data', 'yield')
+CALIBRATION_KEYS = ('wc', 'bins', 'folds')
+CALIBRATION_BINS = (10, 10)
 
 
 def load_config(config_path):
@@ -682,6 +693,229 @@ def positive_background_events(backgrounds, mask, box=None, points=None, members
         Gammas = [s.Gamma] + (list(s.seed_Gamma.values()) if members else [])
         keep[p] = positive_events(Gammas, mask, box=box, points=points)
     return keep
+
+
+CALIBRATION_FOLDS = 5
+# salt of the calibration folds: distinct from the combine salt (0) and the train/test salts (1 << 32) + seed
+CALIBRATION_SALT = 3 << 32
+
+
+def calibration_folds(data, events, year_loc=21, n_folds=CALIBRATION_FOLDS):
+    """
+    Cross-fitting fold of each kept event of a combined sample: a hash (splitmix64) of the event key (event_keys:
+    era, mtt slice, event_id) with its own salt, so the folds do not depend on the event order and never reproduce the
+    combine or train / test splits.
+
+    Args:
+        data: validation.p of a combined sample (nominal layout)
+        events: [N_all] bool, the kept events (load_inputs events, or a background set's events)
+        year_loc: feature column of the era index
+        n_folds: number of folds K
+    Returns:
+        [N] int64 numpy array, fold 0, ..., n_folds - 1 of each kept event
+    """
+    tensors = list(torch.load(data, weights_only=False, mmap=True).tensors)
+    key = np.full(len(tensors[0]), CALIBRATION_SALT, dtype=np.uint64)
+    for field in event_keys(tensors, 'nominal', year_loc).T:
+        key = splitmix64(key ^ field.astype(np.uint64))
+    u = (key >> np.uint64(11)).astype(np.float64) / 2.0**53
+    return np.minimum((u * n_folds).astype(np.int64), n_folds - 1)[np.asarray(events, dtype=bool)]
+
+
+def quantile_edges(stat, w, n_bins):
+    """
+    Inner edges of n_bins bins of stat with equal total weight w.
+
+    Args:
+        stat: [N] statistic
+        w: [N] weights
+        n_bins: number of bins
+    Returns:
+        [n_bins - 1] float64 edges
+    """
+    order = np.argsort(stat, kind='stable')
+    cumulative = np.cumsum(w[order])
+    cuts = np.searchsorted(cumulative, cumulative[-1] * np.arange(1, n_bins) / n_bins)
+    return stat[order][cuts]
+
+
+def nested_bins(stats_fit, w_fit, stats_apply, n_bins):
+    """
+    Bin index of the fit and apply events in nested equal-weight bins: n_bins[0] bins of stats[0], each split into
+    n_bins[1] bins of stats[1] with edges from the fit events of that outer bin, and so on. Edges come from the fit
+    events only; events outside the edges go into the edge bins.
+
+    Args:
+        stats_fit: [d, N_fit] statistics of the fit events
+        w_fit: [N_fit] weights of the fit events
+        stats_apply: [d, N_apply] statistics of the apply events
+        n_bins: [d] bins per level
+    Returns:
+        bins_fit [N_fit], bins_apply [N_apply]: int64 flat bin index in 0, ..., prod(n_bins) - 1
+    """
+    edges = quantile_edges(stats_fit[0], w_fit, n_bins[0])
+    outer_fit = np.searchsorted(edges, stats_fit[0], side='right')
+    outer_apply = np.searchsorted(edges, stats_apply[0], side='right')
+    if len(n_bins) == 1:
+        return outer_fit, outer_apply
+    inner_fit = np.zeros(len(outer_fit), dtype=np.int64)
+    inner_apply = np.zeros(len(outer_apply), dtype=np.int64)
+    for b in range(n_bins[0]):
+        f, a = outer_fit == b, outer_apply == b
+        if not f.any():
+            continue
+        inner_fit[f], inner_apply[a] = nested_bins(stats_fit[1:, f], w_fit[f], stats_apply[1:, a], n_bins[1:])
+    size = int(np.prod(n_bins[1:]))
+    return outer_fit * size + inner_fit, outer_apply * size + inner_apply
+
+
+def calibration_bins(stats, w_sm, folds, n_bins, use=None, others=None):
+    """
+    The cross-fitted calibration binning, one fold at a time: for fold k, nested equal-SM-weight bins (nested_bins) of
+    the statistics with edges from the signal events of the other folds (the fit events), and the bin of each fit
+    event, of each signal event of fold k (the apply events) and of every event of the further event sets in others
+    (e.g. the background events of every fold, so that a per-bin sum over a set can be taken under fold k's edges).
+    Events outside use enter no fit and receive no bin.
+
+    Args:
+        stats: [d, N] statistics of the signal events
+        w_sm: [N] w^s(theta_SM) of the signal events (the bins hold equal sums of it)
+        folds: [N] fold of each signal event (calibration_folds)
+        n_bins: [d] bins per level
+        use: [N] bool, signal events that enter the map and receive a bin (default all)
+        others: {p: ([d, N_p] statistics, [N_p] bool use)}, further event sets binned under every fold's edges, or None
+    Yields:
+        per fold k, in increasing order: SimpleNamespace(fold k, fit [N] bool, bins_fit [n_fit] int64, apply [N] bool,
+        bins_apply [n_apply] int64, others {p: [N_p] int64 bin, -1 outside its use})
+    """
+    stats = np.asarray(stats, dtype=np.float64)
+    w_sm = np.asarray(w_sm, dtype=np.float64)
+    folds = np.asarray(folds)
+    use = np.ones(len(w_sm), dtype=bool) if use is None else np.asarray(use, dtype=bool)
+    others = {p: (np.asarray(s, dtype=np.float64), np.asarray(u, dtype=bool)) for p, (s, u) in (others or {}).items()}
+    for k in np.unique(folds[use]):
+        fit, apply = use & (folds != k), use & (folds == k)
+        parts = [stats[:, apply]] + [s[:, u] for s, u in others.values()]
+        bins_fit, bins_all = nested_bins(stats[:, fit], w_sm[fit], np.concatenate(parts, axis=1), n_bins)
+        n_apply = int(apply.sum())
+        binned, start = {}, n_apply
+        for p, (_, u) in others.items():
+            b = np.full(len(u), -1, dtype=np.int64)
+            b[u] = bins_all[start : start + int(u.sum())]
+            start += int(u.sum())
+            binned[p] = b
+        yield types.SimpleNamespace(
+            fold=int(k), fit=fit, bins_fit=bins_fit, apply=apply, bins_apply=bins_all[:n_apply], others=binned
+        )
+
+
+def calibrated_inputs(inputs, wc, folds, n_bins=(10, 10), Gamma=None, background_folds=None):
+    """
+    Inputs whose learned ratio is the calibrated ratio to the SM, for scans of wc with any WCs and nuisances profiled:
+    fixed nested bins (calibration_bins) of wc's learned slopes (g1_hat / g0_hat, g2_hat / g0_hat, from Gamma on wc's
+    axis), cross-fitted on folds, and in each bin rho_tilde(x; theta) = T(theta)[keep_q] . (sum_b s_q) / sum_b s_0 over
+    the fit events, quadratic in every WC. Gamma becomes these per-event coefficients, mask becomes keep_q and w0
+    becomes w^s(theta_SM), so scan, nll and positive_events use them as a learned ratio. Events with g0_hat <= 0 or
+    w^s(theta_SM) <= 0 get a ratio of 0, which positive_events drops. With backgrounds, every background event is
+    binned with its own fold's edges on its own learned slopes (from its set's Gamma) and gets that bin's calibrated
+    signal term; each component's term on a signal or background event of fold k is its binned yield,
+    b_c = sum_b w_c / (scale sum_b w^s(theta_SM) K / (K - 1)), with sum_b w_c over every background event in the bin
+    under fold k's edges and sum_b w^s(theta_SM) over the fit events, so that the learned rate of component c at
+    nu = 0 is lambda_c (less the yield of background events with g0_hat <= 0, which no bin holds). The members' Gamma
+    are not calibrated (seed_Gamma None).
+
+    Args:
+        inputs: load_inputs result
+        wc: WC whose learned slopes define the bins
+        folds: [N] fold of each signal event (calibration_folds)
+        n_bins: [d] bins per level, d = 1 or 2
+        Gamma: [K, N] Gamma of the signal events' statistics (default inputs.Gamma)
+        background_folds: {p: [N_p] fold of each background event} (calibration_folds of each set's validation.p and
+            events), required with backgrounds
+    Returns:
+        SimpleNamespace: inputs with Gamma [n_q, N], mask (= keep_q), w0, seed_Gamma (None) replaced and, with
+        backgrounds, backgrounds with signal_b and every set's Gamma [n_q, N_p], b and seed_Gamma (None) replaced
+    """
+    n_bins = tuple(n_bins)
+    k = inputs.wcs.index(wc)
+    theta = [1.0] + [0.0] * len(inputs.wcs)
+    theta[k + 1] = 2.0
+    T_axis = get_lower_tri(theta, dtype=torch.float64)[inputs.mask].numpy()
+    cols = np.flatnonzero(T_axis)
+    cols = cols[np.argsort(T_axis[cols])]
+
+    def slopes(G):
+        g = np.asarray(G[cols], dtype=np.float64)
+        use = g[0] > 0
+        g0 = np.where(use, g[0], 1.0)
+        return np.stack([g[1] / g0, g[2] / g0])[: len(n_bins)], use
+
+    coefs = inputs.coefs.numpy()
+    T_sm = get_lower_tri([1.0] + [0.0] * len(inputs.wcs), dtype=torch.float64)[inputs.keep_q].numpy()
+    w_sm = coefs @ T_sm
+    stats, use = slopes(inputs.Gamma if Gamma is None else Gamma)
+    use &= w_sm > 0
+    backgrounds = getattr(inputs, 'backgrounds', None)
+    if backgrounds is not None and background_folds is None:
+        raise ValueError('calibrated inputs with backgrounds need background_folds (calibration_folds of every set)')
+    others = {} if backgrounds is None else {p: slopes(s.Gamma) for p, s in backgrounds.sets.items()}
+    n_folds = len(np.unique(np.asarray(folds)[use]))
+    size = int(np.prod(n_bins))
+    gamma = np.zeros(coefs.shape)
+    if backgrounds is not None:
+        n_c = len(backgrounds.components)
+        signal_b = np.zeros((n_c, len(w_sm)))
+        set_gamma = {p: np.zeros((s.w.shape[1], coefs.shape[1])) for p, s in backgrounds.sets.items()}
+        set_b = {p: np.zeros((n_c, s.w.shape[1])) for p, s in backgrounds.sets.items()}
+    for f in calibration_bins(stats, w_sm, folds, n_bins, use=use, others=others):
+        den = np.bincount(f.bins_fit, weights=w_sm[f.fit], minlength=size)
+        filled = den > 0
+        num = np.stack(
+            [np.bincount(f.bins_fit, weights=coefs[f.fit, q], minlength=size) for q in range(coefs.shape[1])], 1
+        )
+        ratio = np.zeros_like(num)
+        ratio[filled] = num[filled] / den[filled, None]
+        gamma[f.apply] = ratio[f.bins_apply]
+        if backgrounds is None:
+            continue
+        B = np.zeros((size, n_c))
+        for p, s in backgrounds.sets.items():
+            binned = f.others[p] >= 0
+            w = s.w.numpy()
+            for c in range(n_c):
+                B[:, c] += np.bincount(f.others[p][binned], weights=w[c, binned], minlength=size)
+        values = np.zeros_like(B)
+        values[filled] = B[filled] / (inputs.scale * den[filled, None] * n_folds / (n_folds - 1))
+        signal_b[:, f.apply] = values[f.bins_apply].T
+        for p in backgrounds.sets:
+            mine = (np.asarray(background_folds[p]) == f.fold) & (f.others[p] >= 0)
+            set_gamma[p][mine] = ratio[f.others[p][mine]]
+            set_b[p][:, mine] = values[f.others[p][mine]].T
+    out = types.SimpleNamespace(
+        **{
+            **vars(inputs),
+            'Gamma': torch.from_numpy(gamma.T.copy()),
+            'mask': inputs.keep_q.clone(),
+            'w0': torch.from_numpy(w_sm),
+            'seed_Gamma': None,
+        }
+    )
+    if backgrounds is not None:
+        sets = {
+            p: types.SimpleNamespace(
+                **{
+                    **vars(s),
+                    'Gamma': torch.from_numpy(set_gamma[p].T.copy()),
+                    'b': torch.from_numpy(set_b[p]),
+                    'seed_Gamma': None,
+                }
+            )
+            for p, s in backgrounds.sets.items()
+        }
+        out.backgrounds = types.SimpleNamespace(
+            **{**vars(backgrounds), 'signal_b': torch.from_numpy(signal_b), 'sets': sets}
+        )
+    return out
 
 
 def background_dropped(backgrounds, keep):
@@ -1991,7 +2225,9 @@ def check_scans(config):
     (one or two WCs) and grid ({poi: {values: [...]} or {range: [lo, hi], points: n}}), and optional target
     ({theta: {wc: value}, nu: {name: value}, kind: asimov or toy, seed (required for a toy)}), nu_obs ('target' or
     {name: value}), theta_base ('target' or {wc: value}: where the WCs that are not pois are held or, if profiled,
-    start; 0 by default), ratio and rate (learned or truth), profile_wcs and profile_nu (names or 'all'), selection_wcs
+    start; 0 by default), ratio (learned, truth or calibrated) and rate (learned or truth), calibration ({wc (default the poi; required
+    for two pois), bins (default [10, 10]), folds (default 5)}, ratio calibrated only: calibrated_inputs; not with
+    uncertainty), profile_wcs and profile_nu (names or 'all'), selection_wcs
     (names or 'all': further WCs whose box enters the event selection), nu_bound, cls, max_selections, box
     ({wc: [lo, hi]}, over the top-level box),
     overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty) and label
@@ -2016,9 +2252,30 @@ def check_scans(config):
             sys.exit(f'[error]: scan {label}: no grid for {missing}')
         for poi in pois:
             _grid(entry, poi, label)
-        for key in ('ratio', 'rate'):
-            if entry.get(key, 'learned') not in ('learned', 'truth'):
-                sys.exit(f"[error]: scan {label}: {key} must be learned or truth, not {entry[key]}")
+        if entry.get('ratio', 'learned') not in ('learned', 'truth', 'calibrated'):
+            sys.exit(f"[error]: scan {label}: ratio must be learned, truth or calibrated, not {entry['ratio']}")
+        if entry.get('rate', 'learned') not in ('learned', 'truth'):
+            sys.exit(f"[error]: scan {label}: rate must be learned or truth, not {entry['rate']}")
+        calibration = entry.get('calibration')
+        if calibration is not None:
+            if entry.get('ratio') != 'calibrated':
+                sys.exit(f'[error]: scan {label}: calibration needs ratio calibrated')
+            unknown = sorted(set(calibration) - set(CALIBRATION_KEYS))
+            if unknown:
+                sys.exit(f'[error]: scan {label}: unknown calibration keys {unknown}')
+            if 'wc' in calibration:
+                _check_names([calibration['wc']], config['wcs'], 'WCs in calibration', label)
+            bins = calibration.get('bins', CALIBRATION_BINS)
+            if not (1 <= len(bins) <= 2 and all(isinstance(b, int) and b >= 2 for b in bins)):
+                sys.exit(f'[error]: scan {label}: calibration bins must be one or two integers >= 2, not {bins}')
+            folds = calibration.get('folds', CALIBRATION_FOLDS)
+            if not (isinstance(folds, int) and folds >= 2):
+                sys.exit(f'[error]: scan {label}: calibration folds must be an integer >= 2')
+        if entry.get('ratio') == 'calibrated':
+            if len(pois) == 2 and 'wc' not in (calibration or {}):
+                sys.exit(f'[error]: scan {label}: a calibrated 2D scan needs calibration wc')
+            if entry.get('uncertainty'):
+                sys.exit(f'[error]: scan {label}: uncertainty is not available with ratio calibrated')
         target = entry.get('target') or {}
         unknown = sorted(set(target) - set(TARGET_KEYS))
         if unknown:
@@ -2059,7 +2316,7 @@ def check_background_options(config):
     that of the background process shape and takes its shape, with the own yield from the nominal directory of the
     process's combined sample (data: validation.p and sample.yml with eft false; every split of it counts, as no
     network holds events out) or a fixed yield (exactly one of the two with own yields); that every process a rate
-    systematic names is a signal, background or rate-only process; and that every scan uses ratio learned (background
+    systematic names is a signal, background or rate-only process; and that no scan uses ratio truth (background
     events have no structure constants for a truth signal term). Exits listing every failure.
 
     Args:
@@ -2126,9 +2383,7 @@ def check_background_options(config):
             errors.append(
                 f'rate systematic {name}: processes {unknown} are not signal, background or rate-only processes'
             )
-    truth = [
-        label for label, entry in (config.get('scans') or {}).items() if entry.get('ratio', 'learned') != 'learned'
-    ]
+    truth = [label for label, entry in (config.get('scans') or {}).items() if entry.get('ratio', 'learned') == 'truth']
     if truth:
         errors.append(f'scans {truth} use a truth ratio; backgrounds need ratio learned')
     if errors:
@@ -2147,7 +2402,7 @@ def scan_settings(config, label, inputs):
         scan_args (keyword arguments of scan other than inputs, target, Gammas, theta_t and keep), target (dict:
         theta_t [n_wcs], nu_t [n_nu] or None, kind, seed) and spec (the entry as written to scans.yml: profile_wcs,
         profile_nu and selection_wcs as name lists, nu_obs and theta_base as {name: value} of their nonzero entries,
-        box as the {wc: [lo, hi]} used)
+        box as the {wc: [lo, hi]} used, calibration {wc, bins, folds} for ratio calibrated only)
     """
     entry = config['scans'][label]
     wcs = inputs.wcs
@@ -2208,7 +2463,7 @@ def scan_settings(config, label, inputs):
         selection_wcs=selection_wcs,
         nu_bound=entry.get('nu_bound', 5.0),
         nu_obs=nu_obs,
-        ratio=entry.get('ratio', 'learned'),
+        ratio='learned' if entry.get('ratio') == 'calibrated' else entry.get('ratio', 'learned'),
         rate=entry.get('rate', 'learned'),
         cls=tuple(entry.get('cls', (0.6827, 0.95))),
         max_selections=entry.get('max_selections', 5),
@@ -2229,7 +2484,49 @@ def scan_settings(config, label, inputs):
         theta_base={w: float(v) for w, v in zip(wcs, theta_base) if v != 0},
         box=box_used,
     )
+    if entry.get('ratio') == 'calibrated':
+        calibration = entry.get('calibration') or {}
+        spec['calibration'] = dict(
+            wc=calibration.get('wc', pois[0]),
+            bins=list(calibration.get('bins', CALIBRATION_BINS)),
+            folds=int(calibration.get('folds', CALIBRATION_FOLDS)),
+        )
     return scan_args, target_spec, spec
+
+
+def scan_inputs(config, inputs, spec, cache):
+    """
+    The inputs one scan runs on: inputs itself, or for ratio calibrated the calibrated inputs (calibrated_inputs) of
+    spec['calibration'] (wc, bins, folds), with the folds of the signal events and, with backgrounds, of every
+    background event set (calibration_folds); kept in cache by (wc, bins, folds) so that scans with the same
+    calibration share them.
+
+    Args:
+        config: scan config (load_config)
+        inputs: load_inputs result
+        spec: the scan's spec (scan_settings)
+        cache: dict filled across calls
+    Returns:
+        inputs of the scan
+    """
+    calibration = spec.get('calibration')
+    if spec.get('ratio') != 'calibrated' or calibration is None:
+        return inputs
+    key = (calibration['wc'], tuple(calibration['bins']), calibration['folds'])
+    if key not in cache:
+        year_loc = config.get('year_loc', 21)
+        folds = calibration_folds(config['data'], inputs.events, year_loc, calibration['folds'])
+        background_folds = None
+        backgrounds = getattr(inputs, 'backgrounds', None)
+        if backgrounds is not None:
+            background_folds = {
+                p: calibration_folds(config['background_caches'][p]['data'], s.events, year_loc, calibration['folds'])
+                for p, s in backgrounds.sets.items()
+            }
+        cache[key] = calibrated_inputs(
+            inputs, calibration['wc'], folds, n_bins=key[1], background_folds=background_folds
+        )
+    return cache[key]
 
 
 def check_wilks(config):
@@ -2400,13 +2697,18 @@ def run_wilks(config, inputs, first_seed=None, toys=None):
     """
     name = config['name']
     os.makedirs(f'{name}/wilks', mode=0o755, exist_ok=True)
+    calibrated = {}
     for label, entry in config['wilks'].items():
         start = time.time()
-        scan_args, target_spec, _ = scan_settings(config, entry['scan'], inputs)
+        scan_args, target_spec, spec = scan_settings(config, entry['scan'], inputs)
         first = entry.get('first_seed', 0) if first_seed is None else first_seed
         n = entry['toys'] if toys is None else toys
         result = wilks_toys(
-            inputs, scan_args, target_spec, np.arange(first, first + n), entry.get('randomize_nu_obs', True)
+            scan_inputs(config, inputs, spec, calibrated),
+            scan_args,
+            target_spec,
+            np.arange(first, first + n),
+            entry.get('randomize_nu_obs', True),
         )
         np.savez_compressed(f'{name}/wilks/{label}_{first:06d}.npz', **result)
         print(
@@ -2504,15 +2806,17 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
         return
     inputs = load_inputs(config, members=any(entry.get('uncertainty') for entry in scans.values()))
     settings = {label: scan_settings(config, label, inputs) for label in scans}
+    calibrated = {}
 
     entries = {}
     for label, (scan_args, target_spec, spec) in settings.items():
         start = time.time()
-        target, background_target = scan_targets(inputs, target_spec)
+        run_inputs = scan_inputs(config, inputs, spec, calibrated)
+        target, background_target = scan_targets(run_inputs, target_spec)
         u_entry = spec.get('uncertainty')
         if u_entry:
             uncertainty = scan_uncertainty(
-                inputs,
+                run_inputs,
                 target,
                 scan_args,
                 member_scans=u_entry.get('members', True),
@@ -2526,11 +2830,11 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
         else:
             uncertainty = None
             result = scan(
-                inputs, target, theta_t=target_spec['theta_t'], background_target=background_target, **scan_args
+                run_inputs, target, theta_t=target_spec['theta_t'], background_target=background_target, **scan_args
             )
         entries[label] = dict(scan=result, theta_t=target_spec['theta_t'], spec=spec, uncertainty=uncertainty)
         write_results(name, config, inputs, entries)
-        poi = [inputs.wcs.index(p) for p in result.pois]
+        poi = [run_inputs.wcs.index(p) for p in result.pois]
         best = ', '.join(f'{p} {v:.6g}' for p, v in zip(result.pois, result.best.theta[poi]))
         resolution = grid_resolution(result)
         lowest = min(result.levels)

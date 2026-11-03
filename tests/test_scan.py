@@ -9,9 +9,12 @@ from topsbi.scan import (
     background_caches,
     background_dropped,
     background_target_weights,
+    calibrated_inputs,
     check_background_options,
+    check_scans,
     load_background_inputs,
     nll,
+    nested_bins,
     nll_terms,
     positive_background_events,
     positive_events,
@@ -311,13 +314,13 @@ def test_positive_background_events():
         positive_background_events(backgrounds, inputs.mask, box=box, members=True)
 
 
-def mixture_inputs(beta=0.1, seed=0):
+def mixture_inputs(beta=0.1, seed=0, n=400):
     """
     exact_inputs with rate systematics lumi (every process, kappa 1.02) and smxsec_B (background only, 1.2) and one
     background component B whose events are the signal events reweighted by beta (1 + 0.5 tanh(coefs_1)): its term
     b(x) is exact, and its truth yield equals its learned yield.
     """
-    inputs = exact_inputs(seed=seed)
+    inputs = exact_inputs(n=n, seed=seed)
     n = len(inputs.w0)
     inputs.rate_names = ['lumi', 'smxsec_B']
     inputs.log_kappa = torch.zeros(2, 2, n, dtype=torch.float64)
@@ -437,3 +440,59 @@ def test_scan_with_background():
     without = scan(inputs, target, ['cA'], grid, box, **args)
     assert np.allclose(with_b.q, without.q, atol=1e-8)
     assert without.background_keep is None
+
+
+def test_calibrated_inputs():
+    """Calibrated inputs: a fold's values are the other folds' bin ratios and binned background yields, background events
+    of the same fold and bin share them, the learned background rate is lambda, an Asimov scan covers its target, and
+    the calibration keys are checked and resolved."""
+    inputs = mixture_inputs(n=4000)
+    inputs.scale = 0.05
+    inputs.backgrounds.sets['B'].w *= 0.05
+    n = len(inputs.w0)
+    folds = np.arange(n) % 4
+    cal = calibrated_inputs(inputs, 'cA', folds, n_bins=(4, 3), background_folds={'B': folds})
+
+    # by hand, fold 0: bins of (g1 / g0, g2 / g0) on cA's axis (g0 = 1 here), edges from folds 1-3
+    coefs = inputs.coefs.numpy()
+    w_sm = coefs[:, 0]
+    g = inputs.Gamma.numpy()
+    stats = np.stack([g[1] / g[0], g[2] / g[0]])
+    fit, apply = folds != 0, folds == 0
+    bins_fit, bins_apply = nested_bins(stats[:, fit], w_sm[fit], stats[:, apply], (4, 3))
+    den = np.bincount(bins_fit, weights=w_sm[fit], minlength=12)
+    num = np.stack([np.bincount(bins_fit, weights=coefs[fit, q], minlength=12) for q in range(6)], 1)
+    assert np.allclose(cal.Gamma.numpy()[:, apply], (num / den[:, None])[bins_apply].T, rtol=1e-12)
+    w_b = inputs.backgrounds.sets['B'].w[0].numpy()
+    _, bins_b = nested_bins(stats[:, fit], w_sm[fit], stats, (4, 3))
+    B = np.bincount(bins_b, weights=w_b, minlength=12)
+    expected = (B / (inputs.scale * den * 4 / 3))[bins_apply]
+    assert np.allclose(cal.backgrounds.signal_b.numpy()[0, apply], expected, rtol=1e-12)
+    s = cal.backgrounds.sets['B']
+    assert torch.allclose(s.Gamma, cal.Gamma) and torch.allclose(s.b, cal.backgrounds.signal_b)
+    assert torch.equal(cal.mask, inputs.keep_q) and cal.seed_Gamma is None
+    rate = inputs.scale * (cal.w0 * cal.backgrounds.signal_b[0]).sum()
+    assert rate.item() == pytest.approx(w_b.sum(), rel=0.05)
+
+    theta_t, nu_t = np.array([0.7, -0.4]), np.array([0.3, 0.5])
+    box = np.array([[-0.5, 2.0], [-1.5, 1.0]])
+    r = scan(
+        cal, target_weights(cal, theta_t, nu_t), ['cA'], [np.linspace(0.3, 1.1, 9)], box, profile_wcs=['cB'],
+        profile_nu=['lumi', 'smxsec_B'], nu_obs=nu_t, theta_t=theta_t, theta_base=theta_t,
+        background_target=background_target_weights(cal, nu_t),
+    )
+    assert r.q_target < 1.0 and r.stable and r.success.all()
+
+    entry = {'pois': ['cA'], 'grid': {'cA': {'range': [0.0, 1.0], 'points': 3}}, 'ratio': 'calibrated'}
+    config = {'wcs': WCS, 'box': {}, 'scans': {'c': entry}}
+    check_scans(config)
+    args, _, spec = scan_settings(config, 'c', types.SimpleNamespace(wcs=WCS, nuisances=[], rate_names=[]))
+    assert args['ratio'] == 'learned' and spec['calibration'] == {'wc': 'cA', 'bins': [10, 10], 'folds': 5}
+    grid2 = {'cA': entry['grid']['cA'], 'cB': entry['grid']['cA']}
+    for bad in (
+        dict(entry, uncertainty={'members': True}),
+        dict(entry, ratio='learned', calibration={'wc': 'cA'}),
+        dict(entry, pois=['cA', 'cB'], grid=grid2),
+    ):
+        with pytest.raises(SystemExit):
+            check_scans(dict(config, scans={'c': bad}))
