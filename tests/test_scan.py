@@ -430,6 +430,8 @@ def test_scan_with_background():
     )
     assert np.allclose(u.members['best'], u.nominal.best.theta[0], atol=1e-6)
     assert u.members['background_dropped'] == [{'B': 0}, {'B': 0}]
+    assert u.members['best_nu'].shape == (2, len(u.nominal.best.nu))
+    assert np.allclose(u.members['best_nu'], u.nominal.best.nu, atol=1e-6)
     assert len(u.bootstrap['best']) == 1 and all(u.bootstrap['success'])
 
     inputs = mixture_inputs(beta=0.0)

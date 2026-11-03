@@ -1657,10 +1657,12 @@ def scan_uncertainty(
         background_target: {p: [N_p] target weights on the background events}, required with backgrounds
     Returns:
         SimpleNamespace: nominal (scan result), members, bootstrap, subsets (None when not run); members and bootstrap
-        are dicts with best [n_runs, n_poi] (best-fit pois), intervals (per run), success (per run: the best fit and
-        every grid fit converged), dropped (per run), background_dropped (per run, {p: events removed}, None without
-        backgrounds), spread [n_poi] (standard deviation of best) and, for members, error = spread / sqrt(n_e);
-        subsets is {n_e: dict with the same keys and draws (member indices per run)}
+        are dicts with best [n_runs, n_poi] (best-fit pois), best_nu [n_runs, n_nu] (nuisances at the best fit, as
+        inputs.nuisances + inputs.rate_names), intervals (per run), success (per run: the best fit and every grid fit
+        converged), dropped (per run), background_dropped (per run, {p: events removed}, None without backgrounds),
+        spread [n_poi] (standard deviation of best), nu_spread [n_nu] (standard deviation of best_nu) and, for
+        members, error = spread / sqrt(n_e); subsets is {n_e: dict with the same keys and draws (member indices per
+        run)}
     """
     if inputs.seed_Gamma is None:
         raise ValueError('member Gamma are not loaded: use load_inputs(config, members=True)')
@@ -1685,13 +1687,16 @@ def scan_uncertainty(
 
     def collect(results):
         best = np.array([s.best.theta[poi] for s in results])
+        best_nu = np.array([s.best.nu for s in results])
         return dict(
             best=best,
+            best_nu=best_nu,
             intervals=[s.intervals for s in results],
             success=[bool(s.success.all() and s.best.success) for s in results],
             dropped=[s.dropped for s in results],
             background_dropped=[s.background_dropped for s in results],
             spread=best.std(0, ddof=1) if len(best) > 1 else np.full(len(poi), np.nan),
+            nu_spread=best_nu.std(0, ddof=1) if len(best_nu) > 1 else np.full(best_nu.shape[1], np.nan),
         )
 
     out = types.SimpleNamespace(
@@ -1766,14 +1771,26 @@ def _plain(x):
     return x
 
 
-def _spread_summary(part):
-    """yaml summary of the members or bootstrap part of scan_uncertainty."""
+def _spread_summary(part, names_nu, profiled_nu):
+    """
+    yaml summary of the members or bootstrap part of scan_uncertainty.
+
+    Args:
+        part: members or bootstrap dict of scan_uncertainty
+        names_nu: nuisance names in the order of best_nu (inputs.nuisances + inputs.rate_names)
+        profiled_nu: names of the profiled nuisances, whose spread is reported
+    Returns:
+        dict: n, best, spread, all_success, profiled_nu_spread {name: spread} (when nuisances are profiled) and, for
+        members, error
+    """
     out = dict(
         n=len(part['best']),
         best=part['best'][:, 0] if part['best'].shape[1] == 1 else part['best'],
         spread=part['spread'],
         all_success=all(part['success']),
     )
+    if profiled_nu:
+        out['profiled_nu_spread'] = {n: part['nu_spread'][names_nu.index(n)] for n in profiled_nu}
     if 'error' in part:
         out['error'] = part['error']
     return out
@@ -1831,11 +1848,13 @@ def write_results(name, config, inputs, entries):
     fit diagnostics (points, failed, on a bound, largest edm, grid below the best fit, best fit repeated from a grid
     point, fits started from the profiled WCs at 0), the grid resolution (grid_resolution), the event selection
     (dropped, dropped_sm_fraction, selections, stable and, with backgrounds, background_dropped per event set and
-    background_dropped_fraction per component) and, with scan_uncertainty, members (best per member, spread, error),
-    bootstrap (best per replica, spread) and subsets (per n_e: spread, mean 68% half-width for one poi, draws).
-    scans.npz: grid, q, theta, nu, success, edm, at_bound, keep (np.packbits of the selection, N events),
-    background_keep_<p> (np.packbits of the selection of background event set p, with backgrounds) and
-    members_best, bootstrap_best, subsets_<n_e>_best when present.
+    background_dropped_fraction per component) and, with scan_uncertainty, members (best per member, spread, the
+    spread of each profiled nuisance at the best fit, error), bootstrap (best per replica, spread, profiled nuisance
+    spread) and subsets (per n_e: spread, mean 68% half-width for one poi, draws). scans.npz: grid, q, theta, nu,
+    success, edm, at_bound, keep (np.packbits of the selection, N events), background_keep_<p> (np.packbits of the
+    selection of background event set p, with backgrounds) and members_best, members_nu, bootstrap_best,
+    bootstrap_nu, subsets_<n_e>_best, subsets_<n_e>_nu (nuisances at each run's best fit, all of them, as
+    inputs.nuisances + inputs.rate_names) when present.
 
     Args:
         name: output directory
@@ -1945,11 +1964,13 @@ def write_results(name, config, inputs, entries):
         u = entry.get('uncertainty')
         if u is not None:
             if u.members is not None:
-                out['members'] = _spread_summary(u.members)
+                out['members'] = _spread_summary(u.members, names_nu, profiled_nu)
                 arrays[f'{label}/members_best'] = u.members['best']
+                arrays[f'{label}/members_nu'] = u.members['best_nu']
             if u.bootstrap is not None:
-                out['bootstrap'] = _spread_summary(u.bootstrap)
+                out['bootstrap'] = _spread_summary(u.bootstrap, names_nu, profiled_nu)
                 arrays[f'{label}/bootstrap_best'] = u.bootstrap['best']
+                arrays[f'{label}/bootstrap_nu'] = u.bootstrap['best_nu']
             if u.subsets is not None:
                 out['subsets'] = {}
                 for n_e, sub in u.subsets.items():
@@ -1963,6 +1984,7 @@ def write_results(name, config, inputs, entries):
                         item['mean_half_width'] = float(np.mean(widths)) if widths else np.nan
                     out['subsets'][n_e] = item
                     arrays[f'{label}/subsets_{n_e}_best'] = sub['best']
+                    arrays[f'{label}/subsets_{n_e}_nu'] = sub['best_nu']
         summary['scans'][label] = out
     with open(f'{name}/scans.yml', 'w') as f:
         yaml.safe_dump(_plain(summary), f, sort_keys=False)
