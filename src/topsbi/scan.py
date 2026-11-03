@@ -51,10 +51,12 @@ SCAN_KEYS = (
 TARGET_KEYS = ('theta', 'nu', 'kind', 'seed')
 UNCERTAINTY_KEYS = ('members', 'n_boot', 'subsets', 'seed')
 WILKS_KEYS = ('scan', 'toys', 'first_seed', 'randomize_nu_obs')
-BACKGROUND_KEYS = ('yields', 'card_yields', 'rate_only')
+BACKGROUND_KEYS = ('yields', 'card_yields', 'rate_only', 'calibration')
+BACKGROUND_CALIBRATION_KEYS = ('bins', 'folds')
 RATE_ONLY_KEYS = ('shape', 'data', 'yield')
 CALIBRATION_KEYS = ('wc', 'bins', 'folds')
 CALIBRATION_BINS = (10, 10)
+BACKGROUND_CALIBRATION_BINS = 20
 
 
 def load_config(config_path):
@@ -818,11 +820,12 @@ def calibrated_inputs(inputs, wc, folds, n_bins=(10, 10), Gamma=None, background
     becomes w^s(theta_SM), so scan, nll and positive_events use them as a learned ratio. Events with g0_hat <= 0 or
     w^s(theta_SM) <= 0 get a ratio of 0, which positive_events drops. With backgrounds, every background event is
     binned with its own fold's edges on its own learned slopes (from its set's Gamma) and gets that bin's calibrated
-    signal term; each component's term on a signal or background event of fold k is its binned yield,
-    b_c = sum_b w_c / (scale sum_b w^s(theta_SM) K / (K - 1)), with sum_b w_c over every background event in the bin
-    under fold k's edges and sum_b w^s(theta_SM) over the fit events, so that the learned rate of component c at
-    nu = 0 is lambda_c (less the yield of background events with g0_hat <= 0, which no bin holds). The members' Gamma
-    are not calibrated (seed_Gamma None).
+    signal term. The background terms, ratios to theta_0, move to the new reference: b_c(x) / g0_hat(x), with
+    g0_hat = r_hat(x; theta_SM) of the learned ratio (inputs.Gamma on the signal events, the set's Gamma on background
+    events), times one factor per component so that the learned rate of component c at nu = 0,
+    scale sum w^s(theta_SM) b_c over the signal events, equals its rate before, scale sum w0 b_c (lambda_c); b_c is 0
+    on events with a ratio of 0. The background terms are not calibrated here (calibrated_backgrounds). The members'
+    Gamma are not calibrated (seed_Gamma None).
 
     Args:
         inputs: load_inputs result
@@ -859,14 +862,10 @@ def calibrated_inputs(inputs, wc, folds, n_bins=(10, 10), Gamma=None, background
     if backgrounds is not None and background_folds is None:
         raise ValueError('calibrated inputs with backgrounds need background_folds (calibration_folds of every set)')
     others = {} if backgrounds is None else {p: slopes(s.Gamma) for p, s in backgrounds.sets.items()}
-    n_folds = len(np.unique(np.asarray(folds)[use]))
     size = int(np.prod(n_bins))
     gamma = np.zeros(coefs.shape)
     if backgrounds is not None:
-        n_c = len(backgrounds.components)
-        signal_b = np.zeros((n_c, len(w_sm)))
         set_gamma = {p: np.zeros((s.w.shape[1], coefs.shape[1])) for p, s in backgrounds.sets.items()}
-        set_b = {p: np.zeros((n_c, s.w.shape[1])) for p, s in backgrounds.sets.items()}
     for f in calibration_bins(stats, w_sm, folds, n_bins, use=use, others=others):
         den = np.bincount(f.bins_fit, weights=w_sm[f.fit], minlength=size)
         filled = den > 0
@@ -876,21 +875,9 @@ def calibrated_inputs(inputs, wc, folds, n_bins=(10, 10), Gamma=None, background
         ratio = np.zeros_like(num)
         ratio[filled] = num[filled] / den[filled, None]
         gamma[f.apply] = ratio[f.bins_apply]
-        if backgrounds is None:
-            continue
-        B = np.zeros((size, n_c))
-        for p, s in backgrounds.sets.items():
-            binned = f.others[p] >= 0
-            w = s.w.numpy()
-            for c in range(n_c):
-                B[:, c] += np.bincount(f.others[p][binned], weights=w[c, binned], minlength=size)
-        values = np.zeros_like(B)
-        values[filled] = B[filled] / (inputs.scale * den[filled, None] * n_folds / (n_folds - 1))
-        signal_b[:, f.apply] = values[f.bins_apply].T
-        for p in backgrounds.sets:
+        for p in backgrounds.sets if backgrounds is not None else ():
             mine = (np.asarray(background_folds[p]) == f.fold) & (f.others[p] >= 0)
             set_gamma[p][mine] = ratio[f.others[p][mine]]
-            set_b[p][:, mine] = values[f.others[p][mine]].T
     out = types.SimpleNamespace(
         **{
             **vars(inputs),
@@ -901,6 +888,20 @@ def calibrated_inputs(inputs, wc, folds, n_bins=(10, 10), Gamma=None, background
         }
     )
     if backgrounds is not None:
+        g0 = np.asarray(inputs.Gamma[cols[0]], dtype=np.float64)
+        on = use & (g0 > 0)
+        old = backgrounds.signal_b.numpy()
+        moved = np.zeros(old.shape)
+        moved[:, on] = old[:, on] / g0[on]
+        factor = (inputs.w0.numpy() * old).sum(1) / (w_sm * moved).sum(1)
+        signal_b = moved * factor[:, None]
+        set_b = {}
+        for p, s in backgrounds.sets.items():
+            g0_p = np.asarray(s.Gamma[cols[0]], dtype=np.float64)
+            on_p = others[p][1]
+            b = np.zeros(s.b.shape)
+            b[:, on_p] = s.b.numpy()[:, on_p] / g0_p[on_p] * factor[:, None]
+            set_b[p] = b
         sets = {
             p: types.SimpleNamespace(
                 **{
@@ -916,6 +917,87 @@ def calibrated_inputs(inputs, wc, folds, n_bins=(10, 10), Gamma=None, background
             **{**vars(backgrounds), 'signal_b': torch.from_numpy(signal_b), 'sets': sets}
         )
     return out
+
+
+def calibrated_backgrounds(inputs, folds, background_folds, n_bins=BACKGROUND_CALIBRATION_BINS):
+    """
+    Inputs whose background terms are calibrated in bins of their own value, cross-fitted. For every background
+    component c and fold k: n_bins equal-weight bins of b_c (a positive multiple of the seed-mean output of c's
+    background network, so the bins are those of r_hat(x; q_c)), with edges from the background events of the other
+    folds that carry c (w_c != 0; weights w_c, negative ones counted as 0 for the edges), and per bin the factor
+    k_c,b = sum_b w_c / (scale sum_b w0 b_c), the first sum over the background events and the second over the
+    signal events of the other folds. The factors of fold k multiply b_c on the signal events and on every background
+    event of fold k, so that the learned yield of component c in each bin matches its background events there. A bin
+    whose sum of w_c or of w0 b_c is not positive keeps the factor 1. w0 is the inputs' own: w^s(theta_0) for the
+    learned ratio, w^s(theta_SM) after calibrated_inputs. Every loaded event enters, including those a scan's
+    selection later drops.
+
+    Args:
+        inputs: load_inputs result with backgrounds, or calibrated_inputs result
+        folds: [N] fold of each signal event (calibration_folds)
+        background_folds: {p: [N_p] fold of each background event of set p} (calibration_folds of the set)
+        n_bins: bins of each component's b_c
+    Returns:
+        SimpleNamespace: inputs with backgrounds replaced: signal_b and every set's b calibrated, and calibration
+        {component: {'factors' [K, n_bins] (row k: the factors applied to fold k), 'edges' [K, n_bins - 1],
+        'unfilled' [K] (bins kept at factor 1)}}
+    """
+    backgrounds = inputs.backgrounds
+    sets = backgrounds.sets
+    folds = np.asarray(folds)
+    background_folds = {p: np.asarray(background_folds[p]) for p in sets}
+    ks = np.unique(folds)
+    if any(not np.isin(np.unique(f), ks).all() for f in background_folds.values()):
+        raise ValueError('background folds outside the signal folds')
+    w0 = inputs.w0.numpy()
+    signal_b = backgrounds.signal_b.numpy()
+    set_b = {p: s.b.numpy() for p, s in sets.items()}
+    new_signal_b = signal_b.copy()
+    new_set_b = {p: b.copy() for p, b in set_b.items()}
+    calibration = {}
+    for c, name in enumerate(backgrounds.components):
+        b_bkg = np.concatenate([set_b[p][c] for p in sets])
+        w_bkg = np.concatenate([s.w[c].numpy() for s in sets.values()])
+        f_bkg = np.concatenate([background_folds[p] for p in sets])
+        carries = w_bkg != 0
+        factors = np.ones((len(ks), n_bins))
+        edges = np.empty((len(ks), n_bins - 1))
+        unfilled = np.zeros(len(ks), dtype=np.int64)
+        for i, k in enumerate(ks):
+            fit_b = carries & (f_bkg != k)
+            edges[i] = quantile_edges(b_bkg[fit_b], np.clip(w_bkg[fit_b], 0.0, None), n_bins)
+            num = np.bincount(
+                np.searchsorted(edges[i], b_bkg[fit_b], side='right'), weights=w_bkg[fit_b], minlength=n_bins
+            )
+            fit_s = folds != k
+            den = inputs.scale * np.bincount(
+                np.searchsorted(edges[i], signal_b[c, fit_s], side='right'),
+                weights=w0[fit_s] * signal_b[c, fit_s],
+                minlength=n_bins,
+            )
+            filled = (num > 0) & (den > 0)
+            factors[i, filled] = num[filled] / den[filled]
+            unfilled[i] = int((~filled).sum())
+            apply = folds == k
+            new_signal_b[c, apply] = (
+                signal_b[c, apply] * factors[i][np.searchsorted(edges[i], signal_b[c, apply], side='right')]
+            )
+            for p in sets:
+                mine = background_folds[p] == k
+                new_set_b[p][c, mine] = (
+                    set_b[p][c, mine] * factors[i][np.searchsorted(edges[i], set_b[p][c, mine], side='right')]
+                )
+        calibration[name] = {'factors': factors, 'edges': edges, 'unfilled': unfilled}
+    new_sets = {p: types.SimpleNamespace(**{**vars(s), 'b': torch.from_numpy(new_set_b[p])}) for p, s in sets.items()}
+    new_backgrounds = types.SimpleNamespace(
+        **{
+            **vars(backgrounds),
+            'signal_b': torch.from_numpy(new_signal_b),
+            'sets': new_sets,
+            'calibration': calibration,
+        }
+    )
+    return types.SimpleNamespace(**{**vars(inputs), 'backgrounds': new_backgrounds})
 
 
 def background_dropped(backgrounds, keep):
@@ -1839,7 +1921,8 @@ def write_results(name, config, inputs, entries):
     Write the scans to {name}/scans.yml (summary) and {name}/scans.npz (arrays, keys <label>/<array>).
 
     scans.yml: inputs (configs, data, sm_yield, scale, events, wcs, nuisances, rate systematics, time and, with
-    backgrounds, the yields option and each component's yield lambda_c and shape) and per scan
+    backgrounds, the yields option, each component's yield lambda_c and shape, and the background calibration
+    ({bins, folds} with defaults filled in, None when off)) and per scan
     its config entry (spec), pois, target theta_t (pois), best fit (pois, nll_min, success, edm, at a bound), q
     levels and intervals per confidence level (one poi: the segment containing the minimum) and all segments of each
     level (one poi), with a target q_target = q(theta_t) (when the scan computed it) and, for one poi, the shift
@@ -1848,25 +1931,30 @@ def write_results(name, config, inputs, entries):
     fit diagnostics (points, failed, on a bound, largest edm, grid below the best fit, best fit repeated from a grid
     point, fits started from the profiled WCs at 0), the grid resolution (grid_resolution), the event selection
     (dropped, dropped_sm_fraction, selections, stable and, with backgrounds, background_dropped per event set and
-    background_dropped_fraction per component) and, with scan_uncertainty, members (best per member, spread, the
-    spread of each profiled nuisance at the best fit, error), bootstrap (best per replica, spread, profiled nuisance
-    spread) and subsets (per n_e: spread, mean 68% half-width for one poi, draws). scans.npz: grid, q, theta, nu,
-    success, edm, at_bound, keep (np.packbits of the selection, N events), background_keep_<p> (np.packbits of the
-    selection of background event set p, with backgrounds) and members_best, members_nu, bootstrap_best,
-    bootstrap_nu, subsets_<n_e>_best, subsets_<n_e>_nu (nuisances at each run's best fit, all of them, as
-    inputs.nuisances + inputs.rate_names) when present.
+    background_dropped_fraction per component), with the background calibration per component the bins kept at
+    factor 1 per fold (unfilled) and the smallest and largest factor (calibrated_backgrounds), and, with
+    scan_uncertainty, members (best per member, spread, the spread of each profiled nuisance at the best fit, error),
+    bootstrap (best per replica, spread, profiled nuisance spread) and subsets (per n_e: spread, mean 68% half-width
+    for one poi, draws). scans.npz: grid, q, theta, nu, success, edm, at_bound, keep (np.packbits of the selection, N
+    events), background_keep_<p> (np.packbits of the selection of background event set p, with backgrounds),
+    background_calibration_<c>_factors [K, n_bins], _edges [K, n_bins - 1] and _unfilled [K] per component c (with
+    the background calibration) and members_best, members_nu, bootstrap_best, bootstrap_nu, subsets_<n_e>_best,
+    subsets_<n_e>_nu (nuisances at each run's best fit, all of them, as inputs.nuisances + inputs.rate_names) when
+    present.
 
     Args:
         name: output directory
         config: scan config (load_config)
         inputs: load_inputs result
         entries: {label: {'scan': scan result, 'theta_t': [n_wcs] target or None, 'spec': the scan's config entry,
-            'uncertainty': scan_uncertainty result or None (its nominal is 'scan')}}
+            'uncertainty': scan_uncertainty result or None (its nominal is 'scan'), 'background_calibration': the
+            calibration of the scan's inputs (calibrated_backgrounds) or None}}
     """
     os.makedirs(name, mode=0o755, exist_ok=True)
     wcs = inputs.wcs
     names_nu = list(inputs.nuisances) + list(inputs.rate_names)
     backgrounds = getattr(inputs, 'backgrounds', None)
+    options = config.get('backgrounds') or {}
     summary = {
         'inputs': {
             'ensemble': config['ensemble'],
@@ -1881,10 +1969,16 @@ def write_results(name, config, inputs, entries):
             'backgrounds': None
             if backgrounds is None
             else {
-                'yields': (config['backgrounds'] or {}).get('yields', 'own'),
+                'yields': options.get('yields', 'own'),
                 'components': {
                     c: {'yield': float(y), 'shape': shape}
                     for c, y, shape in zip(backgrounds.components, backgrounds.yields, backgrounds.shapes)
+                },
+                'calibration': None
+                if 'calibration' not in options
+                else {
+                    'bins': options['calibration'].get('bins', BACKGROUND_CALIBRATION_BINS),
+                    'folds': options['calibration'].get('folds', CALIBRATION_FOLDS),
                 },
             },
             'created': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -1957,6 +2051,20 @@ def write_results(name, config, inputs, entries):
             out['selection']['background_dropped_fraction'] = s.background_dropped_fraction
             for p, k in background_keep.items():
                 arrays[f'{label}/background_keep_{p}'] = np.packbits(np.asarray(k))
+        # background calibration
+        calibration = entry.get('background_calibration')
+        if calibration is not None:
+            out['background_calibration'] = {
+                c: {
+                    'unfilled': [int(n) for n in v['unfilled']],
+                    'factor_min': float(v['factors'].min()),
+                    'factor_max': float(v['factors'].max()),
+                }
+                for c, v in calibration.items()
+            }
+            for c, v in calibration.items():
+                for key in ('factors', 'edges', 'unfilled'):
+                    arrays[f'{label}/background_calibration_{c}_{key}'] = np.asarray(v[key])
         for key in ('grid', 'q', 'theta', 'nu', 'success', 'edm', 'at_bound'):
             arrays[f'{label}/{key}'] = np.asarray(getattr(s, key))
         arrays[f'{label}/keep'] = np.packbits(np.asarray(s.keep))
@@ -2337,9 +2445,12 @@ def check_background_options(config):
     own); rate_only ({process: {shape, data or yield}}): processes without events or network whose yield is added to
     that of the background process shape and takes its shape, with the own yield from the nominal directory of the
     process's combined sample (data: validation.p and sample.yml with eft false; every split of it counts, as no
-    network holds events out) or a fixed yield (exactly one of the two with own yields); that every process a rate
-    systematic names is a signal, background or rate-only process; and that no scan uses ratio truth (background
-    events have no structure constants for a truth signal term). Exits listing every failure.
+    network holds events out) or a fixed yield (exactly one of the two with own yields); calibration ({bins, folds},
+    absent by default): every scan's background terms calibrated in bins of their own value (calibrated_backgrounds;
+    bins default BACKGROUND_CALIBRATION_BINS, folds default CALIBRATION_FOLDS, both integers >= 2), not with a scan
+    that sets uncertainty; that every process a rate systematic names is a signal, background or rate-only process;
+    and that no scan uses ratio truth (background events have no structure constants for a truth signal term). Exits
+    listing every failure.
 
     Args:
         config: scan config (load_config) with backgrounds
@@ -2347,6 +2458,9 @@ def check_background_options(config):
 
     def positive(value):
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+    def count(value):
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 2
 
     options = config['backgrounds'] or {}
     signal = list(config['processes'])
@@ -2398,6 +2512,21 @@ def check_background_options(config):
     for p, value in card.items():
         if not positive(value):
             errors.append(f'card_yields {p} must be a positive number, not {value}')
+    # calibration
+    if 'calibration' in options:
+        calibration = options['calibration']
+        if not isinstance(calibration, dict):
+            errors.append(f'calibration must be a mapping {{bins, folds}}, not {calibration}')
+        else:
+            unknown = sorted(set(calibration) - set(BACKGROUND_CALIBRATION_KEYS))
+            if unknown:
+                errors.append(f'calibration: unknown keys {unknown}')
+            for key, default in (('bins', BACKGROUND_CALIBRATION_BINS), ('folds', CALIBRATION_FOLDS)):
+                if not count(calibration.get(key, default)):
+                    errors.append(f'calibration {key} must be an integer >= 2, not {calibration[key]}')
+        with_uncertainty = [label for label, entry in (config.get('scans') or {}).items() if 'uncertainty' in entry]
+        if with_uncertainty:
+            errors.append(f'scans {with_uncertainty} set uncertainty, which is not available with calibration')
     known = signal + backgrounds + list(rate_only)
     for name, syst in (config.get('rate_systematics') or {}).items():
         unknown = sorted(set(syst.get('processes', [])) - set(known))
@@ -2518,10 +2647,12 @@ def scan_settings(config, label, inputs):
 
 def scan_inputs(config, inputs, spec, cache):
     """
-    The inputs one scan runs on: inputs itself, or for ratio calibrated the calibrated inputs (calibrated_inputs) of
-    spec['calibration'] (wc, bins, folds), with the folds of the signal events and, with backgrounds, of every
-    background event set (calibration_folds); kept in cache by (wc, bins, folds) so that scans with the same
-    calibration share them.
+    The inputs one scan runs on: for ratio calibrated, the calibrated inputs (calibrated_inputs) of
+    spec['calibration'] (wc, bins, folds), otherwise inputs itself; then, with backgrounds and
+    config['backgrounds']['calibration'] ({bins, folds}), those inputs with calibrated background terms
+    (calibrated_backgrounds). The folds of the signal events and of every background event set are calibration_folds
+    with each calibration's own number of folds. Kept in cache by the scan's signal calibration (wc, bins, folds), or
+    None for the learned ratio, so that scans with the same calibration share them.
 
     Args:
         config: scan config (load_config)
@@ -2531,24 +2662,38 @@ def scan_inputs(config, inputs, spec, cache):
     Returns:
         inputs of the scan
     """
-    calibration = spec.get('calibration')
-    if spec.get('ratio') != 'calibrated' or calibration is None:
+    calibration = spec.get('calibration') if spec.get('ratio') == 'calibrated' else None
+    background_calibration = (config.get('backgrounds') or {}).get('calibration')
+    backgrounds = getattr(inputs, 'backgrounds', None)
+    if backgrounds is None:
+        background_calibration = None
+    if calibration is None and background_calibration is None:
         return inputs
-    key = (calibration['wc'], tuple(calibration['bins']), calibration['folds'])
-    if key not in cache:
-        year_loc = config.get('year_loc', 21)
-        folds = calibration_folds(config['data'], inputs.events, year_loc, calibration['folds'])
-        background_folds = None
-        backgrounds = getattr(inputs, 'backgrounds', None)
-        if backgrounds is not None:
-            background_folds = {
-                p: calibration_folds(config['background_caches'][p]['data'], s.events, year_loc, calibration['folds'])
-                for p, s in backgrounds.sets.items()
-            }
-        cache[key] = calibrated_inputs(
-            inputs, calibration['wc'], folds, n_bins=key[1], background_folds=background_folds
+    key = None if calibration is None else (calibration['wc'], tuple(calibration['bins']), calibration['folds'])
+    if key in cache:
+        return cache[key]
+    year_loc = config.get('year_loc', 21)
+
+    def folds_of(n_folds):
+        folds = calibration_folds(config['data'], inputs.events, year_loc, n_folds)
+        if backgrounds is None:
+            return folds, None
+        return folds, {
+            p: calibration_folds(config['background_caches'][p]['data'], s.events, year_loc, n_folds)
+            for p, s in backgrounds.sets.items()
+        }
+
+    out = inputs
+    if calibration is not None:
+        folds, background_folds = folds_of(calibration['folds'])
+        out = calibrated_inputs(out, calibration['wc'], folds, n_bins=key[1], background_folds=background_folds)
+    if background_calibration is not None:
+        folds, background_folds = folds_of(background_calibration.get('folds', CALIBRATION_FOLDS))
+        out = calibrated_backgrounds(
+            out, folds, background_folds, n_bins=background_calibration.get('bins', BACKGROUND_CALIBRATION_BINS)
         )
-    return cache[key]
+    cache[key] = out
+    return out
 
 
 def check_wilks(config):
@@ -2854,7 +2999,13 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
             result = scan(
                 run_inputs, target, theta_t=target_spec['theta_t'], background_target=background_target, **scan_args
             )
-        entries[label] = dict(scan=result, theta_t=target_spec['theta_t'], spec=spec, uncertainty=uncertainty)
+        entries[label] = dict(
+            scan=result,
+            theta_t=target_spec['theta_t'],
+            spec=spec,
+            uncertainty=uncertainty,
+            background_calibration=getattr(getattr(run_inputs, 'backgrounds', None), 'calibration', None),
+        )
         write_results(name, config, inputs, entries)
         poi = [run_inputs.wcs.index(p) for p in result.pois]
         best = ', '.join(f'{p} {v:.6g}' for p, v in zip(result.pois, result.best.theta[poi]))

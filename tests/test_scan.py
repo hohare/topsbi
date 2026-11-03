@@ -9,6 +9,7 @@ from topsbi.scan import (
     background_caches,
     background_dropped,
     background_target_weights,
+    calibrated_backgrounds,
     calibrated_inputs,
     check_background_options,
     check_scans,
@@ -171,18 +172,24 @@ def background_config(tmp_path, **options):
 
 
 def test_background_options_valid(tmp_path):
-    """Own yields with DY from its sample, and card yields for every process, pass."""
+    """Own yields with DY from its sample, card yields for every process, and calibration (defaults or set) pass."""
     check_background_options(background_config(tmp_path))
     check_background_options(
         background_config(tmp_path, yields='card', card_yields={'tW': 5000.0, 'Others': 1200.0, 'DY': 300.0})
     )
+    check_background_options(background_config(tmp_path, calibration={}))
+    check_background_options(background_config(tmp_path, calibration={'bins': 10, 'folds': 4}))
 
 
 def test_background_options_invalid(tmp_path):
     """Every problem of the block is reported, then the run stops."""
-    config = background_config(tmp_path, yields='card', card_yields={'tW': -1.0, 'ttH': 3.0}, extra=1)
+    config = background_config(
+        tmp_path, yields='card', card_yields={'tW': -1.0, 'ttH': 3.0}, extra=1,
+        calibration={'bins': 1, 'folds': 2.5, 'wc': 'cA'},
+    )
     config['backgrounds']['rate_only']['DY']['shape'] = 'tt'
     config['rate_systematics']['smxsec_ttZ'] = {'kappa': 1.1, 'processes': ['ttZ']}
+    config['scans'] = {'s0': {'uncertainty': {'n_boot': 5}}}
     with pytest.raises(SystemExit) as stop:
         check_background_options(config)
     message = str(stop.value)
@@ -193,6 +200,10 @@ def test_background_options_invalid(tmp_path):
         "names ['ttH']",
         'card_yields tW must be a positive number',
         "processes ['ttZ']",
+        "calibration: unknown keys ['wc']",
+        'calibration bins must be an integer >= 2, not 1',
+        'calibration folds must be an integer >= 2, not 2.5',
+        "scans ['s0'] set uncertainty",
     ):
         assert text in message
     config = background_config(tmp_path)
@@ -445,9 +456,9 @@ def test_scan_with_background():
 
 
 def test_calibrated_inputs():
-    """Calibrated inputs: a fold's values are the other folds' bin ratios and binned background yields, background events
-    of the same fold and bin share them, the learned background rate is lambda, an Asimov scan covers its target, and
-    the calibration keys are checked and resolved."""
+    """Calibrated inputs: a fold's values are the other folds' bin ratios, background events of the same fold and bin
+    share them, the background term moves to the SM reference (b / g0_hat, rate kept), an Asimov scan covers its target,
+    and the calibration keys are checked and resolved."""
     inputs = mixture_inputs(n=4000)
     inputs.scale = 0.05
     inputs.backgrounds.sets['B'].w *= 0.05
@@ -465,16 +476,50 @@ def test_calibrated_inputs():
     den = np.bincount(bins_fit, weights=w_sm[fit], minlength=12)
     num = np.stack([np.bincount(bins_fit, weights=coefs[fit, q], minlength=12) for q in range(6)], 1)
     assert np.allclose(cal.Gamma.numpy()[:, apply], (num / den[:, None])[bins_apply].T, rtol=1e-12)
-    w_b = inputs.backgrounds.sets['B'].w[0].numpy()
-    _, bins_b = nested_bins(stats[:, fit], w_sm[fit], stats, (4, 3))
-    B = np.bincount(bins_b, weights=w_b, minlength=12)
-    expected = (B / (inputs.scale * den * 4 / 3))[bins_apply]
-    assert np.allclose(cal.backgrounds.signal_b.numpy()[0, apply], expected, rtol=1e-12)
     s = cal.backgrounds.sets['B']
-    assert torch.allclose(s.Gamma, cal.Gamma) and torch.allclose(s.b, cal.backgrounds.signal_b)
+    assert torch.allclose(s.Gamma, cal.Gamma)
     assert torch.equal(cal.mask, inputs.keep_q) and cal.seed_Gamma is None
-    rate = inputs.scale * (cal.w0 * cal.backgrounds.signal_b[0]).sum()
-    assert rate.item() == pytest.approx(w_b.sum(), rel=0.05)
+    # theta_0 = SM and g0_hat = 1 here: the background term is unchanged
+    assert torch.allclose(cal.backgrounds.signal_b, inputs.backgrounds.signal_b, rtol=1e-12)
+    assert torch.allclose(s.b, inputs.backgrounds.sets['B'].b, rtol=1e-12)
+
+    # a learned g0_hat != 1 (the same rows of Gamma on the signal and background events): b / g0_hat, rate kept
+    moved = mixture_inputs(n=4000)
+    moved.Gamma[0] *= 1 + 0.5 * torch.tanh(moved.coefs[:, 3])
+    cal_moved = calibrated_inputs(moved, 'cA', folds, n_bins=(4, 3), background_folds={'B': folds})
+    b, g0 = moved.backgrounds.signal_b[0].numpy(), moved.Gamma[0].numpy()
+    expected = b / g0 * (moved.w0.numpy() * b).sum() / (w_sm * b / g0).sum()
+    assert np.allclose(cal_moved.backgrounds.signal_b[0].numpy(), expected, rtol=1e-12)
+    assert np.allclose(cal_moved.backgrounds.sets['B'].b[0].numpy(), expected, rtol=1e-12)
+    rate = (cal_moved.w0 * cal_moved.backgrounds.signal_b[0]).sum()
+    assert rate.item() == pytest.approx((moved.w0 * moved.backgrounds.signal_b[0]).sum().item(), rel=1e-12)
+
+    # background calibration: a flattened term b^0.8 (same rate) misses the background yield in bins of b and closes
+    # after calibrated_backgrounds (the background events are the signal events here, w = scale w0 b)
+    b_true = inputs.backgrounds.signal_b[0].numpy()
+    w0 = inputs.w0.numpy()
+    flat = b_true**0.8 * (w0 * b_true).sum() / (w0 * b_true**0.8).sum()
+    flattened = types.SimpleNamespace(**vars(inputs))
+    flattened.backgrounds = types.SimpleNamespace(
+        **{
+            **vars(inputs.backgrounds),
+            'signal_b': torch.from_numpy(flat[None].copy()),
+            'sets': {'B': types.SimpleNamespace(**{**vars(s), 'b': torch.from_numpy(flat[None].copy())})},
+        }
+    )
+    cal_b = calibrated_backgrounds(flattened, folds, {'B': folds}, n_bins=10)
+    assert torch.equal(flattened.backgrounds.signal_b[0], torch.from_numpy(flat))
+    fixed = cal_b.backgrounds.signal_b[0].numpy()
+    assert np.allclose(cal_b.backgrounds.sets['B'].b[0].numpy(), fixed, rtol=1e-12)
+    record = cal_b.backgrounds.calibration['B']
+    assert record['factors'].shape == (4, 10) and record['edges'].shape == (4, 9) and not record['unfilled'].any()
+    bins = np.searchsorted(np.quantile(b_true, np.arange(1, 10) / 10), b_true, side='right')
+    truth = np.bincount(bins, weights=w0 * b_true, minlength=10)
+    before = np.bincount(bins, weights=w0 * flat, minlength=10) / truth - 1
+    after = np.bincount(bins, weights=w0 * fixed, minlength=10) / truth - 1
+    assert np.abs(before).max() > 0.05
+    assert np.abs(after).max() < 0.02
+    assert (w0 * fixed).sum() == pytest.approx((w0 * b_true).sum(), rel=2e-3)
 
     theta_t, nu_t = np.array([0.7, -0.4]), np.array([0.3, 0.5])
     box = np.array([[-0.5, 2.0], [-1.5, 1.0]])
