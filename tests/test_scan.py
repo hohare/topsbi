@@ -8,6 +8,7 @@ import yaml
 from topsbi.scan import (
     background_caches,
     background_dropped,
+    background_target_weights,
     check_background_options,
     load_background_inputs,
     nll,
@@ -16,6 +17,7 @@ from topsbi.scan import (
     positive_events,
     scan,
     scan_settings,
+    scan_uncertainty,
     target_weights,
 )
 
@@ -192,9 +194,11 @@ def test_background_options_invalid(tmp_path):
         assert text in message
     config = background_config(tmp_path)
     config['backgrounds']['rate_only']['DY']['yield'] = 250.0
+    config['scans'] = {'s1': {'ratio': 'truth'}}
     with pytest.raises(SystemExit) as stop:
         check_background_options(config)
     assert 'exactly one of data and yield' in str(stop.value)
+    assert "scans ['s1'] use a truth ratio" in str(stop.value)
 
 
 def write_background_sample(directory, weights, eras, fractions):
@@ -377,3 +381,59 @@ def test_mixture_zero_background():
         assert torch.allclose(nll(theta, nu, with_b, rate=rate), nll(theta, nu, without, rate=rate), rtol=1e-12)
     with pytest.raises(ValueError):
         nll(theta, nu, with_b, ratio='truth')
+
+
+def test_background_target_weights():
+    """Asimov background targets are w_c kappa_c(nu_t); toys are reproducible, zero outside keep, and refuse
+    negative expected weights."""
+    inputs = mixture_inputs()
+    nu_t = np.array([0.3, 0.5])
+    asimov = background_target_weights(inputs, nu_t)
+    w = inputs.backgrounds.sets['B'].w[0]
+    assert torch.allclose(asimov['B'], w * 1.02**0.3 * 1.2**0.5, rtol=1e-12)
+    assert torch.equal(background_target_weights(inputs)['B'], w)
+    keep = {'B': torch.arange(len(w)) >= 100}
+    toy = background_target_weights(inputs, nu_t, kind='toy', keep=keep, seed=3)
+    assert torch.equal(toy['B'], background_target_weights(inputs, nu_t, kind='toy', keep=keep, seed=3)['B'])
+    assert (toy['B'][:100] == 0).all() and toy['B'].sum() > 0
+    inputs.backgrounds.sets['B'].w[0, 150] = -1.0
+    with pytest.raises(ValueError):
+        background_target_weights(inputs, nu_t, kind='toy', keep=keep, seed=3)
+
+
+def test_scan_with_background():
+    """An Asimov scan with a background returns its target, keeps every event, and a zero-yield background
+    reproduces the scan without backgrounds."""
+    theta_t, nu_t = np.array([0.7, -0.4]), np.array([0.3, 0.5])
+    box = np.array([[-0.5, 2.0], [-1.5, 1.0]])
+    grid = [np.linspace(0.3, 1.1, 9)]
+    inputs = mixture_inputs()
+    target = target_weights(inputs, theta_t, nu_t)
+    s = scan(
+        inputs, target, ['cA'], grid, box, profile_wcs=['cB'], profile_nu=['lumi', 'smxsec_B'], nu_obs=nu_t,
+        theta_t=theta_t, theta_base=theta_t, background_target=background_target_weights(inputs, nu_t),
+    )
+    assert np.allclose(s.best.theta, theta_t, atol=1e-4)
+    assert np.allclose(s.best.nu, nu_t, atol=1e-3)
+    assert s.q_target < 1e-6
+    assert s.background_dropped == {'B': 0} and s.background_dropped_fraction == {'B': 0.0}
+    with pytest.raises(ValueError):
+        scan(inputs, target, ['cA'], grid, box, theta_t=theta_t)
+    inputs.seed_Gamma = {0: inputs.Gamma, 1: inputs.Gamma.clone()}
+    inputs.backgrounds.sets['B'].seed_Gamma = {0: inputs.Gamma, 1: inputs.Gamma.clone()}
+    u = scan_uncertainty(
+        inputs, target, dict(pois=['cA'], grids=grid, box=box, profile_wcs=['cB'], theta_base=theta_t), n_boot=1,
+        background_target=background_target_weights(inputs, nu_t), theta_t=theta_t,
+    )
+    assert np.allclose(u.members['best'], u.nominal.best.theta[0], atol=1e-6)
+    assert u.members['background_dropped'] == [{'B': 0}, {'B': 0}]
+    assert len(u.bootstrap['best']) == 1 and all(u.bootstrap['success'])
+
+    inputs = mixture_inputs(beta=0.0)
+    target = target_weights(inputs, theta_t)
+    args = dict(profile_wcs=['cB'], theta_t=theta_t, theta_base=theta_t)
+    with_b = scan(inputs, target, ['cA'], grid, box, background_target=background_target_weights(inputs), **args)
+    inputs.backgrounds = None
+    without = scan(inputs, target, ['cA'], grid, box, **args)
+    assert np.allclose(with_b.q, without.q, atol=1e-8)
+    assert without.background_keep is None

@@ -888,6 +888,84 @@ def target_weights(inputs, theta_t, nu_t=None, kind='asimov', keep=None, seed=No
     return torch.bincount(picks, minlength=len(w)).to(torch.float64)
 
 
+def background_target_weights(inputs, nu_t=None, kind='asimov', keep=None, seed=None):
+    """
+    Target weights w^t of a scan on the background events, in expected-yield units, from each event's expected weight
+    at nu_t, sum_c w_c kappa_c(nu_t) (w_c from load_background_inputs, kappa_c the rate systematics of component c, as
+    in nll): 'asimov' returns them; 'toy' draws, for each background event set in turn, N_t ~ Poisson(sum of its
+    weights) and N_t events with replacement with probability proportional to the weights, and returns each event's
+    count. The toy's random generator is seeded from (seed, 1), so that the background part and the signal part of a
+    toy (target_weights with the same seed) are independent draws.
+
+    Args:
+        inputs: load_inputs result with backgrounds
+        nu_t: [n_nu] target nuisances (shape, then rate), default 0
+        kind: 'asimov' or 'toy'
+        keep: {p: [N_p] bool}, background events a toy is drawn from (positive_background_events); default every event
+        seed: seed of the toy's random generator
+    Returns:
+        {p: [N_p] float64 w^t} for every background event set p (0 outside keep for a toy)
+    """
+    backgrounds = inputs.backgrounds
+    kappa = torch.ones(len(backgrounds.components), dtype=torch.float64)
+    if nu_t is not None:
+        nu = torch.as_tensor(nu_t, dtype=torch.float64)[len(inputs.nuisances) :]
+        A, B = nuisance_terms(None, backgrounds.log_kappa)
+        kappa = torch.exp(nu @ A + step_h(nu) @ B)
+    weights = {p: kappa @ s.w for p, s in backgrounds.sets.items()}
+    if kind == 'asimov':
+        return weights
+    if kind != 'toy':
+        raise ValueError(f"kind must be 'asimov' or 'toy', not {kind}")
+    generator = torch.Generator()
+    generator.manual_seed(
+        int(np.random.SeedSequence([seed, 1]).generate_state(1)[0]) if seed is not None else torch.seed()
+    )
+    out = {}
+    for p, w in weights.items():
+        if keep is not None:
+            w = torch.where(torch.as_tensor(keep[p], dtype=torch.bool), w, 0.0)
+        if (w < 0).any():
+            raise ValueError(
+                f'{p}: {int((w < 0).sum())} background events have negative expected weight at the toy target'
+            )
+        n_t = int(torch.poisson(w.sum().reshape(1), generator=generator).item())
+        if n_t == 0:
+            out[p] = torch.zeros_like(w)
+            continue
+        picks = torch.multinomial(w / w.sum(), n_t, replacement=True, generator=generator)
+        out[p] = torch.bincount(picks, minlength=len(w)).to(torch.float64)
+    return out
+
+
+def scan_targets(inputs, target_spec):
+    """
+    The target weights of one scan (scan_settings target): on the signal events (target_weights; a toy is drawn from
+    the events with w^s(theta_t) > 0) and, with backgrounds, on the background events (background_target_weights with
+    the same kind, nu_t and seed; a toy is drawn from every background event, the scan's selection removes those
+    outside it).
+
+    Args:
+        inputs: load_inputs result
+        target_spec: target of scan_settings (theta_t, nu_t, kind, seed)
+    Returns:
+        target [N] float64, background_target ({p: [N_p] float64}, None without backgrounds)
+    """
+    theta_t = np.asarray(target_spec['theta_t'], dtype=np.float64)
+    keep = None
+    if target_spec['kind'] == 'toy':
+        keep = positive_events([inputs.coefs.T], inputs.keep_q, points=theta_t[None])
+    target = target_weights(
+        inputs, theta_t, nu_t=target_spec['nu_t'], kind=target_spec['kind'], keep=keep, seed=target_spec['seed']
+    )
+    background_target = None
+    if getattr(inputs, 'backgrounds', None) is not None:
+        background_target = background_target_weights(
+            inputs, nu_t=target_spec['nu_t'], kind=target_spec['kind'], seed=target_spec['seed']
+        )
+    return target, background_target
+
+
 def fit(
     terms,
     theta,
@@ -1032,6 +1110,10 @@ def scan(
     selection_wcs=(),
     keep=None,
     theta_base=None,
+    background_target=None,
+    background_keep=None,
+    background_Gamma=None,
+    background_members=False,
 ):
     """
     Likelihood scan of one or two WCs (pois) on a grid: at every grid point the pois are fixed and the profiled WCs and
@@ -1044,8 +1126,11 @@ def scan(
     the events where that quantity is positive for every Gamma in Gammas (learned ratio) over the box of the moving WCs
     (the pois, the profiled WCs and selection_wcs; the other WCs at theta_base): exactly when at most two WCs move, and
     conservatively when more move, so that every fit inside the box stays finite (positive_events); keep gives the
-    initial selection instead. The visited points of the fits are checked too; when they remove events the scan is
-    repeated on the smaller selection (at most max_selections times). A warm start whose NLL is not finite is recorded
+    initial selection instead. With backgrounds (inputs.backgrounds) the same rule selects the background events, on
+    their signal term (positive_background_events: the ensemble mean, and every member with background_members);
+    background_keep gives their initial selection instead. The visited points of the fits are checked too, on the
+    signal and the background events; when they remove events the scan is repeated on the smaller selection (at most
+    max_selections times). A warm start whose NLL is not finite is recorded
     as visited, so the next pass removes those events, and the fit starts from the profiled WCs at theta_base instead
     (start_fallbacks counts them in the last pass). For one poi, the region q < chi2 quantile(cl, 1) at each confidence
     level cl is found on the grid points and the best fit: every run of consecutive points below the level is one
@@ -1067,7 +1152,7 @@ def scan(
             fitted at every grid point
         nu_bound: |nu| bound of profiled nuisances
         nu_obs: [n_nu] centre of the nuisance constraint (nll_terms), default 0
-        ratio, rate: passed to nll
+        ratio, rate: passed to nll (ratio 'learned' with backgrounds)
         Gammas: list of Gamma the event selection must keep positive (the ensemble mean and the members, when member
             scans follow), default [inputs.Gamma]; the scan itself uses inputs.Gamma
         cls: confidence levels of the intervals (one poi) and of the q levels returned (both)
@@ -1078,6 +1163,13 @@ def scan(
         keep: [N] bool initial event selection, or None to select from the box
         theta_base: [n_wcs] values of the WCs that are not pois (held there, or the start of their fits when
             profiled; the pois' entries start the best fit), or None for 0; a profiled WC's value must lie in its box
+        background_target: {p: [N_p] target weights on the background events} (background_target_weights), required
+            with backgrounds
+        background_keep: {p: [N_p] bool} initial background event selection, or None to select from the box
+        background_Gamma: {p: [K, N_p]} Gamma of the signal term on the background events (a member's), default the
+            ensemble mean
+        background_members: the background selection also keeps every member's signal term positive (set it when
+            Gammas holds the members)
     Returns:
         SimpleNamespace: pois, grid [P, n_poi], q [P], nll_min, levels {cl: q level}, intervals {cl: [lower, upper]}
         (one poi: the segment containing the minimum; None where open), segments {cl: [[lower, upper], ...]} (one poi:
@@ -1086,13 +1178,21 @@ def scan(
         started from the profiled WCs at theta_base), theta [P, n_wcs], nu [P, n_nu], success [P], edm [P], at_bound [P] (a
         profiled parameter on its bound), best_at_bound, grid_below_best (a grid point has a lower NLL than the best
         fit), keep [N], dropped (events removed), dropped_sm_fraction (their share of the SM yield, truth weights),
-        selections, stable
+        background_keep ({p: [N_p] bool}), background_dropped ({p: background events removed}),
+        background_dropped_fraction ({component: share of its yield removed}, background_dropped; the three None
+        without backgrounds), selections, stable
     """
     wcs = inputs.wcs
     names_nu = list(inputs.nuisances) + list(inputs.rate_names)
     n_wcs, n_nu = len(wcs), len(names_nu)
     if len(pois) not in (1, 2) or len(grids) != len(pois):
         raise ValueError('a scan has one or two parameters of interest, each with a grid')
+    backgrounds = getattr(inputs, 'backgrounds', None)
+    if backgrounds is not None:
+        if ratio != 'learned':
+            raise ValueError("backgrounds need ratio 'learned' (background events have no s_q(z) for the signal term)")
+        if background_target is None:
+            raise ValueError('a scan with backgrounds needs background_target (background_target_weights)')
     poi = [wcs.index(p) for p in pois]
     free = np.zeros(n_wcs + n_nu, dtype=bool)
     free[[wcs.index(w) for w in profile_wcs]] = True
@@ -1122,13 +1222,31 @@ def scan(
             return positive_events(Gammas, inputs.mask, **kwargs)
         return positive_events([inputs.coefs.T], inputs.keep_q, **kwargs)
 
+    def positive_background(**kwargs):
+        return positive_background_events(backgrounds, inputs.mask, members=background_members, **kwargs)
+
     moving = sorted(set(poi) | {wcs.index(w) for w in profile_wcs} | {wcs.index(w) for w in selection_wcs})
     selection_box = np.tile(theta0[:, None], (1, 2))
     selection_box[moving] = box[moving]
     keep = positive(box=selection_box) if keep is None else torch.as_tensor(keep, dtype=torch.bool).clone()
+    bkeep = None
+    if backgrounds is not None:
+        bkeep = (
+            positive_background(box=selection_box)
+            if background_keep is None
+            else {p: torch.as_tensor(k, dtype=torch.bool).clone() for p, k in background_keep.items()}
+        )
     stable = False
     for selections in range(1, max_selections + 1):
-        terms = nll_terms(inputs, keep, target, nu_obs=nu_obs)
+        terms = nll_terms(
+            inputs,
+            keep,
+            target,
+            nu_obs=nu_obs,
+            background_keep=bkeep,
+            background_target=background_target,
+            background_Gamma=background_Gamma,
+        )
         visited = []
         fallbacks = [0]
 
@@ -1219,11 +1337,16 @@ def scan(
                     i = j + 1
                 segments[cl] = pieces
 
-        new = keep & positive(points=np.unique(np.concatenate(visited), axis=0))
-        if torch.equal(new, keep):
+        seen = np.unique(np.concatenate(visited), axis=0)
+        new = keep & positive(points=seen)
+        new_b = None
+        if backgrounds is not None:
+            found = positive_background(points=seen)
+            new_b = {p: bkeep[p] & found[p] for p in bkeep}
+        if torch.equal(new, keep) and (new_b is None or all(torch.equal(new_b[p], bkeep[p]) for p in bkeep)):
             stable = True
             break
-        keep = new
+        keep, bkeep = new, new_b
 
     def on_bound(f):
         x = np.concatenate([f.theta, f.nu])[free]
@@ -1254,12 +1377,25 @@ def scan(
         keep=keep,
         dropped=int((~keep).sum()),
         dropped_sm_fraction=float(w_sm[~keep].sum() / w_sm.sum()),
+        background_keep=bkeep,
+        background_dropped=None if bkeep is None else {p: int((~k).sum()) for p, k in bkeep.items()},
+        background_dropped_fraction=None if bkeep is None else background_dropped(backgrounds, bkeep),
         selections=selections,
         stable=stable,
     )
 
 
-def scan_uncertainty(inputs, target, scan_args, member_scans=True, n_boot=0, subsets=None, seed=0, theta_t=None):
+def scan_uncertainty(
+    inputs,
+    target,
+    scan_args,
+    member_scans=True,
+    n_boot=0,
+    subsets=None,
+    seed=0,
+    theta_t=None,
+    background_target=None,
+):
     """
     The scan of scan_args and the uncertainty of its minimum, all on one event selection: the nominal scan's, selected
     with the ensemble mean and every member (scan with Gammas = [mean] + members) and passed to the other scans as
@@ -1268,31 +1404,50 @@ def scan_uncertainty(inputs, target, scan_args, member_scans=True, n_boot=0, sub
     config['data']): n_boot scans with every event's target weight, w0 and weight coefficients multiplied by a
     Poisson(1) count. Subsets: for each n_e in subsets, that many random draws of n_e members whose mean Gamma is
     scanned, with the spread of their minima. theta_t gives the nominal scan its q_target (scan); the other scans have
-    none.
+    none. With backgrounds (inputs.backgrounds), background_target gives the target weights on the background events
+    (background_target_weights); their selection also keeps every member's signal term positive and is passed on like
+    the signal selection; a member (subset) scan uses that member's Gamma (the subset's mean Gamma) on the background
+    events too, and a bootstrap scan also multiplies every background event's target weight and expected weights w_c
+    by a Poisson(1) count of its own (MC statistics of the background samples).
 
     Args:
         inputs: load_inputs result with members (load_inputs(config, members=True))
         target: [N] target weights w^t (target_weights)
-        scan_args: arguments of scan other than inputs, target, Gammas, theta_t and keep (pois, grids, box, ...)
+        scan_args: arguments of scan other than inputs, target, Gammas, theta_t, keep and the background ones
+            (pois, grids, box, ...)
         member_scans: scan every member
         n_boot: number of bootstrap scans
         subsets: {n_e: number of draws} of member subsets, or None
         seed: seed of the bootstrap counts and the subset draws
         theta_t: [n_wcs] target WC point of the nominal scan's q_target, or None
+        background_target: {p: [N_p] target weights on the background events}, required with backgrounds
     Returns:
         SimpleNamespace: nominal (scan result), members, bootstrap, subsets (None when not run); members and bootstrap
         are dicts with best [n_runs, n_poi] (best-fit pois), intervals (per run), success (per run: the best fit and
-        every grid fit converged), dropped (per run), spread [n_poi] (standard deviation of best) and, for members,
-        error = spread / sqrt(n_e); subsets is {n_e: dict with the same keys and draws (member indices per run)}
+        every grid fit converged), dropped (per run), background_dropped (per run, {p: events removed}, None without
+        backgrounds), spread [n_poi] (standard deviation of best) and, for members, error = spread / sqrt(n_e);
+        subsets is {n_e: dict with the same keys and draws (member indices per run)}
     """
     if inputs.seed_Gamma is None:
         raise ValueError('member Gamma are not loaded: use load_inputs(config, members=True)')
-    member_Gamma = list(inputs.seed_Gamma.values())
-    args = dict(scan_args, Gammas=[inputs.Gamma] + member_Gamma)
+    backgrounds = getattr(inputs, 'backgrounds', None)
+    seeds = list(inputs.seed_Gamma)
+    member_Gamma = [inputs.seed_Gamma[e] for e in seeds]
+    args = dict(
+        scan_args,
+        Gammas=[inputs.Gamma] + member_Gamma,
+        background_target=background_target,
+        background_members=backgrounds is not None,
+    )
     poi = [inputs.wcs.index(p) for p in args['pois']]
 
     def replica(**changes):
         return types.SimpleNamespace(**{**vars(inputs), **changes})
+
+    def background_mean(members):
+        if backgrounds is None:
+            return None
+        return {p: torch.stack([s.seed_Gamma[seeds[i]] for i in members]).mean(0) for p, s in backgrounds.sets.items()}
 
     def collect(results):
         best = np.array([s.best.theta[poi] for s in results])
@@ -1301,30 +1456,61 @@ def scan_uncertainty(inputs, target, scan_args, member_scans=True, n_boot=0, sub
             intervals=[s.intervals for s in results],
             success=[bool(s.success.all() and s.best.success) for s in results],
             dropped=[s.dropped for s in results],
+            background_dropped=[s.background_dropped for s in results],
             spread=best.std(0, ddof=1) if len(best) > 1 else np.full(len(poi), np.nan),
         )
 
     out = types.SimpleNamespace(
         nominal=scan(inputs, target, theta_t=theta_t, **args), members=None, bootstrap=None, subsets=None
     )
-    args = dict(args, keep=out.nominal.keep)
+    args = dict(args, keep=out.nominal.keep, background_keep=out.nominal.background_keep)
     if member_scans:
-        out.members = collect([scan(replica(Gamma=G), target, **args) for G in member_Gamma])
+        out.members = collect(
+            [
+                scan(replica(Gamma=G), target, **dict(args, background_Gamma=background_mean([i])))
+                for i, G in enumerate(member_Gamma)
+            ]
+        )
         out.members['error'] = out.members['spread'] / np.sqrt(len(member_Gamma))
     rng = np.random.default_rng(seed)
     if n_boot:
         results = []
         for _ in range(n_boot):
             p = torch.as_tensor(rng.poisson(1.0, len(inputs.w0)), dtype=torch.float64)
-            weighted = replica(w0=inputs.w0 * p, coefs=inputs.coefs * p[:, None])
-            results.append(scan(weighted, torch.as_tensor(target, dtype=torch.float64) * p, **args))
+            changes = dict(w0=inputs.w0 * p, coefs=inputs.coefs * p[:, None])
+            boot_target = background_target
+            if backgrounds is not None:
+                counts = {
+                    name: torch.as_tensor(rng.poisson(1.0, s.w.shape[1]), dtype=torch.float64)
+                    for name, s in backgrounds.sets.items()
+                }
+                sets = {
+                    name: types.SimpleNamespace(**{**vars(s), 'w': s.w * counts[name]})
+                    for name, s in backgrounds.sets.items()
+                }
+                changes['backgrounds'] = types.SimpleNamespace(**{**vars(backgrounds), 'sets': sets})
+                boot_target = {
+                    name: torch.as_tensor(background_target[name], dtype=torch.float64) * c
+                    for name, c in counts.items()
+                }
+            results.append(
+                scan(
+                    replica(**changes),
+                    torch.as_tensor(target, dtype=torch.float64) * p,
+                    **dict(args, background_target=boot_target),
+                )
+            )
         out.bootstrap = collect(results)
     if subsets:
         out.subsets = {}
         for n_e, draws in subsets.items():
             picks = [sorted(rng.choice(len(member_Gamma), n_e, replace=False).tolist()) for _ in range(draws)]
             results = [
-                scan(replica(Gamma=torch.stack([member_Gamma[i] for i in pick]).mean(0)), target, **args)
+                scan(
+                    replica(Gamma=torch.stack([member_Gamma[i] for i in pick]).mean(0)),
+                    target,
+                    **dict(args, background_Gamma=background_mean(pick)),
+                )
                 for pick in picks
             ]
             out.subsets[n_e] = dict(collect(results), draws=picks)
@@ -1401,7 +1587,8 @@ def write_results(name, config, inputs, entries):
     """
     Write the scans to {name}/scans.yml (summary) and {name}/scans.npz (arrays, keys <label>/<array>).
 
-    scans.yml: inputs (configs, data, sm_yield, scale, events, wcs, nuisances, rate systematics, time) and per scan
+    scans.yml: inputs (configs, data, sm_yield, scale, events, wcs, nuisances, rate systematics, time and, with
+    backgrounds, the yields option and each component's yield lambda_c and shape) and per scan
     its config entry (spec), pois, target theta_t (pois), best fit (pois, nll_min, success, edm, at a bound), q
     levels and intervals per confidence level (one poi: the segment containing the minimum) and all segments of each
     level (one poi), with a target q_target = q(theta_t) (when the scan computed it) and, for one poi, the shift
@@ -1409,9 +1596,11 @@ def write_results(name, config, inputs, entries):
     is open) and the signed root sign(best - theta_t) sqrt(q_target), the profiled WCs and nuisances at the best fit,
     fit diagnostics (points, failed, on a bound, largest edm, grid below the best fit, best fit repeated from a grid
     point, fits started from the profiled WCs at 0), the grid resolution (grid_resolution), the event selection
-    (dropped, dropped_sm_fraction, selections, stable) and, with scan_uncertainty, members (best per member, spread, error), bootstrap (best per replica, spread)
-    and subsets (per n_e: spread, mean 68% half-width for one poi, draws).
-    scans.npz: grid, q, theta, nu, success, edm, at_bound, keep (np.packbits of the selection, N events) and
+    (dropped, dropped_sm_fraction, selections, stable and, with backgrounds, background_dropped per event set and
+    background_dropped_fraction per component) and, with scan_uncertainty, members (best per member, spread, error),
+    bootstrap (best per replica, spread) and subsets (per n_e: spread, mean 68% half-width for one poi, draws).
+    scans.npz: grid, q, theta, nu, success, edm, at_bound, keep (np.packbits of the selection, N events),
+    background_keep_<p> (np.packbits of the selection of background event set p, with backgrounds) and
     members_best, bootstrap_best, subsets_<n_e>_best when present.
 
     Args:
@@ -1424,6 +1613,7 @@ def write_results(name, config, inputs, entries):
     os.makedirs(name, mode=0o755, exist_ok=True)
     wcs = inputs.wcs
     names_nu = list(inputs.nuisances) + list(inputs.rate_names)
+    backgrounds = getattr(inputs, 'backgrounds', None)
     summary = {
         'inputs': {
             'ensemble': config['ensemble'],
@@ -1435,6 +1625,15 @@ def write_results(name, config, inputs, entries):
             'wcs': wcs,
             'nuisances': names_nu,
             'rate_systematics': config['rate_systematics'],
+            'backgrounds': None
+            if backgrounds is None
+            else {
+                'yields': (config['backgrounds'] or {}).get('yields', 'own'),
+                'components': {
+                    c: {'yield': float(y), 'shape': shape}
+                    for c, y, shape in zip(backgrounds.components, backgrounds.yields, backgrounds.shapes)
+                },
+            },
             'created': datetime.datetime.now().isoformat(timespec='seconds'),
         },
         'scans': {},
@@ -1499,6 +1698,12 @@ def write_results(name, config, inputs, entries):
             'selections': s.selections,
             'stable': s.stable,
         }
+        background_keep = getattr(s, 'background_keep', None)
+        if background_keep is not None:
+            out['selection']['background_dropped'] = s.background_dropped
+            out['selection']['background_dropped_fraction'] = s.background_dropped_fraction
+            for p, k in background_keep.items():
+                arrays[f'{label}/background_keep_{p}'] = np.packbits(np.asarray(k))
         for key in ('grid', 'q', 'theta', 'nu', 'success', 'edm', 'at_bound'):
             arrays[f'{label}/{key}'] = np.asarray(getattr(s, key))
         arrays[f'{label}/keep'] = np.packbits(np.asarray(s.keep))
@@ -1853,8 +2058,9 @@ def check_background_options(config):
     own); rate_only ({process: {shape, data or yield}}): processes without events or network whose yield is added to
     that of the background process shape and takes its shape, with the own yield from the nominal directory of the
     process's combined sample (data: validation.p and sample.yml with eft false; every split of it counts, as no
-    network holds events out) or a fixed yield (exactly one of the two with own yields); and that every process a rate
-    systematic names is a signal, background or rate-only process. Exits listing every failure.
+    network holds events out) or a fixed yield (exactly one of the two with own yields); that every process a rate
+    systematic names is a signal, background or rate-only process; and that every scan uses ratio learned (background
+    events have no structure constants for a truth signal term). Exits listing every failure.
 
     Args:
         config: scan config (load_config) with backgrounds
@@ -1920,6 +2126,11 @@ def check_background_options(config):
             errors.append(
                 f'rate systematic {name}: processes {unknown} are not signal, background or rate-only processes'
             )
+    truth = [
+        label for label, entry in (config.get('scans') or {}).items() if entry.get('ratio', 'learned') != 'learned'
+    ]
+    if truth:
+        errors.append(f'scans {truth} use a truth ratio; backgrounds need ratio learned')
     if errors:
         sys.exit('[error]: backgrounds:\n  ' + '\n  '.join(errors))
 
@@ -2035,11 +2246,12 @@ def check_wilks(config):
 
 def wilks_toys(inputs, scan_args, target_spec, seeds, randomize_nu_obs=True):
     """
-    q(theta_t) = 2 (NLL(theta_t) - NLL_min) on toys at the target of a scan: per seed, a toy (target_weights,
-    kind='toy', drawn from the events with w^s(theta_t) > 0) and a scan of the pois on the one-point grid theta_t
-    (scan: the best fit and the fit at theta_t, with the scan's profiled WCs and nuisances and its event selection).
-    With randomize_nu_obs, the global observables of the profiled nuisances are drawn per toy, nu_obs ~ N(nu_t, 1)
-    (the auxiliary measurements fluctuate with the toy); the other nuisances keep the scan's nu_obs.
+    q(theta_t) = 2 (NLL(theta_t) - NLL_min) on toys at the target of a scan: per seed, a toy (scan_targets with kind
+    toy: drawn from the signal events with w^s(theta_t) > 0 and, with backgrounds, from every background event) and a
+    scan of the pois on the one-point grid theta_t (scan: the best fit and the fit at theta_t, with the scan's profiled
+    WCs and nuisances and its event selection). With randomize_nu_obs, the global observables of the profiled
+    nuisances are drawn per toy, nu_obs ~ N(nu_t, 1) (the auxiliary measurements fluctuate with the toy); the other
+    nuisances keep the scan's nu_obs.
 
     Args:
         inputs: load_inputs result
@@ -2058,16 +2270,15 @@ def wilks_toys(inputs, scan_args, target_spec, seeds, randomize_nu_obs=True):
     theta_t = target_spec['theta_t']
     nu_t = target_spec['nu_t'] if target_spec['nu_t'] is not None else np.zeros(len(names_nu))
     profiled = [names_nu.index(n) for n in scan_args['profile_nu']]
-    keep = positive_events([inputs.coefs.T], inputs.keep_q, points=theta_t[None])
     args = dict(scan_args, grids=[[theta_t[i]] for i in poi])
     q, best, success, at_bound, dropped = [], [], [], [], []
     for seed in seeds:
-        target = target_weights(inputs, theta_t, nu_t=target_spec['nu_t'], kind='toy', keep=keep, seed=int(seed))
+        target, background_target = scan_targets(inputs, dict(target_spec, kind='toy', seed=int(seed)))
         nu_obs = np.array(scan_args['nu_obs'], dtype=np.float64)
         if randomize_nu_obs and profiled:
             draw = np.random.default_rng(int(seed)).standard_normal(len(names_nu))
             nu_obs[profiled] = nu_t[profiled] + draw[profiled]
-        s = scan(inputs, target, **dict(args, nu_obs=nu_obs))
+        s = scan(inputs, target, **dict(args, nu_obs=nu_obs, background_target=background_target))
         q.append(float(s.q[0]))
         best.append(s.best.theta[poi])
         success.append(bool(s.success[0] and s.best.success))
@@ -2260,12 +2471,12 @@ def merge_wilks(config):
 def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None, toys=None):
     """
     Run the scans of a scan config: every entry of config['scans'] (check_scans) is scanned on its target (Asimov
-    or toy, target_weights; a toy is drawn from the events with w^s(theta_t) > 0), with q at the target (scan,
-    q_target) and with scan_uncertainty when the entry has uncertainty. {name}/scans.yml and scans.npz (write_results)
-    are rewritten after every scan; the plots (plot_results) are drawn at the end. A scan whose grid has too few points
-    below the lowest level (grid_resolution) is reported as coarse. With wilks, only one batch of the Wilks toys of
-    config['wilks'] is run (run_wilks); with merge, only the batches are merged and compared with chi2_k
-    (merge_wilks).
+    or toy, scan_targets: on the signal events and, with backgrounds, on the background events), with q at the target
+    (scan, q_target) and with scan_uncertainty when the entry has uncertainty. {name}/scans.yml and scans.npz
+    (write_results) are rewritten after every scan; the plots (plot_results) are drawn at the end. A scan whose grid
+    has too few points below the lowest level (grid_resolution) is reported as coarse. With wilks, only one batch of
+    the Wilks toys of config['wilks'] is run (run_wilks); with merge, only the batches are merged and compared with
+    chi2_k (merge_wilks).
 
     Args:
         config_path: scan config yml
@@ -2297,17 +2508,7 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
     entries = {}
     for label, (scan_args, target_spec, spec) in settings.items():
         start = time.time()
-        keep = None
-        if target_spec['kind'] == 'toy':
-            keep = positive_events([inputs.coefs.T], inputs.keep_q, points=target_spec['theta_t'][None])
-        target = target_weights(
-            inputs,
-            target_spec['theta_t'],
-            nu_t=target_spec['nu_t'],
-            kind=target_spec['kind'],
-            keep=keep,
-            seed=target_spec['seed'],
-        )
+        target, background_target = scan_targets(inputs, target_spec)
         u_entry = spec.get('uncertainty')
         if u_entry:
             uncertainty = scan_uncertainty(
@@ -2319,11 +2520,14 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
                 subsets=u_entry.get('subsets'),
                 seed=u_entry.get('seed', 0),
                 theta_t=target_spec['theta_t'],
+                background_target=background_target,
             )
             result = uncertainty.nominal
         else:
             uncertainty = None
-            result = scan(inputs, target, theta_t=target_spec['theta_t'], **scan_args)
+            result = scan(
+                inputs, target, theta_t=target_spec['theta_t'], background_target=background_target, **scan_args
+            )
         entries[label] = dict(scan=result, theta_t=target_spec['theta_t'], spec=spec, uncertainty=uncertainty)
         write_results(name, config, inputs, entries)
         poi = [inputs.wcs.index(p) for p in result.pois]
@@ -2335,8 +2539,13 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
             if resolution['coarse']
             else ''
         )
+        dropped_b = (
+            ''
+            if result.background_dropped is None
+            else ', background dropped ' + ', '.join(f'{p} {n}' for p, n in result.background_dropped.items())
+        )
         print(
-            f'{label}: best {best}, failed fits {int((~result.success).sum())}, dropped {result.dropped}, '
+            f'{label}: best {best}, failed fits {int((~result.success).sum())}, dropped {result.dropped}{dropped_b}, '
             f'stable {result.stable}, {time.time() - start:.1f} s{coarse}'
         )
     plot_results(name, lumi=config.get('plot_lumi'))
