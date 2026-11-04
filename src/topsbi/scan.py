@@ -63,7 +63,8 @@ def load_config(config_path):
     """
     The scan config, completed from the EFT validation config it names (ensemble): data, c0, wcs, lumi, year_loc and
     zero_terms are taken from there (a scan config that sets one of them stops the run). eft_cache is {name}/ensemble
-    of that config; nuisance_cache is {name}/nuisance of the nuisance validation config (nuisance), if one is named.
+    of that config; nuisance_caches is [{name}/nuisance] of the nuisance validation configs (nuisance: one config or a
+    list, the first the base whose nuisances later configs replace by name, check_nuisance_caches), if any is named.
     With backgrounds, background_caches and background_ratios are the caches of the EFT validation config's background
     processes (background_caches).
 
@@ -87,8 +88,16 @@ def load_config(config_path):
         sys.exit('[error]: sm_yield, the expected SM yield of the analysis, is required')
     config['eft_cache'] = f'{eft["name"]}/ensemble'
     if config.get('nuisance'):
-        with open(config['nuisance']) as f:
-            config['nuisance_cache'] = f'{yaml.safe_load(f)["name"]}/nuisance'
+        paths = config['nuisance'] if isinstance(config['nuisance'], list) else [config['nuisance']]
+        if not all(isinstance(path, str) for path in paths):
+            sys.exit(f'[error]: nuisance is a nuisance validation config or a list of them, not {config["nuisance"]}')
+        caches = []
+        for path in paths:
+            with open(path) as f:
+                caches.append(f'{yaml.safe_load(f)["name"]}/nuisance')
+        if len(set(caches)) < len(caches):
+            sys.exit(f'[error]: nuisance names the same nuisance cache twice: {caches}')
+        config['nuisance_caches'] = caches
     config.setdefault('processes', ['all'])
     config.setdefault('rate_systematics', {})
     if config.get('backgrounds') is not None:
@@ -97,24 +106,81 @@ def load_config(config_path):
     return config
 
 
+def check_nuisance_caches(config, caches):
+    """
+    Check the nuisance caches of one event set, in the order of config['nuisance_caches']: each was built from the EFT
+    validation config (ensemble); every nuisance of a later cache is a nuisance of the first (the base) with the same
+    method, and no nuisance is in two later caches. The caches' theta_ref may differ from c0 and from each other (each
+    is recorded with the results). Exits listing every failure.
+
+    Args:
+        config: scan config (load_config)
+        caches: [NuisanceCache], the first the base
+    """
+    errors = []
+    for cache in caches:
+        if cache.manifest['ensemble'] != config['ensemble']:
+            errors.append(f'{cache.path} was built from {cache.manifest["ensemble"]}, not {config["ensemble"]}')
+    base = {n['name']: n['method'] for n in caches[0].nuisances}
+    replaced = {}
+    for cache in caches[1:]:
+        for n in cache.nuisances:
+            name = n['name']
+            if name not in base:
+                errors.append(f'{cache.path}: nuisance {name} is not in the base cache {caches[0].path}')
+            elif n['method'] != base[name]:
+                errors.append(f'{cache.path}: nuisance {name} is {n["method"]}, {base[name]} in {caches[0].path}')
+            if name in replaced:
+                errors.append(f'nuisance {name} is replaced by both {replaced[name]} and {cache.path}')
+            replaced[name] = cache.path
+    if errors:
+        sys.exit('[error]: nuisance caches:\n  ' + '\n  '.join(errors))
+
+
+def combined_f_hat(caches, keep):
+    """
+    f_hat of the nuisance caches of one event set on the events keep, combined by name: the rows of the first cache
+    (the base, in its order), each nuisance of a later cache replacing the base row of the same name
+    (check_nuisance_caches).
+
+    Args:
+        caches: [NuisanceCache], the first the base
+        keep: [N] bool over the events of the caches' data, kept by every cache (within each cache's finite)
+    Returns:
+        f_hat [n_n, 2, n_keep] float64 torch tensor, names [n_n], reference {name: {'theta_ref': theta_ref of the
+        cache it comes from, 'cache': that cache's path}}
+    """
+    base = caches[0]
+    names = [n['name'] for n in base.nuisances]
+    f_hat = np.asarray(base.f_hat[..., keep[base.finite]], dtype=np.float64)
+    reference = {name: {'theta_ref': [float(c) for c in base.theta_ref], 'cache': base.path} for name in names}
+    for cache in caches[1:]:
+        rows = cache.f_hat[..., keep[cache.finite]]
+        for j, n in enumerate(cache.nuisances):
+            i = names.index(n['name'])
+            f_hat[i] = rows[j]
+            reference[n['name']] = {'theta_ref': [float(c) for c in cache.theta_ref], 'cache': cache.path}
+    return torch.from_numpy(f_hat), names, reference
+
+
 def background_caches(config, eft):
     """
     The caches of the background processes named in the EFT validation config (eft['backgrounds']), checked against
     the signal caches so that every event set is described by the same ensemble, nuisance model and background
     networks: per process p the EFT ensemble {eft name}/ensemble_<p> (data the process's validation.p; c0, wcs, lumi,
-    seeds, model.pt hashes and mask equal to config['eft_cache']), with a nuisance config the signal nuisances
-    {nuisance name}/nuisance_<p> (data the process's validation.p; ensemble, theta_ref, nuisances, seeds and model.pt
-    hashes equal to config['nuisance_cache']), and the background-network ratios {eft name}/background_ratios
-    (networks eft['background_networks'], reference point c0, event sets 'signal' = config['data'] and every process's
-    validation.p). Exits listing every failure.
+    seeds, model.pt hashes and mask equal to config['eft_cache']), for every signal nuisance cache in
+    config['nuisance_caches'] its sibling {that cache's directory}/nuisance_<p> (data the process's validation.p;
+    ensemble, theta_ref, nuisances, seeds and model.pt hashes equal to that signal cache), and the background-network
+    ratios {eft name}/background_ratios (networks eft['background_networks'], reference point c0, event sets 'signal' =
+    config['data'] and every process's validation.p). Exits listing every failure.
 
     Args:
-        config: scan config being completed by load_config (ensemble, data, c0, processes, eft_cache, nuisance_cache
+        config: scan config being completed by load_config (ensemble, data, c0, processes, eft_cache, nuisance_caches
             if a nuisance config is named)
         eft: the EFT validation config (name, backgrounds, background_networks)
     Returns:
-        caches: {process: {'data': validation.p, 'eft_cache': directory, 'nuisance_cache': directory or None}}, in the
-            order of eft['backgrounds']
+        caches: {process: {'data': validation.p, 'eft_cache': directory, 'nuisance_caches': [directory] in the order
+            of config['nuisance_caches'], or None}}, in the order of eft['backgrounds']
         ratios: directory of the background-network ratios
     """
     if not eft.get('backgrounds') or not eft.get('background_networks'):
@@ -130,11 +196,11 @@ def background_caches(config, eft):
         errors.append(f'background processes {clash} are also signal processes {config["processes"]}')
     signal = manifest(config['eft_cache'], 'ensemble.yml')
     signal_mask = np.load(f'{config["eft_cache"]}/mask_cache.npy')
-    nuisance = manifest(config['nuisance_cache'], 'nuisance.yml') if config.get('nuisance_cache') else None
+    signal_nuisances = [(path, manifest(path, 'nuisance.yml')) for path in config.get('nuisance_caches') or []]
     caches = {}
     for p, directory in eft['backgrounds'].items():
         data = f'{directory}/validation.p'
-        entry = {'data': data, 'eft_cache': f'{eft["name"]}/ensemble_{p}', 'nuisance_cache': None}
+        entry = {'data': data, 'eft_cache': f'{eft["name"]}/ensemble_{p}', 'nuisance_caches': None}
         path = entry['eft_cache']
         if not os.path.exists(f'{path}/ensemble.yml'):
             errors.append(f'{p}: no EFT ensemble cache {path} (python -m topsbi.validation -c <config> --backgrounds)')
@@ -147,19 +213,22 @@ def background_caches(config, eft):
                     errors.append(f'{p}: {path} has another {key} than {config["eft_cache"]}')
             if not np.array_equal(np.load(f'{path}/mask_cache.npy'), signal_mask):
                 errors.append(f'{p}: {path} keeps other terms of T(theta) than {config["eft_cache"]}')
-        if nuisance is not None:
-            path = entry['nuisance_cache'] = f'{os.path.dirname(config["nuisance_cache"])}/nuisance_{p}'
-            if not os.path.exists(f'{path}/nuisance.yml'):
-                errors.append(
-                    f'{p}: no nuisance cache {path} (python -m topsbi.nuisance_validation -c <config> --backgrounds)'
-                )
-            else:
+        if signal_nuisances:
+            entry['nuisance_caches'] = []
+            for signal_path, signal_nuisance in signal_nuisances:
+                path = f'{os.path.dirname(signal_path)}/nuisance_{p}'
+                entry['nuisance_caches'].append(path)
+                if not os.path.exists(f'{path}/nuisance.yml'):
+                    errors.append(
+                        f'{p}: no nuisance cache {path} (python -m topsbi.nuisance_validation -c <config> --backgrounds)'
+                    )
+                    continue
                 stored = manifest(path, 'nuisance.yml')
                 if stored['data'] != data:
                     errors.append(f'{p}: {path} was built from {stored["data"]}, not {data}')
                 for key in ('ensemble', 'theta_ref', 'nuisances', 'seeds', 'model_hash'):
-                    if stored.get(key) != nuisance.get(key):
-                        errors.append(f'{p}: {path} has another {key} than {config["nuisance_cache"]}')
+                    if stored.get(key) != signal_nuisance.get(key):
+                        errors.append(f'{p}: {path} has another {key} than {signal_path}')
         caches[p] = entry
     ratios = f'{eft["name"]}/background_ratios'
     if not os.path.exists(f'{ratios}/manifest.yml'):
@@ -224,7 +293,8 @@ def load_inputs(config, members=False):
     Returns:
         SimpleNamespace: coefs [N, n_kept], keep_q (kept columns of T(theta) for coefs), w0 [N], era [N],
         process [N], Gamma [K, N], mask (kept columns of T(theta) for Gamma), seed_Gamma {e: [K, N]} (members only),
-        f_hat [n_n, 2, N], nuisances, log_kappa [n_rate, 2, N], rate_names, processes, wcs, scale, events (kept
+        f_hat [n_n, 2, N], nuisances, nuisance_reference ({name: {theta_ref, cache}}, None without nuisances),
+        log_kappa [n_rate, 2, N], rate_names, processes, wcs, scale, events (kept
         events of config['data']), backgrounds (load_background_inputs; None without backgrounds); arrays are
         float64 torch tensors (era, process: int64; masks: bool)
     """
@@ -232,12 +302,12 @@ def load_inputs(config, members=False):
     if eft.manifest['data'] != config['data'] or eft.manifest['c0'] != config['c0']:
         sys.exit(f'[error]: {config["eft_cache"]} was built from other data or c0 than {config["ensemble"]}')
     keep = eft.finite.copy()
-    nuisance = None
-    if 'nuisance_cache' in config:
-        nuisance = NuisanceCache(config['nuisance_cache'])
-        if nuisance.manifest['ensemble'] != config['ensemble'] or nuisance.theta_ref != config['c0']:
-            sys.exit(f'[error]: {config["nuisance_cache"]} was not built from {config["ensemble"]} at c0')
-        keep &= nuisance.finite
+    nuisances = None
+    if config.get('nuisance_caches'):
+        nuisances = [NuisanceCache(path) for path in config['nuisance_caches']]
+        check_nuisance_caches(config, nuisances)
+        for cache in nuisances:
+            keep &= cache.finite
     if config.get('background_caches'):
         with np.load(f'{config["background_ratios"]}/signal.npz') as f:
             keep &= f['finite']
@@ -282,6 +352,7 @@ def load_inputs(config, members=False):
         seed_Gamma={e: gamma(eft.seed_Gamma[e], eft.seed_finite[e]) for e in eft.seeds} if members else None,
         f_hat=None,
         nuisances=[],
+        nuisance_reference=None,
         log_kappa=torch.from_numpy(log_kappa),
         rate_names=rate_names,
         processes=processes,
@@ -290,9 +361,8 @@ def load_inputs(config, members=False):
         events=keep,
     )
     out.backgrounds = load_background_inputs(config, out, members) if config.get('background_caches') else None
-    if nuisance is not None:
-        out.f_hat = torch.from_numpy(np.asarray(nuisance.f_hat[..., keep[nuisance.finite]], dtype=np.float64))
-        out.nuisances = [n['name'] for n in nuisance.nuisances]
+    if nuisances is not None:
+        out.f_hat, out.nuisances, out.nuisance_reference = combined_f_hat(nuisances, keep)
     return out
 
 
@@ -386,9 +456,11 @@ def load_background_inputs(config, inputs, members=False):
     for p, entry in caches.items():
         eft = EnsembleCache(entry['eft_cache'])
         keep = eft.finite.copy()
-        nuisance = NuisanceCache(entry['nuisance_cache']) if entry['nuisance_cache'] else None
-        if nuisance is not None:
-            keep &= nuisance.finite
+        nuisances = [NuisanceCache(path) for path in entry['nuisance_caches']] if entry['nuisance_caches'] else None
+        if nuisances is not None:
+            check_nuisance_caches(config, nuisances)
+            for cache in nuisances:
+                keep &= cache.finite
         r_hat, finite = ratios(p)
         keep &= finite
         print(f'{p}: {keep.sum()} of {len(keep)} events kept by every member')
@@ -398,9 +470,7 @@ def load_background_inputs(config, inputs, members=False):
         raw[p] = dict(
             Gamma=gamma(eft.Gamma, eft.finite, keep),
             seed_Gamma={e: gamma(eft.seed_Gamma[e], eft.seed_finite[e], keep) for e in eft.seeds} if members else None,
-            f_hat=None
-            if nuisance is None
-            else torch.from_numpy(np.asarray(nuisance.f_hat[..., keep[nuisance.finite]], dtype=np.float64)),
+            f_hat=None if nuisances is None else combined_f_hat(nuisances, keep)[0],
             mean=seed_mean(r_hat, keep),
             weights=weights[rows],
             era=era[rows],
@@ -1923,9 +1993,10 @@ def write_results(name, config, inputs, entries):
     """
     Write the scans to {name}/scans.yml (summary) and {name}/scans.npz (arrays, keys <label>/<array>).
 
-    scans.yml: inputs (configs, data, sm_yield, scale, events, wcs, nuisances, rate systematics, time and, with
-    backgrounds, the yields option, each component's yield lambda_c and shape, and the background calibration
-    ({bins, folds} with defaults filled in, None when off)) and per scan
+    scans.yml: inputs (configs, data, sm_yield, scale, events, wcs, nuisances, the nuisance caches with their
+    theta_ref and the nuisances taken from each (nuisance_reference; None without nuisances), rate systematics, time
+    and, with backgrounds, the yields option, each component's yield lambda_c and shape, and the background
+    calibration ({bins, folds} with defaults filled in, None when off)) and per scan
     its config entry (spec), pois, target theta_t (pois), best fit (pois, nll_min, success, edm, at a bound), q
     levels and intervals per confidence level (one poi: the segment containing the minimum) and all segments of each
     level (one poi), with a target q_target = q(theta_t) (when the scan computed it) and, for one poi, the shift
@@ -1968,6 +2039,18 @@ def write_results(name, config, inputs, entries):
             'events': int(inputs.events.sum()),
             'wcs': wcs,
             'nuisances': names_nu,
+            'nuisance_reference': None
+            if getattr(inputs, 'nuisance_reference', None) is None
+            else [
+                {
+                    'cache': cache,
+                    'theta_ref': next(
+                        (r['theta_ref'] for r in inputs.nuisance_reference.values() if r['cache'] == cache), None
+                    ),
+                    'nuisances': [n for n in inputs.nuisances if inputs.nuisance_reference[n]['cache'] == cache],
+                }
+                for cache in config['nuisance_caches']
+            ],
             'rate_systematics': config['rate_systematics'],
             'backgrounds': None
             if backgrounds is None

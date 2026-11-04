@@ -12,8 +12,11 @@ from topsbi.scan import (
     calibrated_backgrounds,
     calibrated_inputs,
     check_background_options,
+    check_nuisance_caches,
     check_scans,
+    combined_f_hat,
     load_background_inputs,
+    load_config,
     nll,
     nested_bins,
     nll_terms,
@@ -96,16 +99,18 @@ def test_scan_settings_theta_base():
     assert list(scan_settings(config, 'z', inputs)[0]['theta_base']) == [0.0, 0.0]
 
 
-def write_caches(tmp_path):
-    """Signal and tW caches whose manifests agree; returns the scan config being completed and the EFT config."""
+def write_caches(tmp_path, sm=False):
+    """Signal and tW caches whose manifests agree, with a second nuisance validation (w_sm, theta_ref = SM, not c0)
+    if sm; returns the scan config being completed and the EFT config."""
     eft_name, nu_name = tmp_path / 'validation', tmp_path / 'nuisance_validation'
+    sm_name = tmp_path / 'nuisance_validation_sm'
     data, tw = str(tmp_path / 'signal/validation.p'), str(tmp_path / 'tW/nominal')
     networks = {'tW': {1: 'tw_1.yml', 0: 'tw_0.yml'}}
     ensemble = {'c0': [1.0, 1.5], 'wcs': ['cA'], 'lumi': [1.0], 'seeds': {0: {'networks': ['a.yml']}},
                 'model_hash': {0: ['h']}}
     nuisance = {'ensemble': 'eft.yml', 'theta_ref': [1.0, 1.5], 'nuisances': [{'name': 'n1'}], 'seeds': {0: {}},
                 'model_hash': {0: [['g']]}}
-    for path, name, content in [
+    files = [
         (eft_name / 'ensemble', 'ensemble.yml', dict(ensemble, data=data)),
         (eft_name / 'ensemble_tW', 'ensemble.yml', dict(ensemble, data=f'{tw}/validation.p')),
         (nu_name / 'nuisance', 'nuisance.yml', dict(nuisance, data=data)),
@@ -113,34 +118,53 @@ def write_caches(tmp_path):
         (eft_name / 'background_ratios', 'manifest.yml',
          {'networks': {'tW': {0: 'tw_0.yml', 1: 'tw_1.yml'}}, 'model_hash': {}, 'reference_point': [1.0, 1.5],
           'data': {'signal': data, 'tW': f'{tw}/validation.p'}}),
-    ]:
+    ]
+    if sm:
+        sm_nuisance = dict(nuisance, theta_ref=[1.0, 0.0], model_hash={0: [['s']]})
+        files += [
+            (sm_name / 'nuisance', 'nuisance.yml', dict(sm_nuisance, data=data)),
+            (sm_name / 'nuisance_tW', 'nuisance.yml', dict(sm_nuisance, data=f'{tw}/validation.p')),
+        ]
+    for path, name, content in files:
         os.makedirs(path, exist_ok=True)
         with open(path / name, 'w') as f:
             yaml.safe_dump(content, f)
     for path in (eft_name / 'ensemble', eft_name / 'ensemble_tW'):
         np.save(path / 'mask_cache.npy', np.array([True, True, False]))
+    caches = [str(nu_name / 'nuisance')] + ([str(sm_name / 'nuisance')] if sm else [])
     config = {'ensemble': 'eft.yml', 'data': data, 'c0': [1, 1.5], 'processes': ['tt'],
-              'eft_cache': str(eft_name / 'ensemble'), 'nuisance_cache': str(nu_name / 'nuisance')}
+              'eft_cache': str(eft_name / 'ensemble'), 'nuisance_caches': caches}
     eft = {'name': str(eft_name), 'backgrounds': {'tW': tw}, 'background_networks': networks}
     return config, eft
 
 
 def test_background_caches_match(tmp_path):
-    """Matching caches resolve to the per-process directories and the ratio cache."""
+    """Matching caches resolve to the per-process directories and the ratio cache; a second nuisance validation at
+    another theta_ref than c0 adds its own nuisance_<p> sibling."""
     config, eft = write_caches(tmp_path)
     caches, ratios = background_caches(config, eft)
     assert caches['tW']['eft_cache'].endswith('validation/ensemble_tW')
-    assert caches['tW']['nuisance_cache'].endswith('nuisance_validation/nuisance_tW')
+    assert [path[len(str(tmp_path)):] for path in caches['tW']['nuisance_caches']] == [
+        '/nuisance_validation/nuisance_tW'
+    ]
     assert caches['tW']['data'].endswith('tW/nominal/validation.p')
     assert ratios.endswith('validation/background_ratios')
+    config, eft = write_caches(tmp_path / 'sm', sm=True)
+    caches, _ = background_caches(config, eft)
+    assert [path[len(str(tmp_path / 'sm')):] for path in caches['tW']['nuisance_caches']] == [
+        '/nuisance_validation/nuisance_tW',
+        '/nuisance_validation_sm/nuisance_tW',
+    ]
 
 
 def test_background_caches_mismatch(tmp_path, capsys):
-    """Every disagreement with the signal caches is reported, then the run stops."""
-    config, eft = write_caches(tmp_path)
+    """Every disagreement with the signal caches is reported, then the run stops; each nuisance_<p> is compared with
+    its own signal nuisance cache."""
+    config, eft = write_caches(tmp_path, sm=True)
     for path, name, key, value in [
         (f'{eft["name"]}/ensemble_tW', 'ensemble.yml', 'model_hash', {0: ['other']}),
         (f'{tmp_path}/nuisance_validation/nuisance_tW', 'nuisance.yml', 'theta_ref', [1.0, 0.0]),
+        (f'{tmp_path}/nuisance_validation_sm/nuisance_tW', 'nuisance.yml', 'theta_ref', [1.0, 1.5]),
         (f'{eft["name"]}/background_ratios', 'manifest.yml', 'reference_point', [1.0, 0.0]),
     ]:
         with open(f'{path}/{name}') as f:
@@ -152,7 +176,91 @@ def test_background_caches_mismatch(tmp_path, capsys):
     with pytest.raises(SystemExit) as stop:
         background_caches(config, eft)
     message = str(stop.value)
-    for text in ('another model_hash', 'other terms of T(theta)', 'another theta_ref', 'has reference point'):
+    for text in (
+        'another model_hash',
+        'other terms of T(theta)',
+        f'another theta_ref than {tmp_path}/nuisance_validation/nuisance\n',
+        f'another theta_ref than {tmp_path}/nuisance_validation_sm/nuisance\n',
+        'has reference point',
+    ):
+        assert text in message
+
+
+def test_load_config_nuisance_list(tmp_path):
+    """nuisance takes one nuisance validation config or a list: the caches follow in order; a repeat stops."""
+    eft, gen, sm = tmp_path / 'eft.yml', tmp_path / 'gen.yml', tmp_path / 'sm.yml'
+    for path, content in [
+        (eft, {'name': 'v', 'data': 'd.p', 'c0': [1.0, 1.5], 'wcs': ['cA']}),
+        (gen, {'name': 'g'}),
+        (sm, {'name': 's'}),
+    ]:
+        with open(path, 'w') as f:
+            yaml.safe_dump(content, f)
+
+    def config(nuisance):
+        path = tmp_path / 'scan.yml'
+        with open(path, 'w') as f:
+            yaml.safe_dump({'name': 'out', 'ensemble': str(eft), 'sm_yield': 1.0, 'scans': {}, 'nuisance': nuisance}, f)
+        return load_config(str(path))
+
+    assert config(str(gen))['nuisance_caches'] == ['g/nuisance']
+    assert config([str(gen), str(sm)])['nuisance_caches'] == ['g/nuisance', 's/nuisance']
+    with pytest.raises(SystemExit) as stop:
+        config([str(gen), str(gen)])
+    assert 'the same nuisance cache twice' in str(stop.value)
+
+
+def nuisance_cache(path, names, theta_ref, f_hat, finite, method='weight_shift', ensemble='eft.yml'):
+    """A stand-in for NuisanceCache: path, manifest (ensemble), nuisances, theta_ref, f_hat (on its finite events) and
+    finite."""
+    return types.SimpleNamespace(
+        path=path,
+        manifest={'ensemble': ensemble},
+        nuisances=[{'name': n, 'method': method} for n in names],
+        theta_ref=theta_ref,
+        f_hat=f_hat,
+        finite=finite,
+    )
+
+
+def test_combined_nuisances():
+    """A later nuisance cache replaces the base rows of its nuisances (base order kept) on the events every cache
+    keeps, each nuisance records the theta_ref and cache it comes from, one cache returns its own rows, and every
+    inconsistency between the caches stops the run."""
+    rng = np.random.default_rng(3)
+    n = 6
+    base_finite = np.array([True, True, True, False, True, True])
+    sm_finite = np.array([True, False, True, True, True, True])
+    base_all, sm_all = rng.normal(size=(3, 2, n)), rng.normal(size=(1, 2, n))
+    base = nuisance_cache('gen/nuisance', ['ISR', 'PU', 'fact'], [1.0, 1.5], base_all[..., base_finite], base_finite)
+    sm = nuisance_cache('sm/nuisance', ['fact'], [1.0, 0.0], sm_all[..., sm_finite], sm_finite)
+    config = {'ensemble': 'eft.yml'}
+    check_nuisance_caches(config, [base, sm])
+    keep = base_finite & sm_finite
+    f_hat, names, reference = combined_f_hat([base, sm], keep)
+    assert names == ['ISR', 'PU', 'fact']
+    assert f_hat.dtype == torch.float64 and f_hat.shape == (3, 2, int(keep.sum()))
+    assert np.allclose(f_hat[:2].numpy(), base_all[:2][..., keep])
+    assert np.allclose(f_hat[2].numpy(), sm_all[0][..., keep])
+    assert reference['PU'] == {'theta_ref': [1.0, 1.5], 'cache': 'gen/nuisance'}
+    assert reference['fact'] == {'theta_ref': [1.0, 0.0], 'cache': 'sm/nuisance'}
+    single, single_names, _ = combined_f_hat([base], base_finite)
+    assert single_names == names and np.allclose(single.numpy(), base_all[..., base_finite])
+
+    bad = [
+        nuisance_cache('x/nuisance', ['hdamp'], [1.0, 0.0], sm_all[..., sm_finite], sm_finite),
+        nuisance_cache('y/nuisance', ['ISR'], [1.0, 0.0], sm_all[..., sm_finite], sm_finite, method='kinematic_shift'),
+        nuisance_cache('z/nuisance', ['fact'], [1.0, 0.0], sm_all[..., sm_finite], sm_finite, ensemble='other.yml'),
+    ]
+    with pytest.raises(SystemExit) as stop:
+        check_nuisance_caches(config, [base, sm] + bad)
+    message = str(stop.value)
+    for text in (
+        'x/nuisance: nuisance hdamp is not in the base cache gen/nuisance',
+        'y/nuisance: nuisance ISR is kinematic_shift, weight_shift in gen/nuisance',
+        'nuisance fact is replaced by both sm/nuisance and z/nuisance',
+        'z/nuisance was built from other.yml, not eft.yml',
+    ):
         assert text in message
 
 
@@ -270,8 +378,8 @@ def test_load_background_inputs(tmp_path, monkeypatch):
         'rate_systematics': {'lumi': {'kappa': 1.016}, 'smxsec_DY': {'kappa': 1.15, 'processes': ['DY']}},
         'backgrounds': {'rate_only': {'DY': {'shape': 'Others', 'data': str(dy_dir)}}},
         'background_caches': {
-            'tW': {'data': str(tw_dir / 'validation.p'), 'eft_cache': 'tW/ens', 'nuisance_cache': None},
-            'Others': {'data': str(others_dir / 'validation.p'), 'eft_cache': 'Others/ens', 'nuisance_cache': None},
+            'tW': {'data': str(tw_dir / 'validation.p'), 'eft_cache': 'tW/ens', 'nuisance_caches': None},
+            'Others': {'data': str(others_dir / 'validation.p'), 'eft_cache': 'Others/ens', 'nuisance_caches': None},
         },
         'background_ratios': str(ratios),
     }
