@@ -119,6 +119,113 @@ def test_find_zero_terms_keeps_tail_terms():
     assert find_zero_terms(coefs, ['a', 'b'], lumi, x, n_bins=1) == [['a', 'sm'], ['b', 'a']]  # one bin: inclusive
 
 
+def test_expansion_appends_background_strengths():
+    """E(theta) = T(theta) without background strengths; with them, each strength is one column after T(theta)"""
+    from topsbi.tools.data import expansion
+
+    theta = [1.0, 0.5, -2.0, 3.0]
+    assert torch.equal(expansion(theta, 3), get_lower_tri(theta))
+    E = expansion(theta + [0.7, 0.0], 3, dtype=torch.float64)
+    assert E.dtype == torch.float64 and len(E) == 10 + 2
+    assert torch.equal(E[:10], get_lower_tri(theta, dtype=torch.float64))
+    assert E[10:].tolist() == [0.7, 0.0]
+    with pytest.raises(ValueError):
+        expansion([1.0, 0.5], 3)
+
+
+def test_masks_with_background_processes():
+    """background columns follow T(theta), are always kept and cannot be zero terms; the data width is checked"""
+    from topsbi.tools.data import kept_columns, zero_term_mask
+
+    wcs, zero_terms = ['a', 'b'], [['b', 'a']]
+    plain = zero_term_mask(wcs, zero_terms)
+    mask = zero_term_mask(wcs, zero_terms, ['bg'])
+    assert len(plain) == 6 and len(mask) == 7
+    assert torch.equal(mask[:6], plain) and mask[6] and not mask[4]
+    with pytest.raises(ValueError):
+        zero_term_mask(wcs, [['bg', 'sm']], ['bg'])
+
+    config = {'device': 'cpu', 'wcs': wcs, 'background_processes': ['bg']}
+    assert kept_columns(config, 7).all()
+    with pytest.raises(ValueError):
+        kept_columns(config, 6)
+    assert kept_columns({'device': 'cpu'}, 6).all()  # neither zero_terms nor background_processes: no check
+
+
+def test_get_weights_background_strength():
+    """a background event weighs mu b: at mu = 1 the weights are those of the concatenated samples, at mu = 0 zero"""
+    from topsbi.tools.data import get_weights
+
+    g = torch.Generator().manual_seed(0)
+    n_s, n_b = 200, 50
+    signal = torch.randn(n_s, 6, generator=g, dtype=torch.float64)  # wcs a, b: columns sm, a, a*a, b, b*a, b*b
+    b = torch.rand(n_b, generator=g, dtype=torch.float64) - 0.25  # negative weights allowed
+    years = torch.randint(0, 2, (n_s + n_b,), generator=g).to(torch.float32)
+    plain = {'device': 'cpu', 'lumi': [1.5, 2.0], 'c0': [1.0, 0.5, -1.0], 'c1': [1.0, 2.0, 0.3]}
+
+    # without the background column: background events are flat in theta (SM column only)
+    concatenated = torch.cat([signal, torch.zeros(n_b, 6, dtype=torch.float64)])
+    concatenated[n_s:, 0] = b
+    w0_ref, w1_ref = get_weights(concatenated, plain, years)
+
+    coefs = torch.zeros(n_s + n_b, 7, dtype=torch.float64)
+    coefs[:n_s, :6] = signal
+    coefs[n_s:, 6] = b
+    config = {**plain, 'wcs': ['a', 'b'], 'background_processes': ['bg']}
+    w0, w1 = get_weights(coefs, {**config, 'c0': plain['c0'] + [1.0], 'c1': plain['c1'] + [1.0]}, years)
+    assert torch.equal(w0, w0_ref) and torch.equal(w1, w1_ref)
+
+    v0, v1 = get_weights(coefs, {**config, 'c0': plain['c0'] + [1.0], 'c1': plain['c1'] + [0.0]}, years)
+    assert torch.equal(v0, w0_ref) and torch.equal(v1[:n_s], w1_ref[:n_s])
+    assert (v1[n_s:] == 0).all()
+
+    with pytest.raises(ValueError):
+        get_weights(coefs, {**config, 'c0': plain['c0'] + [1.0], 'c1': plain['c1']}, years)
+
+
+def test_find_zero_terms_ignores_backgrounds():
+    """background events and columns do not change the zero terms, also where a bin holds background events only"""
+    from topsbi.tools.data import find_zero_terms
+
+    n_s, n_b = 2000, 500
+    g = torch.Generator().manual_seed(1)
+    x = torch.rand(n_s, 2, generator=g, dtype=torch.float64)
+    signal = torch.zeros(n_s, 6, dtype=torch.float64)
+    signal[:, 0], signal[:, 1], signal[:, 3], signal[:, 5] = 1.0, x[:, 0], 1e-9, 0.3
+    expected = find_zero_terms(signal, ['a', 'b'], torch.ones(n_s), x)
+    assert expected == [['a', 'a'], ['b', 'sm'], ['b', 'a']]
+
+    coefs = torch.zeros(n_s + n_b, 7, dtype=torch.float64)
+    coefs[:n_s, :6] = signal
+    coefs[n_s:, 6] = 2.0
+    features = torch.cat([x, torch.full((n_b, 2), 5.0, dtype=torch.float64)])  # background-only top bin
+    lumi = torch.ones(n_s + n_b)
+    assert find_zero_terms(coefs, ['a', 'b'], lumi, features, background_processes=['bg']) == expected
+    with pytest.raises(ValueError):
+        find_zero_terms(coefs, ['a', 'b'], lumi, features)
+
+
+def test_check_config_background_processes():
+    """background_processes: a list of names for eft trainings with wcs; c0 / c1 hold SM, WCs and strengths"""
+    from topsbi.train import check_config
+
+    base = {'method': 'eft', 'wcs': ['a', 'b'], 'c0': [1.0, 0.5, 0.5], 'c1': [1.0, 0.0, 0.0]}
+    check_config(base)
+    check_config({**base, 'background_processes': ['bg'], 'c0': base['c0'] + [1.0], 'c1': base['c1'] + [0.0]})
+    with pytest.raises(ValueError):  # strength given, process not declared
+        check_config({**base, 'c0': base['c0'] + [1.0], 'c1': base['c1'] + [0.0]})
+    with pytest.raises(ValueError):  # process declared, strength missing
+        check_config({**base, 'background_processes': ['bg']})
+    for bad in ('bg', [], ['bg', 'bg'], [1]):
+        with pytest.raises(ValueError):
+            check_config({**base, 'background_processes': bad})
+    with pytest.raises(KeyError):
+        check_config({'method': 'eft', 'background_processes': ['bg'], 'c0': [1.0, 1.0], 'c1': [1.0, 0.0]})
+    nuisance = {'method': 'weight_shift', 'data': 'd', 'systematic': 's', 'direction': 'up', 'lumi': [1.0], 'seed': 0}
+    with pytest.raises(ValueError):
+        check_config({**nuisance, 'wcs': ['a'], 'background_processes': ['bg']})
+
+
 SHARED_KEYS = ['auc', 'rate_closure', 'rate_pull', 'r_chi2_ndf', 'r_z', 'r_rms_bias', 'r_pull', 'r_ci_diff',
                'nominal_r_pull', 'group_chi2_ndf', 'feature_chi2_ndf', 'feature_rms_bias', 'nominal_r_chi2_ndf',
                'best_epoch', 'best_test_loss']

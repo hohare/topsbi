@@ -34,7 +34,8 @@ BACKGROUND_KEYS = ('data', 'background', 'lumi', 'seed')
 def check_config(config):
     """
     Raise before loading anything if the method is missing or unknown, a nuisance or background training misses a
-    key, or the optional 'eras', 'closure_groups' or 'threads' are malformed.
+    key, the optional 'eras', 'closure_groups', 'threads' or 'background_processes' are malformed, or c0 / c1 do not
+    have one entry for the SM, each WC and each background process.
     """
     methods = EFT_METHODS + SOFT_PLUS_METHODS
     if config.get('method') not in methods:
@@ -55,6 +56,32 @@ def check_config(config):
     threads = config.get('threads')
     if threads is not None and (not isinstance(threads, int) or threads < 1):
         raise ValueError(f"config 'threads' must be a positive integer, got {threads!r}")
+    processes = config.get('background_processes')
+    if processes is not None:
+        if (
+            not isinstance(processes, list)
+            or not processes
+            or not all(isinstance(p, str) for p in processes)
+            or len(set(processes)) != len(processes)
+        ):
+            raise ValueError(f"config 'background_processes' must be a list of distinct names, got {processes!r}")
+        if config['method'] not in EFT_METHODS:
+            raise ValueError(
+                f"'background_processes' is used by {EFT_METHODS} trainings only, not {config['method']!r}"
+            )
+        if 'wcs' not in config:
+            raise KeyError(
+                "'background_processes' needs 'wcs': a point holds the SM entry, the WCs, then the strengths"
+            )
+    if 'wcs' in config:
+        n_bg = len(processes or [])
+        n_point = len(config['wcs']) + 1 + n_bg
+        for key in ('c0', 'c1'):
+            if key in config and len(config[key]) != n_point:
+                raise ValueError(
+                    f"config {key!r} has {len(config[key])} entries; expected {n_point}: the SM, "
+                    f"{len(config['wcs'])} WCs and {n_bg} background strengths"
+                )
 
 
 def closure_options(config):

@@ -9,6 +9,7 @@ def find_zero_terms(
     features: torch.tensor,
     n_bins: int = 20,
     tol: float = 1e-6,
+    background_processes: list = (),
 ):
     """
     WC pairs whose structure constants s_q(z) are negligible in every region of phase space.
@@ -20,17 +21,29 @@ def find_zero_terms(
     which an inclusive ratio dilutes. The largest bin ratio is never below the inclusive ratio, so this drops a
     subset of the terms an inclusive criterion drops.
 
+    Only the signal enters: with background_processes the last K columns (one per process, expansion) are left out,
+    and so are the background events, whose T(theta) columns are all zero.
+
     Args:
-        coefs: structure constants s_q(z) [n_events, n_q]
+        coefs: structure constants s_q(z) [n_events, n_q + K]
         wcs: WC names in the order of coefs
         lumi_per_event: L of each event's era
         features: event features [n_events, n_features]; every column is binned
         n_bins: quantile bins per feature
         tol: threshold on the largest bin ratio
+        background_processes: names of the background processes, in the order of their columns
     Returns:
         list of [wc_i, wc_j] pairs (names as in zero_terms.yml)
     """
     names = ['sm'] + list(wcs)
+    n_q = len(names) * (len(names) + 1) // 2
+    if coefs.shape[1] != n_q + len(background_processes):
+        raise ValueError(
+            f'wcs and background_processes give {n_q + len(background_processes)} columns but coefs has {coefs.shape[1]}'
+        )
+    coefs = coefs[:, :n_q]
+    signal = coefs.ne(0).any(1)
+    coefs, lumi_per_event, features = coefs[signal], lumi_per_event[signal], features[signal]
     w = lumi_per_event.to(torch.float64)[:, None] * coefs.to(torch.float64).abs()
     largest = torch.zeros(w.shape[1], dtype=torch.float64)
     for column in features.to(torch.float64).T.numpy():
@@ -50,24 +63,49 @@ def load_zero_terms(config: dict):
         return yaml.safe_load(f)['zero_terms']
 
 
-def zero_term_mask(wcs: list, zero_terms: list):
-    """Mask over the get_lower_tri columns that is False for the listed (structurally zero) WC pairs."""
+def zero_term_mask(wcs: list, zero_terms: list, background_processes: list = ()):
+    """
+    Mask over the columns of T(theta, mu) (expansion) that is False for the listed (structurally zero) WC pairs.
+
+    The columns of T(theta) follow get_lower_tri; the one column per background process after them is always kept,
+    as zero_terms names WC pairs only.
+    Args:
+        wcs: WC names in the order of the point
+        zero_terms: [wc_i, wc_j] pairs ('sm' for the SM entry), e.g. from load_zero_terms
+        background_processes: names of the background processes, in the order of their columns
+    Returns:
+        boolean tensor of length (n + 1)(n + 2) / 2 + K
+    """
     names = ['sm'] + list(wcs)
-    mask = torch.ones(len(names) * (len(names) + 1) // 2, dtype=torch.bool)
+    mask = torch.ones(len(names) * (len(names) + 1) // 2 + len(background_processes), dtype=torch.bool)
     for a, b in zero_terms:
+        if a not in names or b not in names:
+            raise ValueError(f'zero term {[a, b]} names something not in {names}: only WC pairs can be zero terms')
         i, j = sorted((names.index(a), names.index(b)), reverse=True)
         mask[i * (i + 1) // 2 + j] = False
     return mask
 
 
 def kept_columns(config: dict, n_cols: int):
-    """Columns of the get_lower_tri expansion to keep: all of them unless config lists zero_terms."""
+    """
+    Columns of the expansion T(theta, mu) to keep: all of them unless config lists zero_terms.
+
+    With background_processes the data hold one column per process after T(theta); the width of the data is then
+    always checked against wcs and background_processes.
+    Args:
+        config: dictionary with 'device' and optional 'zero_terms', 'background_processes' (with 'wcs' if either
+            is given)
+        n_cols: number of columns of the data (coefs)
+    Returns:
+        boolean tensor [n_cols] on config['device'], False for the zero terms
+    """
     zero_terms = load_zero_terms(config)
-    if not zero_terms:
+    background_processes = config.get('background_processes', [])
+    if not zero_terms and not background_processes:
         return torch.ones(n_cols, dtype=torch.bool, device=config['device'])
-    keep = zero_term_mask(config['wcs'], zero_terms)
+    keep = zero_term_mask(config['wcs'], zero_terms, background_processes)
     if keep.numel() != n_cols:
-        raise ValueError(f'wcs give {keep.numel()} columns but the data have {n_cols}')
+        raise ValueError(f'wcs and background_processes give {keep.numel()} columns but the data have {n_cols}')
     return keep.to(config['device'])
 
 
@@ -117,6 +155,32 @@ def get_lower_tri(
     off_rows, off_cols = torch.tril_indices(n, n, offset=-1)
     outer[off_rows, off_cols] *= off_diag
     return outer[rows, cols]
+
+
+def expansion(
+    point: list,
+    n_wcs: int,
+    dtype: type = torch.float32,
+):
+    """
+    Expansion T(theta, mu) = [T(theta), mu_1, ..., mu_K] of a point (1, theta_1, ..., theta_n, mu_1, ..., mu_K), so
+    that w(z; theta, mu) = s_q(z) . T(theta, mu).
+
+    The first n + 1 entries are the SM-inclusive WC point theta, expanded quadratically by get_lower_tri. The K
+    entries after them are the strengths mu_p of the background processes (config 'background_processes'), which
+    enter linearly, one column each, after T(theta). Without background processes T(theta, mu) = T(theta).
+
+    Args:
+        point: SM-inclusive WC point followed by the background strengths
+        n_wcs: number of WCs n
+        dtype: dtype of the result
+    Returns:
+        T(theta, mu), length (n + 1)(n + 2) / 2 + K
+    """
+    point = torch.as_tensor(point, dtype=dtype)
+    if point.ndim != 1 or len(point) < n_wcs + 1:
+        raise ValueError(f'a point needs the SM entry and {n_wcs} WCs, got shape {tuple(point.shape)}')
+    return torch.cat([get_lower_tri(point[: n_wcs + 1], dtype=dtype), point[n_wcs + 1 :]])
 
 
 def lumi_per_event(years: torch.tensor, config: dict):
@@ -571,21 +635,29 @@ def get_weights(coefs: torch.tensor, config: dict, years: torch.tensor):
     Stitched event weights w^s(theta_0) and w^s(theta_1).
 
     The stored structure constants s_q(z) (coefs) already carry xsec/nSumOfWeights and the detector scale factors,
-    but not the luminosity, so w^s(theta) = L_era s_q(z) . T(theta) x 1000 (pb to fb), computed in float64.
+    but not the luminosity, so w^s(theta) = L_era s_q(z) . T(theta) x 1000 (pb to fb), computed in float64. With
+    background_processes, T(theta, mu) replaces T(theta): c0 and c1 end with the background strengths mu_p and coefs with the background columns
+    (expansion).
 
     Args:
-        coefs: structure constants s_q(z) per event (rows) and quadratic term (columns)
-        config: dictionary with 'c0' (theta_0), 'c1' (theta_1) and the per-era luminosities 'lumi'
+        coefs: structure constants s_q(z) per event (rows) and term of T(theta, mu) (columns)
+        config: dictionary with 'c0' (theta_0), 'c1' (theta_1), the per-era luminosities 'lumi' and optional
+            'background_processes'
         years: era index (year_int feature) of each event, used to look up the luminosity
     Returns:
         w0: w^s(theta_0) per event
         w1: w^s(theta_1) per event
     """
+    if len(config['c0']) != len(config['c1']):
+        raise ValueError(f"c0 has {len(config['c0'])} entries but c1 has {len(config['c1'])}")
+    n_wcs = len(config['c0']) - 1 - len(config.get('background_processes', []))
     keep = kept_columns(config, coefs.shape[1])
     coefs = coefs[:, keep].to(torch.float64)
     lumi = lumi_per_event(years, config)
-    w0 = lumi * (coefs @ get_lower_tri(config['c0'], dtype=torch.float64).to(config['device'])[keep]) * 1000
-    w1 = lumi * (coefs @ get_lower_tri(config['c1'], dtype=torch.float64).to(config['device'])[keep]) * 1000
+    T0 = expansion(config['c0'], n_wcs, dtype=torch.float64).to(config['device'])[keep]
+    T1 = expansion(config['c1'], n_wcs, dtype=torch.float64).to(config['device'])[keep]
+    w0 = lumi * (coefs @ T0) * 1000
+    w1 = lumi * (coefs @ T1) * 1000
     return (w0).to(torch.float32), (w1).to(torch.float32)
 
 

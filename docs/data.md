@@ -16,11 +16,29 @@ The config's `data` directory holds `train.p` (and `test.p` unless `bootstrap: t
   $\theta = (1, c_1, \dots, c_{n_{\rm wcs}})$ is $s(z) \cdot T(\theta)$, where $T(\theta)$ = `get_lower_tri(theta)` lists
   $\theta_i \theta_j$ for $j \le i$, so $n_q = (n_{\rm wcs}+1)(n_{\rm wcs}+2)/2$. They include the per-sample normalisation (cross section
   over sum of weights) but not the luminosity: topsbi multiplies by `lumi[era]` and by 1,000, so `coefs` in pb with
-  `lumi` in $fb^{-1}$ gives expected events.
+  `lumi` in $fb^{-1}$ gives expected events. With background processes (below), `coefs` has $K$ more columns after these.
 
 Further tensors are ignored. The config sets `wcs` (the $n_{\rm wcs}$ names, in the order of `coefs`), `c0` and `c1`
-($n_{\rm wcs} + 1$ values each, the first 1), `lumi` ($n_{\rm eras}$ values) and `year_loc`, and its `features` yml has one entry (`loc` < $n_{\rm features}$) per
+($n_{\rm wcs} + 1$ values each, the first 1, plus one strength per background process), `lumi` ($n_{\rm eras}$ values) and `year_loc`, and its `features` yml has one entry (`loc` < $n_{\rm features}$) per
 feature to bin and plot ([`examples/features/README.md`](../examples/features/README.md)).
+
+### Background processes (optional)
+
+Background events can enter an eft training next to the signal. Each background process $p$ (config
+`background_processes`, in column order) adds one column to `coefs` after the $n_q$ columns of $T(\theta)$, and one
+strength $\mu_p$ at the end of each point, $(1, c_1, \dots, c_{n_{\rm wcs}}, \mu_1, \dots, \mu_K)$. The event weight is
+$s(z) \cdot T(\theta, \mu)$ with $T(\theta, \mu) = [T(\theta), \mu_1, \dots, \mu_K]$ (`expansion(point, n_wcs)`), so a
+background is linear in its strength and does not interfere with the WCs:
+
+- a signal event has zeros in the $K$ background columns;
+- an event of background process $p$ has zeros in the $T(\theta)$ columns and its event weight, normalised like
+  `coefs`, in the column of $p$.
+
+`coefs` then has $n_q + K$ columns, and `c0` and `c1` have $n_{\rm wcs} + 1 + K$ values. $\mu_p = 1$ is the nominal
+yield of $p$; $\mu_p = 0$ removes it. A training with $\mu_p = 1$ in both `c0` and `c1` has the background on both
+sides, with the same weight. To separate a background column from the SM column, the ensemble fit
+([`ensemble.md`](ensemble.md)) needs networks trained at $\mu_p \neq 1$. All backgrounds can share one column, or
+each process can have its own. Zero terms name WC pairs only, so background columns are always kept.
 
 ## 2. The combined format: nuisance trainings (optional for eft)
 
@@ -73,12 +91,14 @@ validation split) must agree. Other keys are free.
 | `eras` | the era index | the eras should be labelled by name (names indexed like `lumi`) |
 | `closure_groups` | era, and njets (column 19) with values >= 4 merged | other network inputs should define the closure groups |
 | `zero_terms` | none | some WC pairs have structurally zero quadratic terms (a yml with `zero_terms`: a list of pairs; [example](../examples/data/zero_terms.yml)) |
+| `background_processes` | none | the data hold background columns after $T(\theta)$ (section 1) |
 
 ## 4. What topsbi checks
 
 Checked when loading: the number of tensors in each file, `reference` and `salt_split` between nominal and a
 variation, the eras of a variation's `train.p` and `validation.p`, a non-empty test split, the era and closure-group
-columns against the number of features, and (validation) `lumi` covering every era index. Not checked: that
+columns against the number of features, the width of `coefs` against `wcs` and `background_processes` (when
+either `zero_terms` or `background_processes` is set), the number of values in `c0` and `c1` (training config), and (validation) `lumi` covering every era index. Not checked: that
 `event_id` is unique and that `validation.p` was split by event identity.
 
 ## 5. One way to produce it
