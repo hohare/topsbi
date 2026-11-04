@@ -1713,18 +1713,20 @@ def scan_uncertainty(
     background_target=None,
 ):
     """
-    The scan of scan_args and the uncertainty of its minimum, all on one event selection: the nominal scan's, selected
-    with the ensemble mean and every member (scan with Gammas = [mean] + members) and passed to the other scans as
-    their initial selection. Members: the same scan with each member's Gamma; their spread of the minimum, and
-    spread / sqrt(n_e), the error of the mean's minimum for independent members. Bootstrap (MC statistics of
-    config['data']): n_boot scans with every event's target weight, w0 and weight coefficients multiplied by a
+    The scan of scan_args and the uncertainty of its minimum, all on one event selection: the nominal scan's, passed
+    to the other scans as their initial selection. With member or subset scans it is selected with the ensemble mean
+    and every member (scan with Gammas = [mean] + members), so that every member's term is positive on it; with the
+    bootstrap only, with the mean alone, the selection of a plain scan (a bootstrap scan keeps the mean Gamma), so
+    that the nominal scan is the plain scan. Members: the same scan with each member's Gamma; their spread of the
+    minimum, and spread / sqrt(n_e), the error of the mean's minimum for independent members. Bootstrap (MC statistics
+    of config['data']): n_boot scans with every event's target weight, w0 and weight coefficients multiplied by a
     Poisson(1) count. Subsets: for each n_e in subsets, that many random draws of n_e members whose mean Gamma is
     scanned, with the spread of their minima. theta_t gives the nominal scan its q_target (scan); the other scans have
     none. With backgrounds (inputs.backgrounds), background_target gives the target weights on the background events
-    (background_target_weights); their selection also keeps every member's signal term positive and is passed on like
-    the signal selection; a member (subset) scan uses that member's Gamma (the subset's mean Gamma) on the background
-    events too, and a bootstrap scan also multiplies every background event's target weight and expected weights w_c
-    by a Poisson(1) count of its own (MC statistics of the background samples).
+    (background_target_weights); their selection also keeps every member's signal term positive when member or subset
+    scans run, and is passed on like the signal selection; a member (subset) scan uses that member's Gamma (the
+    subset's mean Gamma) on the background events too, and a bootstrap scan also multiplies every background event's
+    target weight and expected weights w_c by a Poisson(1) count of its own (MC statistics of the background samples).
 
     Args:
         inputs: load_inputs result with members (load_inputs(config, members=True))
@@ -1751,11 +1753,12 @@ def scan_uncertainty(
     backgrounds = getattr(inputs, 'backgrounds', None)
     seeds = list(inputs.seed_Gamma)
     member_Gamma = [inputs.seed_Gamma[e] for e in seeds]
+    with_members = bool(member_scans or subsets)
     args = dict(
         scan_args,
-        Gammas=[inputs.Gamma] + member_Gamma,
+        Gammas=[inputs.Gamma] + member_Gamma if with_members else [inputs.Gamma],
         background_target=background_target,
-        background_members=backgrounds is not None,
+        background_members=backgrounds is not None and with_members,
     )
     poi = [inputs.wcs.index(p) for p in args['pois']]
 

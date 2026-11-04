@@ -455,6 +455,40 @@ def test_scan_with_background():
     assert without.background_keep is None
 
 
+def test_uncertainty_selection():
+    """scan_uncertainty selects with every member only when member or subset scans run: a bootstrap-only nominal is
+    the plain scan (same selection and q), and with member scans the events a member makes non-positive are dropped
+    from the signal and background selections."""
+    theta_t, nu_t = np.array([0.7, -0.4]), np.array([0.3, 0.5])
+    box = np.array([[-0.5, 2.0], [-1.5, 1.0]])
+    grid = [np.linspace(0.3, 1.1, 9)]
+    inputs = mixture_inputs()
+    n = len(inputs.w0)
+    member = inputs.Gamma.clone()
+    member[:, :5] = -member[:, :5]  # r_hat < 0 everywhere for the first five events in this member
+    inputs.seed_Gamma = {0: inputs.Gamma, 1: member}
+    inputs.backgrounds.sets['B'].seed_Gamma = {0: inputs.Gamma, 1: member}
+    target = target_weights(inputs, theta_t, nu_t)
+    background_target = background_target_weights(inputs, nu_t)
+    args = dict(pois=['cA'], grids=grid, box=box, profile_wcs=['cB'], theta_base=theta_t)
+    plain = scan(inputs, target, theta_t=theta_t, background_target=background_target, **args)
+    assert plain.keep.all() and plain.background_keep['B'].all()
+
+    boot = scan_uncertainty(
+        inputs, target, args, member_scans=False, n_boot=1, background_target=background_target, theta_t=theta_t
+    )
+    assert torch.equal(boot.nominal.keep, plain.keep)
+    assert torch.equal(boot.nominal.background_keep['B'], plain.background_keep['B'])
+    assert np.allclose(boot.nominal.q, plain.q, rtol=0.0, atol=1e-10)
+    assert boot.members is None and len(boot.bootstrap['best']) == 1 and all(boot.bootstrap['success'])
+
+    strict = scan_uncertainty(inputs, target, args, background_target=background_target, theta_t=theta_t)
+    expected = torch.arange(n) >= 5
+    assert torch.equal(strict.nominal.keep, expected)
+    assert torch.equal(strict.nominal.background_keep['B'], expected)
+    assert strict.members['background_dropped'] == [{'B': 5}, {'B': 5}]
+
+
 def test_calibrated_inputs():
     """Calibrated inputs: a fold's values are the other folds' bin ratios, background events of the same fold and bin
     share them, the background term moves to the SM reference (b / g0_hat, rate kept), an Asimov scan covers its target,
