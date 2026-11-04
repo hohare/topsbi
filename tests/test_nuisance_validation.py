@@ -176,8 +176,9 @@ def test_load_nuisance_ensemble_data_override(toy, tmp_path):
     assert nv.load_nuisance_ensemble(config, None, data=data, path=path).manifest['data'] == data
     with pytest.raises(SystemExit, match='another ensemble, data'):
         nv.load_nuisance_ensemble(config, None, path=path)
-    with pytest.raises(SystemExit, match='theta_ref'):
-        nv.load_nuisance_ensemble({**config, 'c0': [1.0, 0.0, 0.0]}, None, data=data, path=path)
+    # theta_ref is recorded, not required to equal c0 (the checks move to it through reference_nominal)
+    other = nv.load_nuisance_ensemble({**config, 'c0': [1.0, 0.0, 0.0]}, None, data=data, path=path)
+    assert np.allclose(other.theta_ref, C0)
 
 
 def test_background_nuisances(toy, tmp_path, monkeypatch):
@@ -229,3 +230,41 @@ def test_run_backgrounds(toy, tmp_path):
         nv.run_backgrounds({**config, 'backgrounds': {'signal': config['backgrounds']['tW']}})
     with pytest.raises(SystemExit, match='no validation.p'):
         nv.run_backgrounds({**config, 'backgrounds': {**config['backgrounds'], 'tW': str(tmp_path)}})
+
+
+def reference_file(directory, x, point, w_ref=2.0):
+    """validation.p of the events x in the nominal layout with w_ref, and a sample.yml with reference_point point."""
+    directory.mkdir(parents=True)
+    dataset = nominal_dataset(x)
+    tensors = list(dataset.tensors)
+    tensors[5] = torch.full_like(tensors[5], w_ref)
+    torch.save(torch.utils.data.TensorDataset(*tensors), directory / 'validation.p')
+    (directory / 'sample.yml').write_text(yaml.safe_dump({'reference_point': point}))
+    return str(directory / 'validation.p')
+
+
+def test_reference_nominal(toy, tmp_path):
+    config = nv.load_config(write_config(toy, tmp_path))
+    columns = ('features', 'ids', 'event_id', 'syst_ratio', 'w_ref')
+    nominal = nv.load_combined(config['data'], 'nominal', columns)
+    sm = [1.0, 0.0, 0.0]
+
+    # theta_ref = c0: the checks read config['data']
+    tensors, checks = nv.reference_nominal(config, C0, nominal)
+    assert tensors is nominal and checks is config
+    with pytest.raises(SystemExit, match='set reference_data'):
+        nv.reference_nominal(config, sm, nominal)
+
+    # theta_ref != c0: the same events combined at theta_ref
+    path = reference_file(tmp_path / 'sm' / 'nominal', toy.x['signal'], sm)
+    tensors, checks = nv.reference_nominal({**config, 'reference_data': path}, sm, nominal)
+    assert checks['data'] == path and config['data'] == toy.eft['data']
+    assert torch.equal(tensors[0], nominal[0]) and torch.all(tensors[5] == 2.0)
+    assert np.allclose(nv.sample_weight(tensors, 'nominal', checks), 2 * nv.sample_weight(nominal, 'nominal', config))
+
+    # another reference point, or other events, stop the run
+    with pytest.raises(SystemExit, match='reference_point'):
+        nv.reference_nominal({**config, 'reference_data': path}, C0, nominal)
+    shuffled = reference_file(tmp_path / 'shuffled' / 'nominal', toy.x['signal'][::-1].copy(), sm)
+    with pytest.raises(SystemExit, match='differ in features'):
+        nv.reference_nominal({**config, 'reference_data': shuffled}, sm, nominal)

@@ -49,10 +49,13 @@ def load_config(config_path):
     """
     The nuisance validation config, completed from the EFT validation config it names (ensemble): data, c0, wcs,
     lumi, features and year_loc are taken from there (a nuisance config that sets one of them stops the run),
-    eft_cache is the EFT ensemble cache, {name}/ensemble of that config, and eft_config that config itself.
+    eft_cache is the EFT ensemble cache, {name}/ensemble of that config, and eft_config that config itself. The
+    optional reference_data names the nominal file the checks read their weights and targets from when the nuisance
+    networks were trained at another reference point than c0 (reference_nominal).
 
     Args:
-        config_path: nuisance validation config yml (name, ensemble, seeds, optional device and workers)
+        config_path: nuisance validation config yml (name, ensemble, seeds, optional reference_data, device and
+            workers)
     Returns:
         config dict
     """
@@ -76,8 +79,8 @@ def load_config(config_path):
 def load_nuisance_ensemble(config, features, refit=False, data=None, path=None):
     """
     The nuisance cache of config: read from path when it matches config (EFT ensemble, data, networks and their
-    model.pt), otherwise built and written, but only when refit is set. Its reference point theta_ref must be the EFT
-    reference point c0, since the two ensembles are combined as log r_hat(x; theta) + log r_hat(x; nu).
+    model.pt), otherwise built and written, but only when refit is set. The cache records the networks' reference
+    point theta_ref, which may differ from the EFT reference point c0.
 
     Args:
         config: nuisance validation config, completed by load_config
@@ -100,26 +103,20 @@ def load_nuisance_ensemble(config, features, refit=False, data=None, path=None):
             sys.exit(
                 f'[error]: {path} was built from another ensemble, data, networks or model.pt files; rerun with --refit'
             )
-    else:
-        nuisances, networks = nuisance_networks(config['seeds'])
-        theta_ref = reference_point(nuisances, networks)
-        year_loc = config.get('year_loc', 21)
-        for nuisance, eras in zip(nuisances, nuisance_eras(nuisances, networks, year_loc)):
-            nuisance['eras'] = eras
-        tmp = f'{path}.tmp'
-        shutil.rmtree(tmp, ignore_errors=True)
-        os.makedirs(tmp)
-        args = (networks, features, config.get('device', 'cpu'), tmp)
-        finites = seed_map(nuisance_seed, list(networks), args, config.get('workers', 1))
-        event_eras = features[:, year_loc].to(torch.int64).numpy()
-        write_nuisance_cache(path, config, nuisances, networks, theta_ref, finites, event_eras)
-        cache = NuisanceCache(path)
-    if not np.allclose(cache.theta_ref, config['c0'], rtol=0, atol=1e-12):
-        sys.exit(
-            f'[error]: the nuisance networks were trained at theta_ref = {cache.theta_ref}, '
-            f'the EFT ensemble at c0 = {config["c0"]}'
-        )
-    return cache
+        return cache
+    nuisances, networks = nuisance_networks(config['seeds'])
+    theta_ref = reference_point(nuisances, networks)
+    year_loc = config.get('year_loc', 21)
+    for nuisance, eras in zip(nuisances, nuisance_eras(nuisances, networks, year_loc)):
+        nuisance['eras'] = eras
+    tmp = f'{path}.tmp'
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    args = (networks, features, config.get('device', 'cpu'), tmp)
+    finites = seed_map(nuisance_seed, list(networks), args, config.get('workers', 1))
+    event_eras = features[:, year_loc].to(torch.int64).numpy()
+    write_nuisance_cache(path, config, nuisances, networks, theta_ref, finites, event_eras)
+    return NuisanceCache(path)
 
 
 def background_nuisances(config, refit=False):
@@ -150,6 +147,45 @@ def background_nuisances(config, refit=False):
             features = torch.load(data, weights_only=False, mmap=True).tensors[0].clone()
         caches[p] = load_nuisance_ensemble(config, features, refit=build, data=data, path=path)
     return caches
+
+
+def reference_nominal(config, theta_ref, nominal):
+    """
+    The nominal events the checks read their weights and targets from, w^s(theta_ref, 0) and r(x, z; theta_ref, nu)
+    at the networks' reference point theta_ref, and the config they are read with. config['data'] holds them when
+    theta_ref = c0; otherwise reference_data must name a nominal file of the same events in the same order, combined
+    at theta_ref (reference_point in its sample.yml). The nuisance cache stays on config['data'], the events of the
+    EFT ensemble.
+
+    Args:
+        config: nuisance validation config, completed by load_config
+        theta_ref: the nuisance networks' reference point (NuisanceCache.theta_ref, SM-inclusive)
+        nominal: tensors of config['data'] (load_combined with features, ids, event_id, syst_ratio, w_ref)
+    Returns:
+        (nominal tensors of the checks, config with data the file they come from)
+    """
+    path = config.get('reference_data')
+    if path is None:
+        if not np.allclose(theta_ref, config['c0'], rtol=0, atol=1e-12):
+            sys.exit(
+                f'[error]: the nuisance networks were trained at theta_ref = {theta_ref}, the EFT ensemble at '
+                f'c0 = {config["c0"]}; set reference_data to the nominal file of the same events combined at theta_ref'
+            )
+        return nominal, config
+    sample = f'{os.path.dirname(path)}/sample.yml'
+    with open(sample) as f:
+        point = yaml.safe_load(f).get('reference_point')
+    if point is None or not np.allclose(point, theta_ref, rtol=0, atol=1e-12):
+        sys.exit(f'[error]: {sample} has reference_point {point}, the nuisance networks theta_ref = {theta_ref}')
+    reference = load_combined(path, 'nominal', ('features', 'ids', 'event_id', 'syst_ratio', 'w_ref'))
+    columns = dict(zip(NUISANCE_COLUMNS['nominal'], nominal))
+    for name, tensor in zip(NUISANCE_COLUMNS['nominal'], reference):
+        if name in ('features', 'ids', 'event_id') and not torch.equal(tensor, columns[name]):
+            sys.exit(
+                f'[error]: {path} and {config["data"]} differ in {name}; reference_data must hold the same events '
+                'in the same order'
+            )
+    return reference, {**config, 'data': path}
 
 
 class ClosureTargets:
@@ -290,16 +326,22 @@ def eft_ratio(eft, theta):
     return r_hat
 
 
-def eft_closure(binning, w0, rho, r_hat, keep):
+def eft_closure(binning, w0, rho, w_hat0, keep):
     """
-    Check 4 baseline: closure of the learned EFT ratio alone at theta (nu = 0), hat w_b = sum_i w^s_i(theta_ref, 0)
+    Check 4 baseline: closure of the learned EFT ratio alone at theta (nu = 0), hat w_b = sum_i w^s_i(c0, 0)
     r_hat(x_i; theta) against w_b = sum_i w^s_i(theta, 0), with Var_MC = sum_i (hat w_i - w_i)^2 (no member scatter).
 
+    Args:
+        binning: binning of the nominal events (quantile_binning, then merge_sparse)
+        w0: [N] w^s(theta_ref, 0) per nominal event
+        rho: [N] rho_i(theta) (factorisation_weights)
+        w_hat0: [N] w^s(c0, 0) r_hat(x; theta) per nominal event, 0 where the EFT ensemble drops the event
+        keep: [N] bool, the events the EFT ensemble keeps
     Returns:
         (sums, component_bias result with one row)
     """
     index, n_bins = binning['index'], binning['n_bins']
-    learned, true = (w0 * np.nan_to_num(r_hat))[keep], (w0 * rho)[keep]
+    learned, true = w_hat0[keep], (w0 * rho)[keep]
     sums = {
         'bias': (binned_sums(learned[None], index[:, keep], n_bins) - binned_sums(true[None], index[:, keep], n_bins))[
             None
@@ -900,8 +942,9 @@ def main(config_path, refit=False, backgrounds=False):
     interpolation in nu and its shape; check 3, the closure of the weight_shift networks at other WC points
     (factorisation in theta); check 4, the closure of the combined learned ratio r_hat(x; theta) r_hat(x; nu) of the
     scans at those points, and of the nuisance shift alone on top of the learned EFT ratio; writes
-    nuisance_diagnostics.yml, nuisance_sums.npz and plots/ (plot_results) under config['name']. With backgrounds,
-    only the background step runs instead (run_backgrounds).
+    nuisance_diagnostics.yml, nuisance_sums.npz and plots/ (plot_results) under config['name']. The checks run at the
+    networks' reference point theta_ref, on the events of reference_nominal. With backgrounds, only the background
+    step runs instead (run_backgrounds).
 
     Args:
         config_path: nuisance validation config yml
@@ -921,14 +964,16 @@ def main(config_path, refit=False, backgrounds=False):
 
     nominal = load_combined(config['data'], 'nominal', ('features', 'ids', 'event_id', 'syst_ratio', 'w_ref'))
     features = nominal[0]
-    w0 = sample_weight(nominal, 'nominal', config).double()
     cache = load_nuisance_ensemble(config, features, refit)
+    nominal, checks = reference_nominal(config, cache.theta_ref, nominal)
+    print(f'[info]: checks at theta_ref = {cache.theta_ref} on {checks["data"]}')
+    w0 = sample_weight(nominal, 'nominal', checks).double()
 
     # check 1: closure of every network, averaged over members, in merged equal-count bins of every network input
     cfg = config.get('closure', {})
     binning = quantile_binning(features, config['features'], cfg.get('n_bins', 20), cfg.get('features'))
     binning = merge_sparse(binning, features, config['features'], w0, cfg.get('min_neff', 30))
-    targets = ClosureTargets(config, cache, nominal, w0, binning)
+    targets = ClosureTargets(checks, cache, nominal, w0, binning)
     closure_sums = nuisance_sums(cache, binning, w0, targets)
     closure = [component_bias(s, binning) for s in closure_sums]
     tests = {'closure': (closure_sums, closure)}
@@ -945,9 +990,11 @@ def main(config_path, refit=False, backgrounds=False):
     # check 3: closure at other WC points theta with the networks trained at theta_ref (factorisation in theta), in
     # the bins of theta_ref; kinematic_shift is not tested, its variation files have no structure constants
     points = config.get('factorisation', {}).get('points', {'sm': [1.0] + [0.0] * len(config['wcs'])})
-    coefs = load_combined(config['data'], 'nominal', ('coefs',))[1]
+    coefs = load_combined(checks['data'], 'nominal', ('coefs',))[1]
     factorisation = {}
     weights = factorisation_weights(coefs, cache.theta_ref, points)
+    # w^s(c0, 0) = w^s(theta_ref, 0) to_c0, the reference weight of the learned EFT ratio in check 4 (1 if theta_ref = c0)
+    to_c0 = factorisation_weights(coefs, cache.theta_ref, {'c0': config['c0']})['c0']
     del coefs
     for label, rho in weights.items():
         sums = nuisance_sums(cache, binning, w0.numpy() * rho, ThetaTargets(targets, rho), methods=('weight_shift',))
@@ -963,19 +1010,19 @@ def main(config_path, refit=False, backgrounds=False):
     for label, rho in weights.items():
         r_hat = eft_ratio(eft, points[label])
         keep = np.isfinite(r_hat)
+        w_hat0 = w0.numpy() * to_c0 * np.nan_to_num(r_hat)
         sums = nuisance_sums(
             cache,
             binning,
             w0.numpy() * rho,
             ThetaTargets(targets, rho, keep),
             methods=('weight_shift',),
-            w_hat0=w0.numpy() * np.nan_to_num(r_hat),
+            w_hat0=w_hat0,
         )
         combined[label] = [None if s is None else component_bias(s, binning) for s in sums]
         tests[f'combined/{label}'] = (sums, combined[label])
-        # difference test: the nuisance shift on top of the learned EFT ratio, w0 r_hat (e^f_hat - 1) against
+        # difference test: the nuisance shift on top of the learned EFT ratio, w^s(c0, 0) r_hat (e^f_hat - 1) against
         # w^s(theta, nu) - w^s(theta, 0) per event, so the closure and the scatter of r_hat(x; theta) cancel
-        w_hat0 = w0.numpy() * np.nan_to_num(r_hat)
         sums = nuisance_sums(
             cache,
             binning,
@@ -987,7 +1034,7 @@ def main(config_path, refit=False, backgrounds=False):
         )
         difference[label] = [None if s is None else component_bias(s, binning) for s in sums]
         tests[f'difference/{label}'] = (sums, difference[label])
-        sums, eft_only[label] = eft_closure(binning, w0.numpy(), rho, r_hat, keep)
+        sums, eft_only[label] = eft_closure(binning, w0.numpy(), rho, w_hat0, keep)
         tests[f'eft_only/{label}'] = ([sums], [eft_only[label]])
 
     z_threshold = cfg.get('z_threshold', 5.0)
