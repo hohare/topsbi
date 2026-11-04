@@ -1076,12 +1076,13 @@ NOTE_COLORS = {'dropped': '#a51d1d', 'retrain': '#d95926'}
 
 
 def wc_tex(wc):
-    r'''TeX of a WC name, the convention of likelihood_scan_dev.ipynb: cQj31 -> c_{Qj}^{31}, ctGRe -> \Re[c_{tG}].'''
+    r'''TeX of a WC name, the dissertation's symbols (theory chapter, operator table): ctu1 -> c_{tu}^1,
+    cQj31 -> c_{Qj}^{3,1}, ctGRe -> \Re[c_{tG}].'''
     m = re.fullmatch(r'c([A-Za-z]+?)(Re|Im)', wc)
     if m:
         return rf'\{m.group(2)}\left[c_{{{m.group(1)}}}\right]'
     sub, sup = re.fullmatch(r'c([A-Za-z]+)(\d*)', wc).groups()
-    return f'c_{{{sub}}}' + ('' if not sup else f'^{sup}' if len(sup) == 1 else f'^{{{sup}}}')
+    return f'c_{{{sub}}}' + ('' if not sup else f'^{sup}' if len(sup) == 1 else f'^{{{",".join(sup)}}}')
 
 
 def component_tex(label):

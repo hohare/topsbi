@@ -14,7 +14,9 @@ from topsbi.scan import (
     check_background_options,
     check_nuisance_caches,
     check_scans,
+    combine_series,
     combined_f_hat,
+    curve_segments,
     load_background_inputs,
     load_config,
     nll,
@@ -23,8 +25,10 @@ from topsbi.scan import (
     positive_background_events,
     positive_events,
     scan,
+    scan_series,
     scan_settings,
     scan_uncertainty,
+    summary_plot,
     target_weights,
 )
 
@@ -685,3 +689,52 @@ def test_calibrated_inputs():
     ):
         with pytest.raises(SystemExit):
             check_scans(dict(config, scans={'c': bad}))
+
+
+def test_curve_segments():
+    """Regions below a level of a sampled curve: a V-shaped curve gives one segment with its exact crossings (linear
+    interpolation is exact on a curve linear between the bracketing points), two wells give two segments in order,
+    and a run reaching the grid edge is open there."""
+    x = np.linspace(-1.0, 1.0, 21)
+    assert np.allclose(curve_segments(x, 4 * np.abs(x - 0.2), 1.0), [[-0.05, 0.45]])
+    wells = 10 * np.minimum(np.abs(x + 0.5), np.abs(x - 0.5))
+    assert np.allclose(curve_segments(x, wells, 1.0), [[-0.6, -0.4], [0.4, 0.6]])
+    edge = curve_segments(x, 2 * np.abs(x + 1.0), 1.0)
+    assert len(edge) == 1 and edge[0][0] is None and edge[0][1] == pytest.approx(-0.5)
+
+
+def test_summary_series_and_plot(tmp_path):
+    """scan_series reads the stored regions of 1D scan outputs and refuses a scan of another WC; combine_series reads a
+    Combine tree (best-fit row dropped) at the chi2_1 levels; summary_plot draws series with open ends, two segments,
+    a hollow 68% bar, WCs a series lacks and a title."""
+    import uproot
+
+    out = tmp_path / 'scan_cA'
+    os.makedirs(out)
+    stored = {0.6827: [[-0.2, 0.3]], 0.95: [[None, 0.5]]}
+    with open(out / 'scans.yml', 'w') as f:
+        yaml.safe_dump({'scans': {'s': {'pois': ['cA'], 'segments': stored}}}, f)
+    learned = scan_series({'cA': (str(out), 's')}, 'learned', '#2a78d6', '-')
+    assert learned['segments'] == {'cA': stored}
+    with pytest.raises(ValueError):
+        scan_series({'cB': (str(out), 's')}, 'learned', '#2a78d6', '-')
+
+    x = np.linspace(-1.0, 1.0, 41)
+    path = tmp_path / 'higgsCombine.cB.MultiDimFit.root'
+    with uproot.recreate(path) as f:
+        f['limit'] = {
+            'cB': np.concatenate([[0.0], x]),
+            'deltaNLL': np.concatenate([[5.0], 0.5 * (x / 0.25) ** 2]),
+            'quantileExpected': np.concatenate([[-1.0], np.zeros(len(x))]),
+        }
+    combine = combine_series({'cB': str(path)}, 'Combine', '#eb6834', '--')
+    assert np.allclose(combine['segments']['cB'][0.6827], [[-0.25, 0.25]], atol=1e-4)
+    assert np.allclose(combine['segments']['cB'][0.95], [[-0.49, 0.49]], atol=5e-3)
+
+    combine['segments']['cA'] = {0.6827: [[-0.6, -0.4], [0.4, 0.6]], 0.95: [[-0.7, 0.7]]}
+    combine['hollow'] = True
+    outname = tmp_path / 'summary.png'
+    summary_plot(
+        ['cA', 'cB', 'cQj31'], [learned, combine], str(outname), lumi=138, note='synthetic', title='Others profiled'
+    )
+    assert outname.stat().st_size > 0

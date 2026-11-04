@@ -1,3 +1,5 @@
+from matplotlib.legend_handler import HandlerTuple
+from matplotlib.lines import Line2D
 from matplotlib.transforms import blended_transform_factory
 from topsbi.tools.data import (
     NUISANCE_COLUMNS,
@@ -27,6 +29,8 @@ SHARED_KEYS = ('data', 'c0', 'wcs', 'lumi', 'year_loc', 'zero_terms')
 SCAN_COLORS = ['#2a78d6', '#eb6834', '#1baf7a']
 SCAN_STYLES = ['-', '--', '-.']
 LEVEL_STYLES = ['solid', 'dashed', 'dotted']
+# line widths of the 68% and 95% regions in the summary plot (thick and thin, as in a limit summary)
+SUMMARY_WIDTHS = {0.6827: 4.0, 0.95: 1.5}
 # keys of a scan entry in the config's scans
 SCAN_KEYS = (
     'pois',
@@ -2185,6 +2189,104 @@ def write_results(name, config, inputs, entries):
     np.savez_compressed(f'{name}/scans.npz', **arrays)
 
 
+def curve_segments(x, q, level):
+    """
+    Regions q < level of a 1D curve given on grid points: every run of consecutive points below the level is one
+    segment, its ends interpolated linearly between the last point below and the next point above (None where the run
+    reaches the grid edge).
+
+    Args:
+        x: [P] grid values, increasing
+        q: [P] q at the grid values
+        level: q level
+    Returns:
+        [[lower, upper], ...] in increasing order
+    """
+    x, q = np.asarray(x, dtype=np.float64), np.asarray(q, dtype=np.float64)
+    below = q < level
+    segments = []
+    i, n = 0, len(x)
+    while i < n:
+        if not below[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and below[j + 1]:
+            j += 1
+        lower = None if i == 0 else float(x[i - 1] + (level - q[i - 1]) * (x[i] - x[i - 1]) / (q[i] - q[i - 1]))
+        upper = None if j == n - 1 else float(x[j] + (level - q[j]) * (x[j + 1] - x[j]) / (q[j + 1] - q[j]))
+        segments.append([lower, upper])
+        i = j + 1
+    return segments
+
+
+def combine_scan(path, wc):
+    """
+    A 1D likelihood scan of Combine (MultiDimFit output, tree limit): the grid values of wc and q = 2 deltaNLL, sorted
+    in wc, without the best-fit row (quantileExpected -1).
+
+    Args:
+        path: higgsCombine*.MultiDimFit.root file
+        wc: the scanned parameter, a branch of the tree
+    Returns:
+        x [P], q [P] float64 arrays
+    """
+    import uproot
+
+    tree = uproot.open(path)['limit']
+    a = tree.arrays([wc, 'deltaNLL', 'quantileExpected'], library='np')
+    points = a['quantileExpected'] != -1
+    x, q = a[wc][points].astype(np.float64), 2 * a['deltaNLL'][points].astype(np.float64)
+    order = np.argsort(x)
+    return x[order], q[order]
+
+
+def scan_series(outputs, label, color, linestyle):
+    """
+    A summary_plot series from 1D scan outputs (write_results): for each WC, the 68% and 95% segments of its scan, as
+    stored in scans.yml (crossings refined by brentq in scan).
+
+    Args:
+        outputs: {wc: (output directory, scan label)}, each a 1D scan of wc
+        label: legend text
+        color: line colour
+        linestyle: matplotlib line style
+    Returns:
+        series dict of summary_plot
+    """
+    segments = {}
+    for wc, (directory, scan_label) in outputs.items():
+        with open(f'{directory}/scans.yml') as f:
+            s = yaml.safe_load(f)['scans'][scan_label]
+        if s['pois'] != [wc]:
+            raise ValueError(f'{directory}: scan {scan_label} has pois {s["pois"]}, not [{wc}]')
+        missing = [cl for cl in SUMMARY_WIDTHS if cl not in s['segments']]
+        if missing:
+            raise ValueError(f'{directory}: scan {scan_label} has no regions at {missing}')
+        segments[wc] = {cl: s['segments'][cl] for cl in SUMMARY_WIDTHS}
+    return dict(label=label, color=color, linestyle=linestyle, segments=segments)
+
+
+def combine_series(files, label, color, linestyle):
+    """
+    A summary_plot series from 1D Combine scans (combine_scan): for each WC, the 68% and 95% segments of its curve at
+    q = chi2_1 quantile of the level (curve_segments, crossings interpolated linearly between grid points).
+
+    Args:
+        files: {wc: higgsCombine*.MultiDimFit.root of a 1D scan of wc}
+        label: legend text
+        color: line colour
+        linestyle: matplotlib line style
+    Returns:
+        series dict of summary_plot
+    """
+    segments = {}
+    for wc, path in files.items():
+        x, q = combine_scan(path, wc)
+        segments[wc] = {cl: curve_segments(x, q, float(scipy.stats.chi2.ppf(cl, 1))) for cl in SUMMARY_WIDTHS}
+    return dict(label=label, color=color, linestyle=linestyle, segments=segments)
+
+
 def _scan_label(spec):
     """Legend text of a scan: the spec's 'label', else its ratio and rate and whether it profiles."""
     if 'label' in spec:
@@ -2363,6 +2465,112 @@ def _pull_plot(s, outname, lumi=None):
     ax.set_xlabel(r'$\hat{\nu} - \nu_{\mathrm{obs}}$')
     ax.legend(loc='lower right', fontsize=14)
     mh.cms.label('Preliminary', data=False, lumi=lumi, com=13, ax=ax)
+    fig.savefig(outname, bbox_inches='tight')
+    plt.close(fig)
+
+
+def summary_plot(rows, series, outname, xlim=None, xlabel=None, lumi=None, note=None, title=None):
+    """
+    Summary of 1D scans in the style of a limit summary: one row per WC (top to bottom in the order of rows), in each
+    row one bar per series (offset vertically, in the order of series), each bar the 68% region (thick, filled or
+    hollow) and the 95% region (thin, in the series' line style) as segments. An end open at the grid edge is drawn to
+    the edge of the plot and marked with an arrow head; a WC a series lacks is left empty in its row. The legend is
+    above the plot, the title above the legend.
+
+    Args:
+        rows: WC names, top to bottom (labels wc_tex)
+        series: [{'label': legend text, 'color': line colour, 'linestyle': matplotlib line style of the 95% line,
+            'hollow': optional, True draws the 68% bar as an outline, 'segments': {wc: {cl: [[lower or None, upper or
+            None], ...]}}}], cl the keys of SUMMARY_WIDTHS
+        outname: output file
+        xlim: (lo, hi) of the WC axis; default the closed segment ends with a 10% margin, at least (-1, 1)
+        xlabel: label of the WC axis, default 'WC value / Lambda^2 [TeV^-2]'
+        lumi: integrated luminosity of the experiment label, or None
+        note: title of the legend (e.g. the scan set and its inputs), or None
+        title: title of the plot (e.g. how the other WCs are treated), or None
+    """
+    mh.style.use('CMS')
+    ends = [
+        v
+        for s in series
+        for wc in rows
+        for segments in (s['segments'].get(wc) or {}).values()
+        for segment in segments
+        for v in segment
+        if v is not None
+    ]
+    if xlim is None:
+        lo, hi = min(ends + [-1.0]), max(ends + [1.0])
+        margin = 0.1 * (hi - lo)
+        xlim = (lo - margin, hi + margin)
+    n = len(series)
+    step = 0.8 / n
+    thick, thin = SUMMARY_WIDTHS[0.6827], SUMMARY_WIDTHS[0.95]
+    fig, ax = plt.subplots(figsize=(10, 2.0 + 0.22 * len(rows) * max(2, n)))
+    for r in range(1, len(rows)):
+        ax.axhline(r - 0.5, color='#d9d9d9', linewidth=1, zorder=0)
+    ax.grid(axis='x', color='#e6e6e6', linewidth=0.8, zorder=0)
+    ax.axvline(0.0, color='grey', linestyle=':', linewidth=1, zorder=1)
+
+    def bar(a, b, y, s, cl):
+        if cl == 0.95:
+            ax.plot([a, b], [y, y], color=s['color'], linestyle=s['linestyle'], linewidth=thin, zorder=2)
+            return
+        ax.plot([a, b], [y, y], color=s['color'], linewidth=thick, solid_capstyle='butt', zorder=3)
+        if s.get('hollow'):
+            ax.plot([a, b], [y, y], color='white', linewidth=thick - 2.5, solid_capstyle='butt', zorder=4)
+
+    for k, s in enumerate(series):
+        for r, wc in enumerate(rows):
+            levels = s['segments'].get(wc)
+            if not levels:
+                continue
+            y = r - 0.4 + step * (k + 0.5)
+            for cl in sorted(SUMMARY_WIDTHS, reverse=True):
+                for lower, upper in levels.get(cl, []):
+                    a = xlim[0] if lower is None else lower
+                    b = xlim[1] if upper is None else upper
+                    bar(a, b, y, s, cl)
+                    for end, x, marker in ((lower, a, '<'), (upper, b, '>')):
+                        if end is None:
+                            ax.plot(x, y, marker=marker, markersize=9, color=s['color'], linestyle='none', zorder=5)
+    ax.set_yticks(range(len(rows)), [f'${wc_tex(wc)}$' for wc in rows])
+    ax.tick_params(axis='y', which='both', length=0)
+    ax.set_ylim(len(rows) - 0.5, -0.5)
+    ax.set_xlim(*xlim)
+    ax.set_xlabel(xlabel or r'WC value / $\Lambda^2$ [TeV$^{-2}$]')
+    handles = []
+    for s in series:
+        line = Line2D([], [], color=s['color'], linestyle=s['linestyle'], linewidth=thick)
+        if s.get('hollow'):
+            line = (
+                Line2D([], [], color=s['color'], linewidth=thick, solid_capstyle='butt'),
+                Line2D([], [], color='white', linewidth=thick - 2.5, solid_capstyle='butt'),
+                Line2D([], [], color=s['color'], linestyle=s['linestyle'], linewidth=thin),
+            )
+        handles.append(line)
+    labels = [s['label'] for s in series]
+    for cl, width in SUMMARY_WIDTHS.items():
+        handles.append(Line2D([], [], color='grey', linewidth=width))
+        labels.append(f'{100 * cl:.0f}%')
+    axes_height = ax.get_position().height * fig.get_size_inches()[1]
+    legend = ax.legend(
+        handles,
+        labels,
+        handler_map={tuple: HandlerTuple(ndivide=1, pad=0)},
+        loc='lower center',
+        bbox_to_anchor=(0.5, 1.0 + 0.55 / axes_height),
+        ncol=2,
+        frameon=False,
+        fontsize=14,
+        title=note,
+        title_fontsize=14,
+    )
+    mh.cms.label('Preliminary', data=False, lumi=lumi, com=13, ax=ax)
+    if title:
+        fig.canvas.draw()
+        above = (legend.get_window_extent().y1 - ax.get_window_extent().y1) * 72 / fig.dpi
+        ax.set_title(title, pad=above + 8, fontsize=20)
     fig.savefig(outname, bbox_inches='tight')
     plt.close(fig)
 
