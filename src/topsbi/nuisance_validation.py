@@ -326,10 +326,30 @@ def eft_ratio(eft, theta):
     return r_hat
 
 
-def eft_closure(binning, w0, rho, w_hat0, keep):
+def eft_member_ratios(eft, theta, keep):
+    """
+    [S, N] learned EFT ratio r_hat_e(x; theta) = T(theta)[mask] Gamma_e of every member e of the EFT cache on every
+    event of its data, 0 outside keep.
+
+    Args:
+        eft: EnsembleCache
+        theta: WC point (SM-inclusive)
+        keep: [N] bool, the events every member keeps (eft.finite)
+    """
+    t = get_lower_tri(theta, dtype=torch.float64).numpy()[eft.mask]
+    ratios = np.zeros((len(eft.seeds), keep.size))
+    for i, e in enumerate(eft.seeds):
+        member = np.full(keep.size, np.nan)
+        member[eft.seed_finite[e]] = t @ eft.seed_Gamma[e]
+        ratios[i, keep] = member[keep]
+    return ratios
+
+
+def eft_closure(binning, w0, rho, w_hat0, keep, members):
     """
     Check 4 baseline: closure of the learned EFT ratio alone at theta (nu = 0), hat w_b = sum_i w^s_i(c0, 0)
-    r_hat(x_i; theta) against w_b = sum_i w^s_i(theta, 0), with Var_MC = sum_i (hat w_i - w_i)^2 (no member scatter).
+    r_hat(x_i; theta) against w_b = sum_i w^s_i(theta, 0), with Var_MC = sum_i (hat w_i - w_i)^2 of the member mean and
+    Var_seeds from the scatter of the members' hat w_b.
 
     Args:
         binning: binning of the nominal events (quantile_binning, then merge_sparse)
@@ -337,17 +357,17 @@ def eft_closure(binning, w0, rho, w_hat0, keep):
         rho: [N] rho_i(theta) (factorisation_weights)
         w_hat0: [N] w^s(c0, 0) r_hat(x; theta) per nominal event, 0 where the EFT ensemble drops the event
         keep: [N] bool, the events the EFT ensemble keeps
+        members: [S, N] w^s(c0, 0) r_hat_e(x; theta) per member e (eft_member_ratios), 0 outside keep
     Returns:
         (sums, component_bias result with one row)
     """
     index, n_bins = binning['index'], binning['n_bins']
     learned, true = w_hat0[keep], (w0 * rho)[keep]
+    truth = binned_sums(true[None], index[:, keep], n_bins)
     sums = {
-        'bias': (binned_sums(learned[None], index[:, keep], n_bins) - binned_sums(true[None], index[:, keep], n_bins))[
-            None
-        ],
+        'bias': (binned_sums(members[:, keep], index[:, keep], n_bins) - truth)[:, None],
         'mc_var': binned_sums(((learned - true) ** 2)[None], index[:, keep], n_bins),
-        'sm_yield': binned_sums(true[None], index[:, keep], n_bins)[0],
+        'sm_yield': truth[0],
     }
     sums['truth'] = sums['sm_yield']
     return sums, component_bias(sums, binning)
@@ -1034,7 +1054,8 @@ def main(config_path, refit=False, backgrounds=False):
         )
         difference[label] = [None if s is None else component_bias(s, binning) for s in sums]
         tests[f'difference/{label}'] = (sums, difference[label])
-        sums, eft_only[label] = eft_closure(binning, w0.numpy(), rho, w_hat0, keep)
+        members = w0.numpy()[None] * to_c0[None] * eft_member_ratios(eft, points[label], keep)
+        sums, eft_only[label] = eft_closure(binning, w0.numpy(), rho, w_hat0, keep, members)
         tests[f'eft_only/{label}'] = ([sums], [eft_only[label]])
 
     z_threshold = cfg.get('z_threshold', 5.0)

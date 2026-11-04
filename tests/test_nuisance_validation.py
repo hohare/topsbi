@@ -268,3 +268,40 @@ def test_reference_nominal(toy, tmp_path):
     shuffled = reference_file(tmp_path / 'shuffled' / 'nominal', toy.x['signal'][::-1].copy(), sm)
     with pytest.raises(SystemExit, match='differ in features'):
         nv.reference_nominal({**config, 'reference_data': shuffled}, sm, nominal)
+
+
+def test_eft_closure_member_scatter():
+    rng = np.random.default_rng(3)
+    n, n_q, n_bins = 200, 6, 4
+    theta = [1.0, 0.4, -0.3]
+    finite = {e: np.ones(n, dtype=bool) for e in MEMBERS}
+    finite[1][0] = False
+    gammas = {e: rng.normal(1.0, 0.1, (n_q, finite[e].sum())) for e in MEMBERS}
+    eft = types.SimpleNamespace(
+        seeds=MEMBERS,
+        mask=np.ones(n_q, dtype=bool),
+        seed_finite=finite,
+        seed_Gamma=gammas,
+        finite=finite[0] & finite[1],
+    )
+    keep = eft.finite
+    ratios = nv.eft_member_ratios(eft, theta, keep)
+    t = nv.get_lower_tri(theta, dtype=torch.float64).numpy()
+    assert ratios.shape == (len(MEMBERS), n) and np.all(ratios[:, ~keep] == 0)
+    assert np.allclose(ratios[0, keep], t @ gammas[0][:, keep])
+    # member 1's coefficients are stored on its own kept events
+    assert np.allclose(ratios[1, keep], t @ gammas[1][:, keep[finite[1]]])
+
+    bins = np.arange(n) % n_bins
+    binning = {'index': torch.from_numpy(bins)[None], 'n_bins': n_bins, 'feature': np.zeros(n_bins, dtype=int),
+               'names': ['x0']}
+    w0, rho = rng.uniform(0.5, 1.5, n), rng.uniform(0.8, 1.2, n)
+    members = w0[None] * ratios
+    w_hat0 = members.mean(0)
+    sums, bias = nv.eft_closure(binning, w0, rho, w_hat0, keep, members)
+    assert sums['bias'].shape == (len(MEMBERS), 1, n_bins)
+    true = np.bincount(bins[keep], (w0 * rho)[keep], n_bins)
+    per_member = np.stack([np.bincount(bins[keep], m[keep], n_bins) for m in members]) - true
+    assert np.allclose(bias['D'][0], np.bincount(bins[keep], w_hat0[keep], n_bins) - true)
+    assert np.allclose(bias['s2'][0], per_member.var(0, ddof=1) / len(MEMBERS))
+    assert np.allclose(sums['mc_var'][0], np.bincount(bins[keep], (w_hat0 - w0 * rho)[keep] ** 2, n_bins))
