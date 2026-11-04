@@ -245,20 +245,3 @@ class Ensemble:
     def __call__(self, theta: list):
         """r_hat(x; theta) = T(theta)[mask] Gamma for the events kept by every seed."""
         return get_lower_tri(theta)[self.mask] @ self.Gamma
-
-
-def get_np_parameterization(features, config, up_training, down_training):
-    """
-    Mean of the up and down networks' outputs f_hat per event (placeholder; the nuisance parameterisation in the
-    likelihood is still to be designed).
-    """
-    up_model = Net(features.shape[1], config['device'], config['network'])
-    down_model = Net(features.shape[1], config['device'], config['network'])
-    up_model.load_state_dict(torch.load(up_training, map_location=torch.device(config['device'])))
-    down_model.load_state_dict(torch.load(down_training, map_location=torch.device(config['device'])))
-    up_model.eval()
-    down_model.eval()
-    with torch.no_grad():
-        f_hat_up = up_model(features)
-        f_hat_down = down_model(features)
-    return ((f_hat_up + f_hat_down) / 2).numpy().flatten()
