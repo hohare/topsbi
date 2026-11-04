@@ -50,6 +50,7 @@ SCAN_KEYS = (
     'overlay',
     'uncertainty',
     'calibration',
+    'impacts',
     'label',
 )
 TARGET_KEYS = ('theta', 'nu', 'kind', 'seed')
@@ -1364,7 +1365,6 @@ def fit(
     bounds,
     ratio='learned',
     rate='learned',
-    hessian=False,
     ftol=1e-10,
     gtol=1e-6,
     maxiter=1000,
@@ -1386,15 +1386,13 @@ def fit(
         free: [n_wcs + n_nu] bool, parameters to minimise over
         bounds: [n_wcs + n_nu, 2] lower / upper bound of each parameter (used for free ones)
         ratio, rate: passed to nll
-        hessian: also return the Hessian of the NLL in the free parameters at the minimum and its inverse
         ftol, gtol, maxiter: L-BFGS-B options
         edm_tol: largest EDM of a converged fit, in NLL units
         restarts: largest number of restarts
     Returns:
         SimpleNamespace: theta, nu (numpy, at the minimum), nll (value there), success (EDM <= edm_tol and no
         non-finite NLL), edm, max_grad, message (scipy's, last run), runs, nit, nfev, nonfinite (evaluations with a
-        non-finite NLL), visited [n_eval, n_wcs], hessian and covariance ([n_free, n_free], or None; covariance None
-        if the Hessian is not positive definite)
+        non-finite NLL), visited [n_eval, n_wcs] (postfit_uncertainties gives the Hessian at the minimum)
     """
     start = torch.cat([torch.as_tensor(theta, dtype=torch.float64), torch.as_tensor(nu, dtype=torch.float64)])
     n_wcs = len(theta)
@@ -1453,14 +1451,7 @@ def fit(
         nfev=nfev,
         nonfinite=nonfinite[0],
         visited=np.array(visited),
-        hessian=None,
-        covariance=None,
     )
-    if hessian:
-        H = torch.autograd.functional.hessian(lambda p: value(p)[0], torch.as_tensor(x, dtype=torch.float64))
-        out.hessian = H.numpy()
-        if np.linalg.eigvalsh(out.hessian).min() > 0:
-            out.covariance = np.linalg.inv(out.hessian)
     return out
 
 
@@ -1477,6 +1468,59 @@ def _fixed_value(terms, theta, nu, ratio, rate):
         edm=0.0,
         nonfinite=int(not np.isfinite(value)),
         visited=theta[None],
+    )
+
+
+def postfit_uncertainties(terms, theta, nu, free, bounds, ratio='learned', rate='learned'):
+    """
+    Post-fit uncertainties of the free parameters from the Hessian H of nll at a minimum (theta, nu): Cov = H^-1,
+    sigma_hat_k = sqrt(Cov_kk), and the correlation matrix. With the unit-Gaussian nuisance constraint (nll) the
+    pre-fit width of every nuisance is sigma_0 = 1, so a nuisance's sigma_hat is also sigma_hat / sigma_0. A parameter
+    within 1e-9 of the bounds' width of a bound is flagged in at_bound: its sigma_hat is the local curvature only.
+
+    Args:
+        terms: nll_terms result (the selection of the minimum)
+        theta: [n_wcs] WC values at the minimum, without the SM entry
+        nu: [n_nu] nuisance values at the minimum (shape, then rate)
+        free: [n_wcs + n_nu] bool, parameters fitted at the minimum
+        bounds: [n_wcs + n_nu, 2] lower / upper bound of each parameter
+        ratio, rate: passed to nll
+    Returns:
+        SimpleNamespace: index [n_free] (positions of the free parameters in (theta, nu)), hessian [n_free, n_free],
+        min_eigenvalue (of the Hessian), covariance and correlation ([n_free, n_free], None if the Hessian is not
+        positive definite), sigma [n_free] (NaN without covariance), at_bound [n_free] bool
+    """
+    start = torch.cat([torch.as_tensor(theta, dtype=torch.float64), torch.as_tensor(nu, dtype=torch.float64)])
+    n_wcs = len(theta)
+    index = np.flatnonzero(np.asarray(free, dtype=bool))
+    rows = torch.as_tensor(index)
+
+    def value(p):
+        full = start.index_put((rows,), p)
+        return nll(full[:n_wcs], full[n_wcs:], terms, ratio=ratio, rate=rate)
+
+    H = torch.autograd.functional.hessian(value, start[rows]).numpy()
+    H = (H + H.T) / 2
+    min_eigenvalue = float(np.linalg.eigvalsh(H).min()) if len(index) else np.nan
+    covariance = correlation = None
+    sigma = np.full(len(index), np.nan)
+    if len(index) and min_eigenvalue > 0:
+        covariance = np.linalg.inv(H)
+        covariance = (covariance + covariance.T) / 2
+        sigma = np.sqrt(np.diag(covariance))
+        correlation = covariance / np.outer(sigma, sigma)
+    bounds = np.asarray(bounds, dtype=np.float64)[index]
+    x = start[rows].numpy()
+    width = 1e-9 * (bounds[:, 1] - bounds[:, 0])
+    at_bound = (x <= bounds[:, 0] + width) | (x >= bounds[:, 1] - width)
+    return types.SimpleNamespace(
+        index=index,
+        hessian=H,
+        min_eigenvalue=min_eigenvalue,
+        covariance=covariance,
+        correlation=correlation,
+        sigma=sigma,
+        at_bound=at_bound,
     )
 
 
@@ -1915,6 +1959,111 @@ def scan_uncertainty(
     return out
 
 
+def impacts(inputs, target, result, scan_args, background_target=None):
+    """
+    Pulls and impacts of the profiled nuisances on the pois at the best fit of a scan (Combine's definitions), on the
+    scan's final selection (result.keep, result.background_keep) and with its settings (scan_args: pois, box,
+    profile_wcs, profile_nu, nu_bound, nu_obs, ratio, rate). The post-fit uncertainties sigma_hat are those of the
+    Hessian of nll at the best fit, with every parameter of the best fit free (postfit_uncertainties). Per profiled
+    nuisance n: the pull (nu_hat_n - nu_obs_n) / sigma_0 (sigma_0 = 1, the constraint's width), the constrained pull
+    (nu_hat_n - nu_obs_n) / sqrt(sigma_0^2 - sigma_hat_n^2) (NaN where sigma_hat_n >= sigma_0), and the impacts
+    Delta theta_hat^+- = theta_hat(nu_n fixed at nu_hat_n +- sigma_hat_n) - theta_hat on each poi, from fits with every
+    other parameter of the best fit free, started at the best fit. The selection is not revisited: the fits stay inside
+    the scan's box, on which the selection keeps every event's term positive (positive_events), and the nuisances
+    scale the terms by positive factors. A fit below the best fit's NLL (lower_minimum) means the scan's best fit was
+    not the global minimum. Without a positive definite Hessian, sigma_hat and the impacts are NaN.
+
+    Args:
+        inputs: the scan's inputs (load_inputs, scan_inputs)
+        target: [N] target weights w^t of the scan
+        result: scan result
+        scan_args: the scan's settings (scan_settings)
+        background_target: {p: [N_p] target weights on the background events}, required with backgrounds
+    Returns:
+        SimpleNamespace: names (profiled nuisances, in the order of inputs.nuisances + inputs.rate_names), nu_hat,
+        nu_obs, sigma, at_bound (on its bound at the best fit), pull, constrained_pull [n], impact_up, impact_down
+        [n, n_poi] (nu_n at nu_hat_n + sigma_hat_n and nu_hat_n - sigma_hat_n), success_up, success_down [n],
+        lower_minimum [n], poi_hat, poi_sigma [n_poi] (best fit and Hessian sigma_hat of the pois), min_eigenvalue,
+        free_names (parameters of the best fit, WCs then nuisances), covariance, correlation (over free_names, None
+        without a positive definite Hessian)
+    """
+    wcs = inputs.wcs
+    names_nu = list(inputs.nuisances) + list(inputs.rate_names)
+    n_wcs = len(wcs)
+    poi = [wcs.index(p) for p in scan_args['pois']]
+    profile_nu = list(scan_args.get('profile_nu', ()))
+    free = np.zeros(n_wcs + len(names_nu), dtype=bool)
+    free[[wcs.index(w) for w in scan_args.get('profile_wcs', ())]] = True
+    free[[n_wcs + names_nu.index(n) for n in profile_nu]] = True
+    free[poi] = True
+    nu_bound = scan_args.get('nu_bound', 5.0)
+    bounds = np.concatenate(
+        [np.asarray(scan_args['box'], dtype=np.float64), np.tile([-nu_bound, nu_bound], (len(names_nu), 1))]
+    )
+    nu_obs = scan_args.get('nu_obs')
+    nu_obs = np.zeros(len(names_nu)) if nu_obs is None else np.asarray(nu_obs, dtype=np.float64)
+    ratio, rate = scan_args.get('ratio', 'learned'), scan_args.get('rate', 'learned')
+    terms = nll_terms(
+        inputs,
+        result.keep,
+        target,
+        nu_obs=nu_obs,
+        background_keep=result.background_keep,
+        background_target=background_target,
+    )
+    best = result.best
+    post = postfit_uncertainties(terms, best.theta, best.nu, free, bounds, ratio=ratio, rate=rate)
+    position = {int(k): i for i, k in enumerate(post.index)}
+
+    names = [n for n in names_nu if n in profile_nu]
+    rows = [n_wcs + names_nu.index(n) for n in names]
+    nu_hat = np.array([best.nu[k - n_wcs] for k in rows])
+    sigma = np.array([post.sigma[position[k]] for k in rows])
+    at_bound = np.array([bool(post.at_bound[position[k]]) for k in rows], dtype=bool)
+    pull = nu_hat - nu_obs[[k - n_wcs for k in rows]]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        constrained_pull = np.where(sigma < 1, pull / np.sqrt(1 - np.minimum(sigma, 1) ** 2), np.nan)
+
+    impact = np.full((2, len(names), len(poi)), np.nan)
+    success = np.zeros((2, len(names)), dtype=bool)
+    lower_minimum = np.zeros(len(names), dtype=bool)
+    start = np.concatenate([best.theta, best.nu])
+    for i, k in enumerate(rows):
+        if not np.isfinite(sigma[i]):
+            continue
+        free_n = free.copy()
+        free_n[k] = False
+        for j, sign in enumerate((1.0, -1.0)):
+            p = start.copy()
+            p[k] += sign * sigma[i]
+            f = fit(terms, p[:n_wcs], p[n_wcs:], free_n, bounds, ratio=ratio, rate=rate)
+            impact[j, i] = f.theta[poi] - best.theta[poi]
+            success[j, i] = f.success
+            lower_minimum[i] |= bool(f.nll < best.nll - 1e-6)
+
+    free_names = [wcs[k] if k < n_wcs else names_nu[k - n_wcs] for k in post.index]
+    return types.SimpleNamespace(
+        names=names,
+        nu_hat=nu_hat,
+        nu_obs=nu_obs[[k - n_wcs for k in rows]],
+        sigma=sigma,
+        at_bound=at_bound,
+        pull=pull,
+        constrained_pull=constrained_pull,
+        impact_up=impact[0],
+        impact_down=impact[1],
+        success_up=success[0],
+        success_down=success[1],
+        lower_minimum=lower_minimum,
+        poi_hat=best.theta[poi],
+        poi_sigma=np.array([post.sigma[position[k]] for k in poi]),
+        min_eigenvalue=post.min_eigenvalue,
+        free_names=free_names,
+        covariance=post.covariance,
+        correlation=post.correlation,
+    )
+
+
 def _plain(x):
     """numpy and torch values (also inside dicts, lists and tuples) as plain Python, for yaml."""
     if isinstance(x, torch.Tensor):
@@ -2013,12 +2162,16 @@ def write_results(name, config, inputs, entries):
     factor 1 per fold (unfilled) and the smallest and largest factor (calibrated_backgrounds), and, with
     scan_uncertainty, members (best per member, spread, the spread of each profiled nuisance at the best fit, error),
     bootstrap (best per replica, spread, profiled nuisance spread) and subsets (per n_e: spread, mean 68% half-width
-    for one poi, draws). scans.npz: grid, q, theta, nu, success, edm, at_bound, keep (np.packbits of the selection, N
-    events), background_keep_<p> (np.packbits of the selection of background event set p, with backgrounds),
+    for one poi, draws) and, with impacts, impacts (poi_hat and poi_sigma, the pois' best fit and Hessian sigma_hat;
+    min_eigenvalue of the Hessian; failed impact fits; lower_minimum, the nuisances whose impact fits found a lower NLL
+    than the best fit; free_names, the parameters of the best fit; and per profiled nuisance nu_hat, nu_obs, sigma,
+    pull, constrained_pull, impact_up and impact_down per poi, success, at_bound, lower_minimum). scans.npz: grid, q,
+    theta, nu, success, edm, at_bound, keep (np.packbits of the selection, N events), background_keep_<p> (np.packbits of the selection of background event set p, with backgrounds),
     background_calibration_<c>_factors [K, n_bins], _edges [K, n_bins - 1] and _unfilled [K] per component c (with
     the background calibration) and members_best, members_nu, bootstrap_best, bootstrap_nu, subsets_<n_e>_best,
     subsets_<n_e>_nu (nuisances at each run's best fit, all of them, as inputs.nuisances + inputs.rate_names) when
-    present.
+    present, and impacts_covariance, impacts_correlation [n_free, n_free] over impacts free_names (with impacts and a
+    positive definite Hessian).
 
     Args:
         name: output directory
@@ -2026,7 +2179,8 @@ def write_results(name, config, inputs, entries):
         inputs: load_inputs result
         entries: {label: {'scan': scan result, 'theta_t': [n_wcs] target or None, 'spec': the scan's config entry,
             'uncertainty': scan_uncertainty result or None (its nominal is 'scan'), 'background_calibration': the
-            calibration of the scan's inputs (calibrated_backgrounds) or None}}
+            calibration of the scan's inputs (calibrated_backgrounds) or None,
+            'impacts': impacts result or None}}
     """
     os.makedirs(name, mode=0o755, exist_ok=True)
     wcs = inputs.wcs
@@ -2183,6 +2337,34 @@ def write_results(name, config, inputs, entries):
                     out['subsets'][n_e] = item
                     arrays[f'{label}/subsets_{n_e}_best'] = sub['best']
                     arrays[f'{label}/subsets_{n_e}_nu'] = sub['best_nu']
+        imp = entry.get('impacts')
+        if imp is not None:
+            out['impacts'] = {
+                'poi_hat': {p: imp.poi_hat[j] for j, p in enumerate(s.pois)},
+                'poi_sigma': {p: imp.poi_sigma[j] for j, p in enumerate(s.pois)},
+                'min_eigenvalue': imp.min_eigenvalue,
+                'failed': int((~imp.success_up).sum() + (~imp.success_down).sum()),
+                'lower_minimum': int(imp.lower_minimum.sum()),
+                'free_names': imp.free_names,
+                'nuisances': {
+                    n: {
+                        'nu_hat': imp.nu_hat[i],
+                        'nu_obs': imp.nu_obs[i],
+                        'sigma': imp.sigma[i],
+                        'pull': imp.pull[i],
+                        'constrained_pull': imp.constrained_pull[i],
+                        'impact_up': {p: imp.impact_up[i, j] for j, p in enumerate(s.pois)},
+                        'impact_down': {p: imp.impact_down[i, j] for j, p in enumerate(s.pois)},
+                        'success': bool(imp.success_up[i] and imp.success_down[i]),
+                        'at_bound': bool(imp.at_bound[i]),
+                        'lower_minimum': bool(imp.lower_minimum[i]),
+                    }
+                    for i, n in enumerate(imp.names)
+                },
+            }
+            if imp.covariance is not None:
+                arrays[f'{label}/impacts_covariance'] = imp.covariance
+                arrays[f'{label}/impacts_correlation'] = imp.correlation
         summary['scans'][label] = out
     with open(f'{name}/scans.yml', 'w') as f:
         yaml.safe_dump(_plain(summary), f, sort_keys=False)
@@ -2654,7 +2836,8 @@ def check_scans(config):
     uncertainty), profile_wcs and profile_nu (names or 'all'), selection_wcs
     (names or 'all': further WCs whose box enters the event selection), nu_bound, cls, max_selections, box
     ({wc: [lo, hi]}, over the top-level box),
-    overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty) and label
+    overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty), impacts (true:
+    pulls and impacts of the profiled nuisances at the best fit, impacts; one poi and profile_nu needed) and label
     (legend text). With backgrounds, the backgrounds block is checked by check_background_options.
 
     Args:
@@ -2717,6 +2900,14 @@ def check_scans(config):
         unknown = sorted(set(entry.get('uncertainty') or {}) - set(UNCERTAINTY_KEYS))
         if unknown:
             sys.exit(f'[error]: scan {label}: unknown uncertainty keys {unknown}')
+        with_impacts = entry.get('impacts', False)
+        if not isinstance(with_impacts, bool):
+            sys.exit(f'[error]: scan {label}: impacts must be true or false, not {with_impacts}')
+        if with_impacts:
+            if len(pois) != 1:
+                sys.exit(f'[error]: scan {label}: impacts need one poi')
+            if not entry.get('profile_nu'):
+                sys.exit(f'[error]: scan {label}: impacts need profiled nuisances (profile_nu)')
         overlay = entry.get('overlay', [])
         if len(overlay) > len(SCAN_COLORS) - 1:
             sys.exit(f'[error]: scan {label}: at most {len(SCAN_COLORS) - 1} overlays')
@@ -3235,7 +3426,8 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
     """
     Run the scans of a scan config: every entry of config['scans'] (check_scans) is scanned on its target (Asimov
     or toy, scan_targets: on the signal events and, with backgrounds, on the background events), with q at the target
-    (scan, q_target) and with scan_uncertainty when the entry has uncertainty. {name}/scans.yml and scans.npz
+    (scan, q_target) and with scan_uncertainty when the entry has uncertainty. With impacts: true, the pulls and
+    impacts of the profiled nuisances at the best fit follow the scan (impacts). {name}/scans.yml and scans.npz
     (write_results) are rewritten after every scan; the plots (plot_results) are drawn at the end. A scan whose grid
     has too few points below the lowest level (grid_resolution) is reported as coarse. With wilks, only one batch of
     the Wilks toys of config['wilks'] is run (run_wilks); with merge, only the batches are merged and compared with
@@ -3293,12 +3485,16 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
             result = scan(
                 run_inputs, target, theta_t=target_spec['theta_t'], background_target=background_target, **scan_args
             )
+        impact = None
+        if spec.get('impacts'):
+            impact = impacts(run_inputs, target, result, scan_args, background_target=background_target)
         entries[label] = dict(
             scan=result,
             theta_t=target_spec['theta_t'],
             spec=spec,
             uncertainty=uncertainty,
             background_calibration=getattr(getattr(run_inputs, 'backgrounds', None), 'calibration', None),
+            impacts=impact,
         )
         write_results(name, config, inputs, entries)
         poi = [run_inputs.wcs.index(p) for p in result.pois]
@@ -3315,9 +3511,15 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
             if result.background_dropped is None
             else ', background dropped ' + ', '.join(f'{p} {n}' for p, n in result.background_dropped.items())
         )
+        impact_note = ''
+        if impact is not None:
+            shifts = np.abs(np.concatenate([impact.impact_up, impact.impact_down]))
+            largest = float(np.nanmax(shifts)) if np.isfinite(shifts).any() else np.nan
+            failed = int((~impact.success_up).sum() + (~impact.success_down).sum())
+            impact_note = f', impacts {len(impact.names)} (failed fits {failed}, largest {largest:.3g})'
         print(
             f'{label}: best {best}, failed fits {int((~result.success).sum())}, dropped {result.dropped}{dropped_b}, '
-            f'stable {result.stable}, {time.time() - start:.1f} s{coarse}'
+            f'stable {result.stable}, {time.time() - start:.1f} s{coarse}{impact_note}'
         )
     plot_results(name, lumi=config.get('plot_lumi'))
 

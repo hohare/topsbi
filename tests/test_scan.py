@@ -17,6 +17,7 @@ from topsbi.scan import (
     combine_series,
     combined_f_hat,
     curve_segments,
+    impacts,
     load_background_inputs,
     load_config,
     nll,
@@ -27,9 +28,11 @@ from topsbi.scan import (
     scan,
     scan_series,
     scan_settings,
+    scan_targets,
     scan_uncertainty,
     summary_plot,
     target_weights,
+    write_results,
 )
 
 WCS = ['cA', 'cB']
@@ -599,6 +602,92 @@ def test_uncertainty_selection():
     assert torch.equal(strict.nominal.keep, expected)
     assert torch.equal(strict.nominal.background_keep['B'], expected)
     assert strict.members['background_dropped'] == [{'B': 5}, {'B': 5}]
+
+
+def impact_scan():
+    """
+    An Asimov scan of cA with a background (mixture_inputs) at theta_t = (0.7, -0.4), nu_t = (0.3, 0.5), cB and both
+    rate systematics profiled, set up from a scan entry with impacts: true as main sets it up (check_scans,
+    scan_settings, scan_targets), and its impacts.
+    """
+    inputs = mixture_inputs()
+    entry = {
+        'pois': ['cA'],
+        'grid': {'cA': {'range': [0.3, 1.1], 'points': 17}},
+        'target': {'theta': {'cA': 0.7, 'cB': -0.4}, 'nu': {'lumi': 0.3, 'smxsec_B': 0.5}},
+        'nu_obs': 'target',
+        'theta_base': 'target',
+        'box': {'cB': [-1.5, 1.0]},
+        'profile_wcs': ['cB'],
+        'profile_nu': 'all',
+        'impacts': True,
+    }
+    config = {'wcs': WCS, 'box': {}, 'scans': {'i': entry}}
+    check_scans(config)
+    scan_args, target_spec, spec = scan_settings(config, 'i', inputs)
+    target, background_target = scan_targets(inputs, target_spec)
+    s = scan(inputs, target, theta_t=target_spec['theta_t'], background_target=background_target, **scan_args)
+    imp = impacts(inputs, target, s, scan_args, background_target=background_target)
+    return types.SimpleNamespace(inputs=inputs, theta_t=target_spec['theta_t'], spec=spec, scan=s, impacts=imp)
+
+
+def test_impacts_gaussian():
+    """At an Asimov best fit the pulls vanish and the data constrain both rate systematics (0 < sigma_hat < 1); every
+    impact fit converges at or above the best fit's NLL; near the Gaussian minimum the symmetric part of each impact,
+    (up - down) / 2, is Cov(cA, nu_n) / sigma_hat_n (the lnN rate systematics make the two sides differ by up to about
+    10%), and the Hessian sigma_hat of cA is the 68% half-width of the scan."""
+    r = impact_scan()
+    imp, s = r.impacts, r.scan
+    assert imp.names == ['lumi', 'smxsec_B']
+    assert imp.free_names == ['cA', 'cB', 'lumi', 'smxsec_B']
+    assert np.allclose(imp.nu_obs, [0.3, 0.5])
+    assert np.allclose(imp.pull, 0.0, atol=1e-3) and np.allclose(imp.constrained_pull, 0.0, atol=1e-2)
+    assert ((imp.sigma > 0) & (imp.sigma < 1)).all() and not imp.at_bound.any()
+    assert imp.min_eigenvalue > 0
+    assert imp.success_up.all() and imp.success_down.all() and not imp.lower_minimum.any()
+    assert np.allclose(np.diag(imp.correlation), 1.0)
+    for i, n in enumerate(imp.names):
+        expected = imp.covariance[0, imp.free_names.index(n)] / imp.sigma[i]
+        symmetric = (imp.impact_up[i, 0] - imp.impact_down[i, 0]) / 2
+        assert abs(symmetric - expected) < 0.02 * abs(expected)
+        assert abs(imp.impact_up[i, 0] - expected) < 0.2 * abs(expected)
+        assert abs(imp.impact_down[i, 0] + expected) < 0.2 * abs(expected)
+    lower, upper = s.intervals[0.6827]
+    assert abs(imp.poi_sigma[0] - (upper - lower) / 2) < 0.05 * imp.poi_sigma[0]
+    assert imp.poi_hat[0] == s.best.theta[0]
+
+
+def test_impacts_config_and_results(tmp_path):
+    """check_scans refuses impacts on two pois, without profiled nuisances or not a boolean; write_results writes the
+    impacts block to scans.yml and the covariance and correlation to scans.npz."""
+    base = {'pois': ['cA'], 'grid': {'cA': {'range': [0.0, 1.0], 'points': 3}}, 'profile_nu': ['lumi'], 'impacts': True}
+    check_scans({'wcs': WCS, 'scans': {'ok': base}})
+    two = dict(base, pois=['cA', 'cB'], grid={'cA': base['grid']['cA'], 'cB': base['grid']['cA']})
+    for bad in (two, dict(base, profile_nu=[]), dict(base, impacts='yes')):
+        with pytest.raises(SystemExit):
+            check_scans({'wcs': WCS, 'scans': {'bad': bad}})
+
+    r = impact_scan()
+    inputs, imp = r.inputs, r.impacts
+    inputs.events = np.ones(len(inputs.w0), dtype=bool)
+    inputs.backgrounds.yields = [float(inputs.backgrounds.sets['B'].w.sum())]
+    config = {'ensemble': 'eft.yml', 'data': 'data', 'sm_yield': 1.0, 'rate_systematics': {}}
+    entries = {
+        'i': dict(scan=r.scan, theta_t=r.theta_t, spec=r.spec, uncertainty=None, background_calibration=None, impacts=imp)
+    }
+    name = str(tmp_path / 'scans')
+    write_results(name, config, inputs, entries)
+    with open(f'{name}/scans.yml') as f:
+        out = yaml.safe_load(f)['scans']['i']['impacts']
+    assert list(out['nuisances']) == ['lumi', 'smxsec_B']
+    assert out['failed'] == 0 and out['lower_minimum'] == 0 and out['free_names'] == imp.free_names
+    lumi = out['nuisances']['lumi']
+    assert lumi['impact_up']['cA'] == pytest.approx(imp.impact_up[0, 0], rel=1e-12)
+    assert lumi['sigma'] == pytest.approx(imp.sigma[0], rel=1e-12) and lumi['success'] and not lumi['at_bound']
+    assert out['poi_sigma']['cA'] == pytest.approx(imp.poi_sigma[0], rel=1e-12)
+    arrays = np.load(f'{name}/scans.npz')
+    assert np.allclose(arrays['i/impacts_covariance'], imp.covariance, rtol=0.0, atol=0.0)
+    assert np.allclose(arrays['i/impacts_correlation'], imp.correlation, rtol=0.0, atol=0.0)
 
 
 def test_calibrated_inputs():
