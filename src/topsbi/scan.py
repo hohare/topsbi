@@ -1,6 +1,6 @@
 from matplotlib.legend_handler import HandlerTuple
 from matplotlib.lines import Line2D
-from matplotlib.transforms import blended_transform_factory
+from matplotlib.transforms import Bbox, blended_transform_factory
 from topsbi.tools.data import (
     NUISANCE_COLUMNS,
     event_keys,
@@ -17,10 +17,11 @@ from topsbi.tools.plots import _no_tex_mapping, wc_tex
 import numpy as np
 import matplotlib.pyplot as plt
 import mplhep as mh
+import scipy.interpolate
 import scipy.optimize
 import scipy.stats
 
-import argparse, datetime, glob, logging, os, sys, time, torch, types, yaml
+import argparse, copy, datetime, glob, itertools, logging, os, sys, time, torch, types, yaml
 
 # taken from the EFT validation config, so the scans use the events, reference point and luminosities of the ensemble
 SHARED_KEYS = ('data', 'c0', 'wcs', 'lumi', 'year_loc', 'zero_terms')
@@ -31,6 +32,14 @@ SCAN_STYLES = ['-', '--', '-.']
 LEVEL_STYLES = ['solid', 'dashed', 'dotted']
 # line widths of the 68% and 95% regions in the summary plot (thick and thin, as in a limit summary)
 SUMMARY_WIDTHS = {0.6827: 4.0, 0.95: 1.5}
+# default confidence levels of a 2D scan: 1, 2 and 3 sigma (q = 2.30, 6.18, 11.83 for two pois, as in Combine)
+CONTOUR_CLS = (0.6827, 0.9545, 0.9973)
+# contour colours of a single 2D scan per level (1, 2, 3 sigma: yellow, green, blue as in the binned analysis's figures,
+# the yellow darkened for contrast on white) and the SM marker colour (red)
+CONTOUR_COLORS = ['#d9a400', '#2e9e3e', '#2a5bd7']
+SM_COLOR = '#ff0000'
+# margin of a 2D plot around its contours and centre markers, as a fraction of their extent on each axis
+CONTOUR_MARGIN = 0.1
 # keys of a scan entry in the config's scans
 SCAN_KEYS = (
     'pois',
@@ -51,10 +60,12 @@ SCAN_KEYS = (
     'uncertainty',
     'calibration',
     'impacts',
+    'refine',
     'label',
 )
 TARGET_KEYS = ('theta', 'nu', 'kind', 'seed')
 UNCERTAINTY_KEYS = ('members', 'n_boot', 'subsets', 'seed')
+REFINE_KEYS = ('factor', 'pad')
 WILKS_KEYS = ('scan', 'toys', 'first_seed', 'randomize_nu_obs')
 BACKGROUND_KEYS = ('yields', 'card_yields', 'rate_only', 'calibration')
 BACKGROUND_CALIBRATION_KEYS = ('bins', 'folds')
@@ -1548,6 +1559,7 @@ def scan(
     background_keep=None,
     background_Gamma=None,
     background_members=False,
+    refine=None,
 ):
     """
     Likelihood scan of one or two WCs (pois) on a grid: at every grid point the pois are fixed and the profiled WCs and
@@ -1572,7 +1584,11 @@ def scan(
     stored q at those two points, fits between them warm-started from the nearer one; the best fit counts as a point)
     (None where the run reaches the grid edge); segments lists them all, intervals the one containing the minimum. Other WCs
     not profiled stay at theta_base (0 by default), where the profiled WCs and the best fit also start; nuisances not
-    profiled stay at nu_obs (0 by default).
+    profiled stay at nu_obs (0 by default). For two pois, refine ({factor, pad}) adds a refinement pass after the
+    grid: refine_points subdivides every cell a level crosses (and the cells within pad of one) factor times per axis,
+    the new points are fitted in order of distance from the best fit, each warm-started from the nearest fitted point,
+    and the result is on that fine regular grid: q from the fits where fitted, elsewhere from the coarse grid's NLL
+    interpolated bilinearly (fitted marks which).
 
     Args:
         inputs: load_inputs result
@@ -1604,13 +1620,15 @@ def scan(
             ensemble mean
         background_members: the background selection also keeps every member's signal term positive (set it when
             Gammas holds the members)
+        refine: {factor (default 4), pad (default 1)} of the 2D refinement pass (refine_points), or None
     Returns:
-        SimpleNamespace: pois, grid [P, n_poi], q [P], nll_min, levels {cl: q level}, intervals {cl: [lower, upper]}
+        SimpleNamespace: pois, grid [P, n_poi] (with refine, the fine grid), q [P], nll_min, levels {cl: q level}, intervals {cl: [lower, upper]}
         (one poi: the segment containing the minimum; None where open), segments {cl: [[lower, upper], ...]} (one poi:
         every segment, in order), q_target (None without theta_t), best (fit at the minimum: theta, nu, nll, success,
         edm), best_refit (the best fit was repeated from a lower grid point), start_fallbacks (fits of the last pass
         started from the profiled WCs at theta_base), theta [P, n_wcs], nu [P, n_nu], success [P], edm [P], at_bound [P] (a
-        profiled parameter on its bound), best_at_bound, grid_below_best (a grid point has a lower NLL than the best
+        profiled parameter on its bound), fitted [P] (grid points with a fit; elsewhere theta and nu are NaN, success
+        True, edm 0, at_bound False), best_at_bound, grid_below_best (a grid point has a lower NLL than the best
         fit), keep [N], dropped (events removed), dropped_sm_fraction (their share of the SM yield, truth weights),
         background_keep ({p: [N_p] bool}), background_dropped ({p: background events removed}),
         background_dropped_fraction ({component: share of its yield removed}, background_dropped; the three None
@@ -1633,6 +1651,8 @@ def scan(
     free[[n_wcs + names_nu.index(n) for n in profile_nu]] = True
     if free[poi].any():
         raise ValueError('a parameter of interest cannot also be profiled')
+    if refine is not None and len(pois) != 2:
+        raise ValueError('refine needs two pois')
     free_best = free.copy()
     free_best[poi] = True
     box = np.asarray(box, dtype=np.float64)
@@ -1709,20 +1729,55 @@ def scan(
             theta[poi] = points[p]
             fits[p] = run(theta, start.nu.copy(), free)
             done.append(p)
-        nll_grid = np.array([f.nll for f in fits])
+        grid_points, fitted = points, np.ones(len(points), dtype=bool)
+        if refine is not None:
+            n1, n2 = len(grids[0]), len(grids[1])
+            nll_coarse = np.array([f.nll for f in fits]).reshape(n1, n2)
+            factor = int(refine.get('factor', 4))
+            fine1, fine2, new = refine_points(
+                grids[0],
+                grids[1],
+                2 * (nll_coarse - min(best.nll, nll_coarse.min())),
+                list(levels.values()),
+                factor=factor,
+                pad=int(refine.get('pad', 1)),
+            )
+            grid_points = np.stack(np.meshgrid(fine1, fine2, indexing='ij'), -1).reshape(-1, 2)
+            coarse_index = (np.arange(n1)[:, None] * factor * len(fine2) + np.arange(n2)[None, :] * factor).ravel()
+            fine_fits = [None] * len(grid_points)
+            for p, k in enumerate(coarse_index):
+                fine_fits[k] = fits[p]
+            fine_spacing = spacing / factor
+            done = [int(k) for k in coarse_index]
+            new_index = np.flatnonzero(new.ravel())
+            for k in new_index[np.argsort((((grid_points[new_index] - best.theta[poi]) / fine_spacing) ** 2).sum(1))]:
+                start = fine_fits[
+                    done[int(np.argmin((((grid_points[done] - grid_points[k]) / fine_spacing) ** 2).sum(1)))]
+                ]
+                theta = start.theta.copy()
+                theta[poi] = grid_points[k]
+                fine_fits[k] = run(theta, start.nu.copy(), free)
+                done.append(int(k))
+            fits = fine_fits
+            fitted = np.array([f is not None for f in fits])
+            interpolated = scipy.interpolate.RegularGridInterpolator((grids[0], grids[1]), nll_coarse)(grid_points)
+            nll_grid = np.array([f.nll if f is not None else v for f, v in zip(fits, interpolated)])
+        else:
+            nll_grid = np.array([f.nll for f in fits])
         best_refit = False
-        lowest = int(np.argmin(nll_grid))
+        lowest = int(np.argmin(np.where(fitted, nll_grid, np.inf)))
         if nll_grid[lowest] < best.nll - 1e-6:
             again = run(fits[lowest].theta.copy(), fits[lowest].nu.copy(), free_best)
             if again.nll < best.nll:
                 best, best_refit = again, True
-        nll_min = min(best.nll, nll_grid.min())
+        nll_min = min(best.nll, nll_grid[fitted].min())
         q = 2 * (nll_grid - nll_min)
 
         q_target = None
         if theta_t is not None:
             target_point = np.asarray(theta_t, dtype=np.float64)[poi]
-            near = fits[int(np.argmin((((points - target_point) / spacing) ** 2).sum(1)))]
+            candidates = np.flatnonzero(fitted)
+            near = fits[candidates[int(np.argmin((((grid_points[candidates] - target_point) / spacing) ** 2).sum(1)))]]
             theta = near.theta.copy()
             theta[poi] = target_point
             q_target = float(2 * (run(theta, near.nu.copy(), free).nll - nll_min))
@@ -1791,7 +1846,7 @@ def scan(
     w_sm = inputs.coefs @ get_lower_tri([1.0] + [0.0] * n_wcs, dtype=torch.float64)[inputs.keep_q]
     return types.SimpleNamespace(
         pois=list(pois),
-        grid=points,
+        grid=grid_points,
         q=q,
         nll_min=nll_min,
         levels=levels,
@@ -1801,13 +1856,14 @@ def scan(
         best=types.SimpleNamespace(theta=best.theta, nu=best.nu, nll=best.nll, success=best.success, edm=best.edm),
         best_refit=best_refit,
         start_fallbacks=fallbacks[0],
-        theta=np.array([f.theta for f in fits]),
-        nu=np.array([f.nu for f in fits]),
-        success=np.array([f.success for f in fits]),
-        edm=np.array([f.edm for f in fits]),
-        at_bound=np.array([on_bound(f) for f in fits]),
+        theta=np.array([f.theta if f is not None else np.full(n_wcs, np.nan) for f in fits]),
+        nu=np.array([f.nu if f is not None else np.full(n_nu, np.nan) for f in fits]),
+        success=np.array([f.success if f is not None else True for f in fits]),
+        edm=np.array([f.edm if f is not None else 0.0 for f in fits]),
+        at_bound=np.array([on_bound(f) if f is not None else False for f in fits]),
+        fitted=fitted,
         best_at_bound=on_bound(best),
-        grid_below_best=bool(nll_grid.min() < best.nll - 1e-6),
+        grid_below_best=bool(nll_grid[fitted].min() < best.nll - 1e-6),
         keep=keep,
         dropped=int((~keep).sum()),
         dropped_sm_fraction=float(w_sm[~keep].sum() / w_sm.sum()),
@@ -2142,6 +2198,49 @@ def grid_resolution(s, min_points=(5, 20)):
     return out
 
 
+def refine_points(a1, a2, q, levels, factor=4, pad=1):
+    """
+    The points of a finer grid where a 2D scan resolves its contours: the coarse grid (a1 x a2, q [n1, n2] with
+    indexing 'ij') is subdivided factor times along each axis, and the fine points inside the cells a level crosses,
+    or within pad cells of one, are returned, without the coarse grid points. A cell is crossed by a level when its
+    four corner values of q are neither all below nor all at or above it, so that bilinear interpolation of q puts the
+    contour through it; pad also refines the cells around a crossed one, where a contour can pass between corners on
+    the same side (a narrow tip). A NaN corner counts as above every level.
+
+    Args:
+        a1, a2: increasing coarse grid axes of the two pois
+        q: [n1, n2] q on the coarse grid
+        levels: q levels of the contours
+        factor: subdivisions of each cell side (at least 2)
+        pad: cells around a crossed cell that are refined too
+    Returns:
+        fine1 [(n1 - 1) factor + 1], fine2 [(n2 - 1) factor + 1] (fine grid axes; the coarse points are every
+        factor-th entry), new [F1, F2] bool (fine points to fit: in a refined cell and not a coarse grid point)
+    """
+    a1, a2 = np.asarray(a1, dtype=np.float64), np.asarray(a2, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    if q.shape != (len(a1), len(a2)):
+        raise ValueError(f'q has shape {q.shape}, expected ({len(a1)}, {len(a2)})')
+    if factor < 2:
+        raise ValueError(f'factor must be at least 2, not {factor}')
+    corners = np.stack([q[:-1, :-1], q[1:, :-1], q[:-1, 1:], q[1:, 1:]])
+    crossed = np.zeros((len(a1) - 1, len(a2) - 1), dtype=bool)
+    for level in levels:
+        below = corners < level
+        crossed |= below.any(0) & ~below.all(0)
+    refined = crossed.copy()
+    for i, j in np.argwhere(crossed):
+        refined[max(i - pad, 0) : i + pad + 1, max(j - pad, 0) : j + pad + 1] = True
+    steps = np.arange(factor) / factor
+    fine1 = np.append((a1[:-1, None] + np.diff(a1)[:, None] * steps).ravel(), a1[-1])
+    fine2 = np.append((a2[:-1, None] + np.diff(a2)[:, None] * steps).ravel(), a2[-1])
+    new = np.zeros((len(fine1), len(fine2)), dtype=bool)
+    for i, j in np.argwhere(refined):
+        new[i * factor : (i + 1) * factor + 1, j * factor : (j + 1) * factor + 1] = True
+    new[::factor, ::factor] = False
+    return fine1, fine2, new
+
+
 def write_results(name, config, inputs, entries):
     """
     Write the scans to {name}/scans.yml (summary) and {name}/scans.npz (arrays, keys <label>/<array>).
@@ -2155,7 +2254,7 @@ def write_results(name, config, inputs, entries):
     level (one poi), with a target q_target = q(theta_t) (when the scan computed it) and, for one poi, the shift
     best - theta_t, its size in units of the interval half-width on the side of theta_t (cl 0.6827; nan if that side
     is open) and the signed root sign(best - theta_t) sqrt(q_target), the profiled WCs and nuisances at the best fit,
-    fit diagnostics (points, failed, on a bound, largest edm, grid below the best fit, best fit repeated from a grid
+    fit diagnostics (points, fitted, failed, on a bound, largest edm, grid below the best fit, best fit repeated from a grid
     point, fits started from the profiled WCs at 0), the grid resolution (grid_resolution), the event selection
     (dropped, dropped_sm_fraction, selections, stable and, with backgrounds, background_dropped per event set and
     background_dropped_fraction per component), with the background calibration per component the bins kept at
@@ -2166,7 +2265,7 @@ def write_results(name, config, inputs, entries):
     min_eigenvalue of the Hessian; failed impact fits; lower_minimum, the nuisances whose impact fits found a lower NLL
     than the best fit; free_names, the parameters of the best fit; and per profiled nuisance nu_hat, nu_obs, sigma,
     pull, constrained_pull, impact_up and impact_down per poi, success, at_bound, lower_minimum). scans.npz: grid, q,
-    theta, nu, success, edm, at_bound, keep (np.packbits of the selection, N events), background_keep_<p> (np.packbits of the selection of background event set p, with backgrounds),
+    theta, nu, success, edm, at_bound, fitted, keep (np.packbits of the selection, N events), background_keep_<p> (np.packbits of the selection of background event set p, with backgrounds),
     background_calibration_<c>_factors [K, n_bins], _edges [K, n_bins - 1] and _unfilled [K] per component c (with
     the background calibration) and members_best, members_nu, bootstrap_best, bootstrap_nu, subsets_<n_e>_best,
     subsets_<n_e>_nu (nuisances at each run's best fit, all of them, as inputs.nuisances + inputs.rate_names) when
@@ -2275,6 +2374,7 @@ def write_results(name, config, inputs, entries):
             out['profiled_nu'] = {n: s.best.nu[names_nu.index(n)] for n in profiled_nu}
         out['fits'] = {
             'points': len(s.q),
+            'fitted': int(s.fitted.sum()),
             'failed': int((~s.success).sum()),
             'at_bound': int(s.at_bound.sum()),
             'max_edm': float(s.edm.max()),
@@ -2309,7 +2409,7 @@ def write_results(name, config, inputs, entries):
             for c, v in calibration.items():
                 for key in ('factors', 'edges', 'unfilled'):
                     arrays[f'{label}/background_calibration_{c}_{key}'] = np.asarray(v[key])
-        for key in ('grid', 'q', 'theta', 'nu', 'success', 'edm', 'at_bound'):
+        for key in ('grid', 'q', 'theta', 'nu', 'success', 'edm', 'at_bound', 'fitted'):
             arrays[f'{label}/{key}'] = np.asarray(getattr(s, key))
         arrays[f'{label}/keep'] = np.packbits(np.asarray(s.keep))
 
@@ -2486,6 +2586,20 @@ def _grid_axes(grid):
     return square[:, 0, 0], square[0, :, 1]
 
 
+def _wc_axis_label(wc):
+    """Axis label of a WC, as in the binned analysis's figures: c / Lambda^2 [TeV^-2]."""
+    return rf'${wc_tex(wc)}/\Lambda^2$ [TeV$^{{-2}}$]'
+
+
+def _level_label(cl):
+    """Legend label of a confidence level: n sigma when cl is the two-sided coverage of n sigma (to 0.01 sigma), else
+    the percentage."""
+    z = scipy.stats.norm.ppf((1 + cl) / 2)
+    if abs(z - round(z)) < 0.01:
+        return rf'${round(z)}\sigma$'
+    return f'{100 * cl:.4g}%'
+
+
 def _q_plot_1d(ax, scans, arrays, shown):
     """
     q against the poi for the scans in shown (first the main scan), with levels, the ends of every segment below each
@@ -2555,21 +2669,74 @@ def _q_plot_1d(ax, scans, arrays, shown):
     lo, hi = (min(inside) - step, max(inside) + step) if inside else (grid.min(), grid.max())
     ax.set_xlim(max(lo, grid.min()), min(hi, grid.max()))
     ax.set_ylim(0, top)
-    ax.set_xlabel(f'${wc_tex(poi)}$')
+    ax.set_xlabel(_wc_axis_label(poi))
     ax.set_ylabel(r'$-2\Delta\log\mathcal{L}$')
     ax.legend(loc='best', fontsize=14)
 
 
+def _contour_limits(boxes, points, grid, margin=CONTOUR_MARGIN):
+    """
+    Axis limits of a 2D plot: the extent of the contours (boxes) and of the centre markers that lie inside the grid
+    (points), widened on each side by margin times that extent (times the grid's extent where it is zero) and
+    clipped to the grid's extent; the grid's extent without contours.
+
+    Args:
+        boxes: matplotlib Bbox of every drawn contour path
+        points: [n, 2] centre markers (best fits and theta_t, or the SM)
+        grid: [P, 2] grid points
+        margin: fraction of the extent added on each side
+    Returns:
+        (x_lo, x_hi), (y_lo, y_hi)
+    """
+    lo, hi = grid.min(0), grid.max(0)
+    if not boxes:
+        return (float(lo[0]), float(hi[0])), (float(lo[1]), float(hi[1]))
+    box = Bbox.union(boxes)
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    inside = points[((points >= lo) & (points <= hi)).all(1)]
+    a = np.minimum(box.min, inside.min(0)) if len(inside) else box.min
+    b = np.maximum(box.max, inside.max(0)) if len(inside) else box.max
+    width = np.where(b > a, b - a, hi - lo)
+    a, b = np.maximum(a - margin * width, lo), np.minimum(b + margin * width, hi)
+    return (float(a[0]), float(b[0])), (float(a[1]), float(b[1]))
+
+
+def _legend_figure(handles, labels, outname):
+    """A figure holding only a legend of the given handles in one row, saved to outname with no margin."""
+    fig = plt.figure(figsize=(1, 1))
+    legend = fig.legend(handles, labels, loc='center', ncol=len(handles), frameon=False)
+    fig.savefig(outname, bbox_inches='tight', bbox_extra_artists=[legend], pad_inches=0.02)
+    plt.close(fig)
+
+
 def _q_plot_2d(ax, scans, arrays, shown):
     """
-    q contours at the levels for the scans in shown (first the main scan), with grid points, best fit and target. A
-    scan with no grid point below its lowest level has no contour; a note on the plot names it.
+    q contours at the levels for the scans in shown (first the main scan), with the main scan's fitted grid points
+    and the centre markers: with a target (the main scan's theta_t: Asimov and toy scans) every scan's best fit and
+    theta_t, without one the SM; markers are drawn whole on an axis edge. One scan: one colour per level
+    (CONTOUR_COLORS) and one line style per level; with overlays: one colour per scan (SCAN_COLORS) and one line style
+    per level. The axes show the contours and centre markers with a margin (_contour_limits), or the whole grid when a
+    shown scan's outermost region reaches the grid edge (an open contour). The legend entries are labelled artists
+    without a legend on the axes (plot_results draws them in a separate figure, _legend_figure). A scan with no grid
+    point below its lowest level has no contour; a note on the plot names it.
     """
     main = scans[shown[0]]
     p1, p2 = main['pois']
     grid = arrays[f'{shown[0]}/grid']
-    ax.plot(grid[:, 0], grid[:, 1], linestyle='none', marker='.', markersize=4, color='#d9d9d9', label='_nolegend_')
-    missing = []
+    key = f'{shown[0]}/fitted'
+    fitted = arrays[key].astype(bool) if key in arrays else np.ones(len(grid), dtype=bool)
+    ax.plot(
+        grid[fitted, 0],
+        grid[fitted, 1],
+        linestyle='none',
+        marker='.',
+        markersize=3,
+        color='#d9d9d9',
+        label='_nolegend_',
+    )
+    single = len(shown) == 1
+    has_target = 'target' in main
+    missing, boxes, points, open_region = [], [], [], False
     for other, color in zip(shown, SCAN_COLORS):
         o = scans[other]
         a1, a2 = _grid_axes(arrays[f'{other}/grid'])
@@ -2578,38 +2745,71 @@ def _q_plot_2d(ax, scans, arrays, shown):
         if q.min() > o['levels'][cls[0]]:
             missing.append(_scan_label(o['spec']))
         else:
-            ax.contour(
+            contours = ax.contour(
                 a1,
                 a2,
                 q.T,
                 levels=[o['levels'][cl] for cl in cls],
-                colors=color,
+                colors=CONTOUR_COLORS[: len(cls)] if single else color,
                 linestyles=LEVEL_STYLES[: len(cls)],
                 linewidths=2,
             )
-        ax.plot([], [], color=color, linewidth=2, label=_scan_label(o['spec']))
+            boxes += [path.get_extents() for path in contours.get_paths() if len(path.vertices)]
+            edge = np.concatenate([q[0], q[-1], q[:, 0], q[:, -1]])
+            open_region |= bool((edge < o['levels'][cls[-1]]).any())
+        if not single:
+            ax.plot([], [], color=color, linewidth=2, label=_scan_label(o['spec']))
+        if has_target:
+            points.append([o['best'][p1], o['best'][p2]])
+            ax.plot(
+                o['best'][p1],
+                o['best'][p2],
+                linestyle='none',
+                marker='o',
+                markersize=6,
+                color='k' if single else color,
+                clip_on=False,
+                zorder=5,
+                label='_nolegend_',
+            )
+    for cl, style, level_color in zip(sorted(main['levels']), LEVEL_STYLES, CONTOUR_COLORS):
         ax.plot(
-            o['best'][p1],
-            o['best'][p2],
-            linestyle='none',
-            marker='P',
-            markersize=11,
-            color=color,
-            markeredgecolor='white',
-            label='_nolegend_',
+            [],
+            [],
+            color=level_color if single else 'grey',
+            linestyle=style,
+            linewidth=2,
+            label=_level_label(cl),
         )
-    for cl, style in zip(sorted(main['levels']), LEVEL_STYLES):
-        ax.plot([], [], color='grey', linestyle=style, linewidth=2, label=f'{100 * cl:.0f}%')
-    ax.plot([], [], linestyle='none', marker='P', markersize=11, color='grey', label='best fit')
-    if 'target' in main:
+    if has_target:
+        ax.plot([], [], linestyle='none', marker='o', markersize=6, color='k' if single else 'grey', label='best fit')
+        points.append([main['target'][p1], main['target'][p2]])
         ax.plot(
             main['target'][p1],
             main['target'][p2],
             linestyle='none',
-            marker='*',
-            markersize=14,
-            color='k',
+            marker='o',
+            markersize=12,
+            markerfacecolor='none',
+            markeredgecolor='k',
+            markeredgewidth=1.5,
+            clip_on=False,
+            zorder=4,
             label=r'$\theta_t$',
+        )
+    else:
+        points.append([0.0, 0.0])
+        ax.plot(
+            0.0,
+            0.0,
+            linestyle='none',
+            marker='D',
+            markersize=9,
+            color=SM_COLOR,
+            markeredgecolor='white',
+            clip_on=False,
+            zorder=5,
+            label='SM',
         )
     if missing:
         ax.text(
@@ -2622,11 +2822,14 @@ def _q_plot_2d(ax, scans, arrays, shown):
             fontsize=12,
             color='#52514e',
         )
-    ax.set_xlim(grid[:, 0].min(), grid[:, 0].max())
-    ax.set_ylim(grid[:, 1].min(), grid[:, 1].max())
-    ax.set_xlabel(f'${wc_tex(p1)}$')
-    ax.set_ylabel(f'${wc_tex(p2)}$')
-    ax.legend(loc='best', fontsize=14)
+    if open_region:
+        xlim, ylim = (grid[:, 0].min(), grid[:, 0].max()), (grid[:, 1].min(), grid[:, 1].max())
+    else:
+        xlim, ylim = _contour_limits(boxes, points, grid)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_xlabel(_wc_axis_label(p1))
+    ax.set_ylabel(_wc_axis_label(p2))
 
 
 def _pull_plot(s, outname, lumi=None):
@@ -2763,7 +2966,9 @@ def plot_results(name, lumi=None):
 
     <label>.png: for one poi, q = 2 (NLL - NLL_min) at the grid points against the poi, with the q levels, the
     interval ends (open markers on their level), the target theta_t and, with scan_uncertainty, every member's best
-    fit (ticks at q = 0); for two pois, the contours of q at the levels, the grid points, the best fit and theta_t.
+    fit (ticks at q = 0); for two pois, the contours of q at the levels, the fitted grid points and, with a target,
+    the best fits and theta_t, without one the SM, with no legend on the plot: <label>_legend.png holds it in one
+    row, so that many 2D plots can be shown together with one legend.
     The scans named in the spec's 'overlay' (same pois, at most two) are drawn on the same axes; only the main scan's
     target and members are drawn. <label>_pulls.png, for a scan with profiled nuisances: nu_hat - nu_obs of each at
     the best fit (nu_obs from the spec's 'nu_obs', {name: value}, default 0), with the +-1 and +-2 bands of the
@@ -2797,6 +3002,8 @@ def plot_results(name, lumi=None):
                 _q_plot_2d(ax, scans, arrays, shown)
             mh.cms.label('Preliminary', data=False, lumi=lumi, com=13, ax=ax)
             fig.savefig(f'{name}/plots/{label}.png', bbox_inches='tight')
+            if len(s['pois']) == 2:
+                _legend_figure(*ax.get_legend_handles_labels(), f'{name}/plots/{label}_legend.png')
             plt.close(fig)
             if s.get('profiled_nu'):
                 _pull_plot(s, f'{name}/plots/{label}_pulls.png', lumi=lumi)
@@ -2834,11 +3041,14 @@ def check_scans(config):
     start; 0 by default), ratio (learned, truth or calibrated) and rate (learned or truth), calibration ({wc (default the poi; required
     for two pois), bins (default [10, 10]), folds (default 5)}, ratio calibrated only: calibrated_inputs; not with
     uncertainty), profile_wcs and profile_nu (names or 'all'), selection_wcs
-    (names or 'all': further WCs whose box enters the event selection), nu_bound, cls, max_selections, box
+    (names or 'all': further WCs whose box enters the event selection), nu_bound, cls (default [0.6827, 0.95] for one
+    poi, CONTOUR_CLS = 1, 2, 3 sigma for two), max_selections, box
     ({wc: [lo, hi]}, over the top-level box),
     overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty), impacts (true:
-    pulls and impacts of the profiled nuisances at the best fit, impacts; one poi and profile_nu needed) and label
-    (legend text). With backgrounds, the backgrounds block is checked by check_background_options.
+    pulls and impacts of the profiled nuisances at the best fit, impacts; one poi and profile_nu needed),
+    refine (false, or {factor (integer >= 2, default 4), pad (integer >= 0, default 1)}: 2D refinement near the
+    contours, refine_points; two pois only, on by default for two pois) and label (legend text). With backgrounds, the
+    backgrounds block is checked by check_background_options.
 
     Args:
         config: scan config (load_config)
@@ -2908,6 +3118,20 @@ def check_scans(config):
                 sys.exit(f'[error]: scan {label}: impacts need one poi')
             if not entry.get('profile_nu'):
                 sys.exit(f'[error]: scan {label}: impacts need profiled nuisances (profile_nu)')
+        refine = entry.get('refine')
+        if refine is not None and refine is not False:
+            if len(pois) != 2:
+                sys.exit(f'[error]: scan {label}: refine needs two pois')
+            if not isinstance(refine, dict):
+                sys.exit(f'[error]: scan {label}: refine must be false or {{factor, pad}}, not {refine}')
+            unknown = sorted(set(refine) - set(REFINE_KEYS))
+            if unknown:
+                sys.exit(f'[error]: scan {label}: unknown refine keys {unknown}')
+            factor, pad = refine.get('factor', 4), refine.get('pad', 1)
+            if not (isinstance(factor, int) and factor >= 2):
+                sys.exit(f'[error]: scan {label}: refine factor must be an integer >= 2, not {factor}')
+            if not (isinstance(pad, int) and pad >= 0):
+                sys.exit(f'[error]: scan {label}: refine pad must be an integer >= 0, not {pad}')
         overlay = entry.get('overlay', [])
         if len(overlay) > len(SCAN_COLORS) - 1:
             sys.exit(f'[error]: scan {label}: at most {len(SCAN_COLORS) - 1} overlays')
@@ -3045,6 +3269,7 @@ def scan_settings(config, label, inputs):
     names_nu = list(inputs.nuisances) + list(inputs.rate_names)
     pois = list(entry['pois'])
     grids = [_grid(entry, poi, label) for poi in pois]
+    refine = entry.get('refine', {} if len(pois) == 2 else None)
 
     profile_wcs = entry.get('profile_wcs', [])
     profile_wcs = [w for w in wcs if w not in pois] if profile_wcs == 'all' else list(profile_wcs)
@@ -3101,9 +3326,10 @@ def scan_settings(config, label, inputs):
         nu_obs=nu_obs,
         ratio='learned' if entry.get('ratio') == 'calibrated' else entry.get('ratio', 'learned'),
         rate=entry.get('rate', 'learned'),
-        cls=tuple(entry.get('cls', (0.6827, 0.95))),
+        cls=tuple(entry.get('cls', (0.6827, 0.95) if len(pois) == 1 else CONTOUR_CLS)),
         max_selections=entry.get('max_selections', 5),
         theta_base=theta_base,
+        refine=None if refine is False else refine,
     )
     target_spec = dict(
         theta_t=theta_t,
@@ -3179,6 +3405,51 @@ def scan_inputs(config, inputs, spec, cache):
         )
     cache[key] = out
     return out
+
+
+def pair_configs(config, wcs, template, pairs='all', ranges=None, points=21, name=None, prefix=''):
+    """
+    Scan configs for 2D scans of pairs of WCs, one scan per config (one job per pair): every key of config except
+    name and scans is copied, and the one scan, labelled <prefix><p1>_<p2>, is the template entry with pois [p1, p2],
+    grid {p: {range: ranges[p], points: points}} and the pois' box rows set to their grid ranges (over the template's
+    box), so that the event selection covers the whole grid (scan). The config's name is <name>/<label>.
+
+    Args:
+        config: scan config as written (before load_config); its scans are not used
+        wcs: WC names of the ensemble (load_config(path)['wcs']), the order of 'all'
+        template: scan entry without pois and grid (e.g. profile_wcs 'all', profile_nu 'all', refine, target)
+        pairs: 'all' (every pair of wcs, in their order) or a list of [p1, p2] (p1 on the x axis)
+        ranges: {wc: [lo, hi]} grid range of each WC, default config['box']
+        points: grid points per poi
+        name: output directory of the scans' results, default config['name']
+        prefix: label prefix
+    Returns:
+        {label: config}, in the order of the pairs
+    """
+    if 'pois' in template or 'grid' in template:
+        raise ValueError('the template scan entry must not set pois or grid')
+    pairs = list(itertools.combinations(wcs, 2)) if pairs == 'all' else [tuple(p) for p in pairs]
+    bad = [list(p) for p in pairs if len(p) != 2 or p[0] == p[1] or any(w not in wcs for w in p)]
+    if bad:
+        raise ValueError(f'pairs need two different WCs of {list(wcs)}: {bad}')
+    if len({frozenset(p) for p in pairs}) != len(pairs):
+        raise ValueError('a pair is listed twice')
+    ranges = config.get('box', {}) if ranges is None else ranges
+    missing = sorted({w for p in pairs for w in p if w not in ranges})
+    if missing:
+        raise ValueError(f'no grid range for {missing}')
+    out_name = config['name'] if name is None else name
+    base = {k: v for k, v in config.items() if k not in ('name', 'scans')}
+    configs = {}
+    for p1, p2 in pairs:
+        label = f'{prefix}{p1}_{p2}'
+        rows = {p: [float(v) for v in ranges[p]] for p in (p1, p2)}
+        entry = copy.deepcopy(template)
+        entry['pois'] = [p1, p2]
+        entry['grid'] = {p: {'range': rows[p], 'points': int(points)} for p in (p1, p2)}
+        entry['box'] = {**entry.get('box', {}), **rows}
+        configs[label] = {'name': f'{out_name}/{label}', **copy.deepcopy(base), 'scans': {label: entry}}
+    return configs
 
 
 def check_wilks(config):

@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import os
 import pytest
@@ -5,7 +6,10 @@ import torch
 import types
 import yaml
 
+from matplotlib.transforms import Bbox
 from topsbi.scan import (
+    _contour_limits,
+    _q_plot_2d,
     background_caches,
     background_dropped,
     background_target_weights,
@@ -23,8 +27,11 @@ from topsbi.scan import (
     nll,
     nested_bins,
     nll_terms,
+    pair_configs,
+    plot_results,
     positive_background_events,
     positive_events,
+    refine_points,
     scan,
     scan_series,
     scan_settings,
@@ -827,3 +834,198 @@ def test_summary_series_and_plot(tmp_path):
         ['cA', 'cB', 'cQj31'], [learned, combine], str(outname), lumi=138, note='synthetic', title='Others profiled'
     )
     assert outname.stat().st_size > 0
+
+
+def test_refine_points():
+    """refine_points on q = r^2 (5 x 5 grid, level 1.5): the fine axes hold the coarse values at every factor-th
+    entry; a crossed cell's interior is new, a corner cell no level crosses is new only with pad; coarse points are
+    never new; a wrong shape of q or a factor below 2 stops."""
+    a1 = a2 = np.linspace(-2.0, 2.0, 5)
+    q = a1[:, None] ** 2 + a2[None, :] ** 2
+    fine1, fine2, new = refine_points(a1, a2, q, [1.5], factor=2, pad=0)
+    assert np.allclose(fine1, np.linspace(-2.0, 2.0, 9)) and np.allclose(fine2, np.linspace(-2.0, 2.0, 9))
+    assert np.allclose(fine1[::2], a1)
+    assert new.shape == (9, 9) and not new[::2, ::2].any()
+    assert new[3, 3]  # centre of the cell [-1, 0] x [-1, 0]: corners q 2, 1, 1, 0
+    assert not new[1, 1]  # centre of the corner cell [-2, -1]^2: corners q 8, 5, 5, 2, all above 1.5
+    _, _, padded = refine_points(a1, a2, q, [1.5], factor=2, pad=1)
+    assert padded[1, 1] and not padded[::2, ::2].any() and (padded | ~new).all()
+    with pytest.raises(ValueError):
+        refine_points(a1, a2, q[:-1], [1.5])
+    with pytest.raises(ValueError):
+        refine_points(a1, a2, q, [1.5], factor=1)
+
+
+def refined_scan():
+    """
+    A refined 2D Asimov scan of (cA, cB) on exact_inputs at theta_t = (0.5, -0.3), 7 x 7 coarse grid, factor 2, pad 1,
+    set up from a scan entry as main does (check_scans, scan_settings), and its inputs, target, spec and settings.
+    """
+    inputs = exact_inputs()
+    entry = {
+        'pois': ['cA', 'cB'],
+        'grid': {'cA': {'range': [0.0, 1.0], 'points': 7}, 'cB': {'range': [-0.8, 0.2], 'points': 7}},
+        'target': {'theta': {'cA': 0.5, 'cB': -0.3}},
+        'refine': {'factor': 2, 'pad': 1},
+    }
+    config = {'wcs': WCS, 'box': {}, 'scans': {'r': entry}}
+    check_scans(config)
+    scan_args, target_spec, spec = scan_settings(config, 'r', inputs)
+    target = target_weights(inputs, target_spec['theta_t'])
+    s = scan(inputs, target, theta_t=target_spec['theta_t'], **scan_args)
+    return types.SimpleNamespace(
+        inputs=inputs, target=target, theta_t=target_spec['theta_t'], spec=spec, scan_args=scan_args, scan=s
+    )
+
+
+def test_refined_2d_scan():
+    """A 2D scan defaults to the 1, 2, 3 sigma levels (q = -2 log(1 - cl)); with refine its grid is the fine grid,
+    the coarse points and some refined points are fitted, the others carry NaN theta and interpolated q >= 0; q at
+    the fitted points equals an unrefined scan on the fine grid; refinement is on by default for two pois (refine
+    {}), off with refine false and for one poi; check_scans refuses refine on one poi and a bad factor or pad."""
+    r = refined_scan()
+    s, cls = r.scan, r.scan_args['cls']
+    assert cls == (0.6827, 0.9545, 0.9973)
+    assert np.allclose([s.levels[cl] for cl in cls], [-2 * np.log(1 - cl) for cl in cls], rtol=1e-9)
+    assert s.grid.shape == (13 * 13, 2)
+    fitted = s.fitted.reshape(13, 13)
+    assert fitted[::2, ::2].all() and 49 < s.fitted.sum() < 13 * 13
+    assert np.isnan(s.theta[~s.fitted]).all() and s.success.all() and (s.q >= -1e-9).all()
+    assert np.allclose(s.best.theta, r.theta_t, atol=1e-4) and s.q_target < 1e-6
+    fine = scan(
+        r.inputs,
+        r.target,
+        ['cA', 'cB'],
+        [np.unique(s.grid[:, 0]), np.unique(s.grid[:, 1])],
+        r.scan_args['box'],
+        cls=cls,
+        theta_t=r.theta_t,
+    )
+    assert np.allclose(fine.grid, s.grid, rtol=0.0, atol=1e-12)
+    assert np.allclose(s.q[s.fitted], fine.q[s.fitted], rtol=0.0, atol=1e-8)
+
+    base = {'pois': ['cA', 'cB'], 'grid': {'cA': {'range': [0.0, 1.0], 'points': 3}, 'cB': {'range': [0.0, 1.0], 'points': 3}}}
+    one = {'pois': ['cA'], 'grid': {'cA': {'range': [0.0, 1.0], 'points': 3}}, 'refine': {}}
+    defaults = {'wcs': WCS, 'box': {}, 'scans': {'d': base, 'off': dict(base, refine=False), 'one': dict(one, refine=False)}}
+    check_scans(defaults)
+    assert scan_settings(defaults, 'd', r.inputs)[0]['refine'] == {}
+    assert scan_settings(defaults, 'off', r.inputs)[0]['refine'] is None
+    assert scan_settings(defaults, 'one', r.inputs)[0]['refine'] is None
+    for bad in (one, dict(base, refine={'factor': 1}), dict(base, refine={'pad': -1}), dict(base, refine={'step': 2})):
+        with pytest.raises(SystemExit):
+            check_scans({'wcs': WCS, 'scans': {'bad': bad}})
+
+
+def test_refined_2d_plot(tmp_path):
+    """write_results writes fitted for a refined 2D scan, and plot_results draws it alone and with an unrefined
+    overlay (with a target: best fits and theta_t) and without a target (the SM)."""
+    r = refined_scan()
+    unrefined = scan(r.inputs, r.target, theta_t=r.theta_t, **dict(r.scan_args, refine=None))
+    r.inputs.events = np.ones(len(r.inputs.w0), dtype=bool)
+    config = {'ensemble': 'eft.yml', 'data': 'data', 'sm_yield': 1.0, 'rate_systematics': {}}
+    entries = {
+        'r': dict(scan=r.scan, theta_t=r.theta_t, spec=dict(r.spec, overlay=['u']), uncertainty=None),
+        'u': dict(scan=unrefined, theta_t=r.theta_t, spec=dict(r.spec, refine=False, label='unrefined'), uncertainty=None),
+        'n': dict(scan=r.scan, theta_t=None, spec=dict(r.spec, label='no target'), uncertainty=None),
+    }
+    name = str(tmp_path / 'scans')
+    write_results(name, config, r.inputs, entries)
+    with open(f'{name}/scans.yml') as f:
+        out = yaml.safe_load(f)['scans']
+    assert out['r']['fits']['fitted'] == int(r.scan.fitted.sum()) and out['u']['fits']['fitted'] == 49
+    assert np.array_equal(np.load(f'{name}/scans.npz')['r/fitted'], r.scan.fitted)
+    assert 'target' in out['r'] and 'target' not in out['n']
+    plot_results(name)
+    assert all(os.path.getsize(f'{name}/plots/{label}{end}.png') > 0 for label in ('r', 'u', 'n') for end in ('', '_legend'))
+
+
+def test_pair_configs():
+    """pair_configs: 'all' gives every pair in WC order, one scan per config with the template, grid ranges and
+    widened pois' box rows (the template untouched); listed pairs keep their order, with ranges, name and prefix;
+    a pair twice, an unknown WC, a missing range or a template with pois stop."""
+    wcs = ['cA', 'cB', 'cC']
+    config = {
+        'name': '/out/set',
+        'ensemble': 'eft.yml',
+        'box': {'cA': [-1.0, 1.0], 'cB': [-2.0, 2.0], 'cC': [-3.0, 3.0]},
+        'scans': {'old': {}},
+    }
+    template = {'profile_nu': 'all', 'refine': {'factor': 2}, 'box': {'cB': [-0.5, 0.5], 'cC': [-0.5, 0.5]}}
+    configs = pair_configs(config, wcs, template, points=11)
+    assert list(configs) == ['cA_cB', 'cA_cC', 'cB_cC']
+    c = configs['cA_cB']
+    assert c['name'] == '/out/set/cA_cB' and c['ensemble'] == 'eft.yml' and list(c['scans']) == ['cA_cB']
+    e = c['scans']['cA_cB']
+    assert e['pois'] == ['cA', 'cB'] and e['profile_nu'] == 'all' and e['refine'] == {'factor': 2}
+    assert e['grid'] == {'cA': {'range': [-1.0, 1.0], 'points': 11}, 'cB': {'range': [-2.0, 2.0], 'points': 11}}
+    assert e['box'] == {'cA': [-1.0, 1.0], 'cB': [-2.0, 2.0], 'cC': [-0.5, 0.5]}
+    assert template == {'profile_nu': 'all', 'refine': {'factor': 2}, 'box': {'cB': [-0.5, 0.5], 'cC': [-0.5, 0.5]}}
+    check_scans({'wcs': wcs, **c})
+
+    listed = pair_configs(
+        config, wcs, template, pairs=[['cC', 'cA']], ranges={'cA': [0.0, 1.0], 'cC': [0.0, 2.0]}, name='/x',
+        prefix='s1_',
+    )
+    assert list(listed) == ['s1_cC_cA'] and listed['s1_cC_cA']['name'] == '/x/s1_cC_cA'
+    e = listed['s1_cC_cA']['scans']['s1_cC_cA']
+    assert e['pois'] == ['cC', 'cA'] and e['grid']['cC']['range'] == [0.0, 2.0]
+    for kwargs in (
+        dict(pairs=[['cA', 'cB'], ['cB', 'cA']]),
+        dict(pairs=[['cA', 'cD']]),
+        dict(pairs=[['cA', 'cA']]),
+        dict(ranges={'cA': [0.0, 1.0]}),
+    ):
+        with pytest.raises(ValueError):
+            pair_configs(config, wcs, template, **kwargs)
+    with pytest.raises(ValueError):
+        pair_configs(config, wcs, dict(template, pois=['cA']))
+
+
+def test_contour_limits():
+    """_contour_limits: the contour extent plus the margin on each side, widened to a marker inside the grid but not
+    to one outside it, the grid's extent for a zero width, clipped to the grid; the grid's extent without contours."""
+    grid = np.array([[0.0, 0.0], [10.0, 5.0]])
+    box = Bbox.from_extents(4.0, 2.0, 6.0, 3.0)
+    assert _contour_limits([box], [], grid) == (pytest.approx((3.8, 6.2)), pytest.approx((1.9, 3.1)))
+    assert _contour_limits([box], [[1.0, 2.5]], grid) == (pytest.approx((0.5, 6.5)), pytest.approx((1.9, 3.1)))
+    assert _contour_limits([box], [[20.0, 2.5]], grid) == (pytest.approx((3.8, 6.2)), pytest.approx((1.9, 3.1)))
+    line = Bbox.from_extents(5.0, 2.0, 5.0, 3.0)
+    assert _contour_limits([line], [], grid) == (pytest.approx((4.0, 6.0)), pytest.approx((1.9, 3.1)))
+    wide = Bbox.from_extents(0.1, 0.1, 9.9, 4.9)
+    assert _contour_limits([wide], [], grid) == ((0.0, 10.0), (0.0, 5.0))
+    assert _contour_limits([], [[1.0, 1.0]], grid) == ((0.0, 10.0), (0.0, 5.0))
+
+
+def test_q_plot_2d_limits(tmp_path):
+    """The 2D plot shows closed contours with a margin inside a wider grid, and the whole grid when the outermost
+    region reaches the grid edge (open contour)."""
+    r = refined_scan()
+    narrow = scan(
+        r.inputs,
+        r.target,
+        ['cA', 'cB'],
+        [np.linspace(0.45, 0.7, 6), np.linspace(-0.8, 0.2, 7)],
+        r.scan_args['box'],
+        cls=r.scan_args['cls'],
+        theta_t=r.theta_t,
+    )
+    r.inputs.events = np.ones(len(r.inputs.w0), dtype=bool)
+    config = {'ensemble': 'eft.yml', 'data': 'data', 'sm_yield': 1.0, 'rate_systematics': {}}
+    entries = {
+        'r': dict(scan=r.scan, theta_t=r.theta_t, spec=r.spec, uncertainty=None),
+        'w': dict(scan=narrow, theta_t=r.theta_t, spec=dict(r.spec, refine=False), uncertainty=None),
+    }
+    name = str(tmp_path / 'scans')
+    write_results(name, config, r.inputs, entries)
+    with open(f'{name}/scans.yml') as f:
+        scans = yaml.safe_load(f)['scans']
+    arrays = dict(np.load(f'{name}/scans.npz'))
+    fig, ax = plt.subplots()
+    _q_plot_2d(ax, scans, arrays, ['r'])
+    (x0, x1), (y0, y1) = ax.get_xlim(), ax.get_ylim()
+    assert 0.0 < x0 < 0.4 and 0.6 < x1 < 1.0 and -0.8 < y0 < -0.4 and -0.2 < y1 < 0.2
+    plt.close(fig)
+    fig, ax = plt.subplots()
+    _q_plot_2d(ax, scans, arrays, ['w'])
+    assert ax.get_xlim() == pytest.approx((0.45, 0.7)) and ax.get_ylim() == pytest.approx((-0.8, 0.2))
+    plt.close(fig)
