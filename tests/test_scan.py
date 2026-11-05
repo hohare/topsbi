@@ -673,6 +673,21 @@ def test_impacts_config_and_results(tmp_path):
     for bad in (two, dict(base, profile_nu=[]), dict(base, impacts='yes')):
         with pytest.raises(SystemExit):
             check_scans({'wcs': WCS, 'scans': {'bad': bad}})
+    inputs_names = types.SimpleNamespace(wcs=WCS, nuisances=[], rate_names=['lumi'])
+    two = {'cA': {'range': [0.0, 1.0], 'points': 3}, 'cB': {'range': [0.0, 1.0], 'points': 3}}
+    defaults = {
+        'wcs': WCS,
+        'box': {},
+        'scans': {
+            'nu': {'pois': ['cA'], 'grid': {'cA': two['cA']}, 'profile_nu': ['lumi']},
+            'off': {'pois': ['cA'], 'grid': {'cA': two['cA']}, 'profile_nu': ['lumi'], 'impacts': False},
+            'frozen': {'pois': ['cA'], 'grid': {'cA': two['cA']}},
+            'pair': {'pois': ['cA', 'cB'], 'grid': two, 'profile_nu': ['lumi']},
+        },
+    }
+    check_scans(defaults)
+    resolved = {label: scan_settings(defaults, label, inputs_names)[2]['impacts'] for label in defaults['scans']}
+    assert resolved == {'nu': True, 'off': False, 'frozen': False, 'pair': False}
 
     r = impact_scan()
     inputs, imp = r.inputs, r.impacts
@@ -695,6 +710,9 @@ def test_impacts_config_and_results(tmp_path):
     arrays = np.load(f'{name}/scans.npz')
     assert np.allclose(arrays['i/impacts_covariance'], imp.covariance, rtol=0.0, atol=0.0)
     assert np.allclose(arrays['i/impacts_correlation'], imp.correlation, rtol=0.0, atol=0.0)
+    plot_results(name)
+    assert os.path.getsize(f'{name}/plots/i_impacts.png') > 0
+    assert not os.path.exists(f'{name}/plots/i_pulls.png')
 
 
 def test_calibrated_inputs():

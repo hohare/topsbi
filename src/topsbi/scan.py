@@ -1,6 +1,6 @@
 from matplotlib.legend_handler import HandlerTuple
 from matplotlib.lines import Line2D
-from matplotlib.transforms import Bbox, blended_transform_factory
+from matplotlib.transforms import Bbox, ScaledTranslation, blended_transform_factory
 from topsbi.tools.data import (
     NUISANCE_COLUMNS,
     event_keys,
@@ -15,6 +15,7 @@ from topsbi.tools.nuisanceCache import NuisanceCache
 from topsbi.tools.plots import _no_tex_mapping, wc_tex
 
 import numpy as np
+import matplotlib.colors
 import matplotlib.pyplot as plt
 import mplhep as mh
 import scipy.interpolate
@@ -40,6 +41,14 @@ CONTOUR_COLORS = ['#d9a400', '#2e9e3e', '#2a5bd7']
 SM_COLOR = '#ff0000'
 # margin of a 2D plot around its contours and centre markers, as a fraction of their extent on each axis
 CONTOUR_MARGIN = 0.1
+# impact plot (after Combine's impact plots): bar colours for nu fixed at nu_hat + sqrt(Var(nu_hat)) (red) and
+# nu_hat - sqrt(Var(nu_hat)) (blue), filled with IMPACT_ALPHA and edged opaque, the constrained-pull marker colour,
+# the shading of alternate rows, the height of a row in inches
+IMPACT_COLORS = {'up': '#d93a3a', 'down': '#3a64d9'}
+IMPACT_ALPHA = 0.45
+PULL_COLOR = '#1f3fd1'
+ROW_SHADE = '#e6e6e6'
+IMPACT_ROW_HEIGHT = 0.28
 # keys of a scan entry in the config's scans
 SCAN_KEYS = (
     'pois',
@@ -2832,24 +2841,175 @@ def _q_plot_2d(ax, scans, arrays, shown):
     ax.set_ylabel(_wc_axis_label(p2))
 
 
-def _pull_plot(s, outname, lumi=None):
-    """nu_hat - nu_obs of every profiled nuisance of one scan at its best fit, with the +-1 and +-2 bands."""
-    names = list(s['profiled_nu'])
-    nu_obs = s['spec'].get('nu_obs') or {}
-    pull = np.array([s['profiled_nu'][n] - nu_obs.get(n, 0.0) for n in names])
-    y = np.arange(len(names))
-    fig, ax = plt.subplots(figsize=(10, 2 + 0.35 * len(names)))
-    ax.axvspan(-2, 2, color='#E6EEE6', label=r'$\pm 2$')
-    ax.axvspan(-1, 1, color='#4086B8', alpha=0.6, label=r'$\pm 1$')
-    ax.axvline(0, color='grey', linestyle=':', linewidth=1)
-    ax.plot(pull, y, linestyle='none', marker='o', markersize=7, color='k', label='_nolegend_')
-    ax.set_yticks(y, names, fontsize=12)
-    ax.set_ylim(len(names) - 0.5, -0.5)
-    extent = max(2.5, 1.1 * float(np.abs(pull).max(initial=0)))
-    ax.set_xlim(-extent, extent)
-    ax.set_xlabel(r'$\hat{\nu} - \nu_{\mathrm{obs}}$')
-    ax.legend(loc='lower right', fontsize=14)
-    mh.cms.label('Preliminary', data=False, lumi=lumi, com=13, ax=ax)
+def _impact_plot(s, outname, rows_per_page=30):
+    """
+    Pulls and impacts of one 1D scan with impacts (its scans.yml entry s), after Combine's impact plots: the profiled
+    nuisances ranked by their larger |impact|, rows_per_page per page (outname for the first page, <outname
+    stem>_<k>.png for page k > 1), with the same axis ranges on every page (_impact_page).
+
+    Args:
+        s: scans.yml entry of a 1D scan with an impacts block (write_results)
+        outname: output png of the first page
+        rows_per_page: nuisances per page
+    """
+    poi = s['pois'][0]
+
+    def size(v):
+        x = np.array([v['impact_up'][poi], v['impact_down'][poi]], dtype=np.float64)
+        return float(np.nanmax(np.abs(x))) if np.isfinite(x).any() else -1.0
+
+    ranked = sorted(s['impacts']['nuisances'].items(), key=lambda item: size(item[1]), reverse=True)
+    values = np.array(
+        [[v['pull'], v['sigma'], v['constrained_pull'], v['impact_up'][poi], v['impact_down'][poi]] for _, v in ranked],
+        dtype=np.float64,
+    ).reshape(-1, 5)
+    pull, sigma, constrained = values[:, 0], np.nan_to_num(values[:, 1]), values[:, 2]
+    reach = np.abs(np.concatenate([pull + sigma, pull - sigma, constrained]))
+    reach = reach[np.isfinite(reach)]
+    pull_limit = max(3.0, 1.1 * float(reach.max())) if len(reach) else 3.0
+    shifts = np.abs(values[:, 3:].ravel())
+    shifts = shifts[np.isfinite(shifts)]
+    impact_limit = 1.15 * float(shifts.max()) if len(shifts) and shifts.max() > 0 else 1.0
+
+    c = s['best'][poi]
+    lower, upper = (s.get('intervals') or {}).get(0.6827, [None, None])
+    above = f'+{upper - c:.3g}' if upper is not None else r'\mathrm{open}'
+    below = f'-{c - lower:.3g}' if lower is not None else r'\mathrm{open}'
+    tex = wc_tex(poi)
+    hat = rf'\hat{{c}}{tex[1:]}' if tex.startswith('c') else rf'\hat{{{tex}}}'
+    header = rf'${hat} = {c:.3g}^{{{above}}}_{{{below}}}$'
+    stem = outname[:-4] if outname.endswith('.png') else outname
+    for page, first in enumerate(range(0, max(len(ranked), 1), rows_per_page)):
+        _impact_page(
+            ranked[first : first + rows_per_page],
+            first,
+            poi,
+            hat,
+            header,
+            pull_limit,
+            impact_limit,
+            outname if page == 0 else f'{stem}_{page + 1}.png',
+        )
+
+
+def _impact_page(rows, first, poi, hat, header, pull_limit, impact_limit, outname):
+    """
+    One page of _impact_plot, in the layout of Combine's impact plots, alternate rows shaded across the page: left,
+    the rank and name of each nuisance (* when its impact fits failed or found a lower minimum, or nu_hat is on its
+    bound); middle, the pull nu_hat - nu_obs (black dot; the constraint has unit width) with bars +-sqrt(Var(nu_hat))
+    and, just below it, the constrained pull (nu_hat - nu_obs) / sqrt(1 - Var(nu_hat)) (cross, where Var(nu_hat) < 1),
+    dotted lines at +-1 and +-2; right, the impacts on the poi with nu fixed at nu_hat +- sqrt(Var(nu_hat))
+    (IMPACT_COLORS, semi-transparent), headed by the poi's best fit and 68% interval; legend below the names; a note on the flags.
+
+    Args:
+        rows: [(name, scans.yml impacts entry)] of the page, ranked
+        first: rank of the first row minus one
+        poi: the scan's poi
+        hat, header: TeX of the poi with a hat, and the best-fit header
+        pull_limit, impact_limit: half-widths of the pull and impact axes
+        outname: output png
+    """
+    n = max(len(rows), 1)
+    y = np.arange(len(rows))[::-1].astype(np.float64)
+    fig, (names, left, right) = plt.subplots(
+        1,
+        3,
+        sharey=True,
+        figsize=(12, 1.6 + IMPACT_ROW_HEIGHT * n),
+        gridspec_kw={'width_ratios': [2.2, 3, 2], 'wspace': 0.06},
+    )
+    for ax in (names, left, right):
+        for k in range(1, len(rows), 2):
+            ax.axhspan(y[k] - 0.5, y[k] + 0.5, color=ROW_SHADE, linewidth=0, zorder=0)
+        ax.set_ylim(-0.5, n - 0.5)
+        ax.tick_params(axis='y', which='both', left=False, right=False, labelleft=False)
+    names.axis('off')
+    names.set_xlim(0, 1)
+    flagged = False
+    for k, ((name, v), yy) in enumerate(zip(rows, y)):
+        flag = not v['success'] or v['lower_minimum'] or v['at_bound']
+        flagged |= bool(flag)
+        names.text(0.02, yy, str(first + k + 1), ha='left', va='center', fontsize=13, fontweight='bold')
+        names.text(0.98, yy, f'{name} *' if flag else name, ha='right', va='center', fontsize=12)
+
+    pull = np.array([v['pull'] for _, v in rows], dtype=np.float64)
+    sigma = np.array([v['sigma'] for _, v in rows], dtype=np.float64)
+    constrained = np.array([v['constrained_pull'] for _, v in rows], dtype=np.float64)
+    for x in (-2, -1, 1, 2):
+        left.axvline(x, color='k', linestyle=':', linewidth=1, zorder=1)
+    fit = left.errorbar(
+        pull,
+        y,
+        xerr=np.nan_to_num(sigma),
+        fmt='o',
+        color='k',
+        markersize=5,
+        linewidth=1.6,
+        capsize=4,
+        capthick=1.6,
+        zorder=3,
+    )
+    cross = left.plot(
+        constrained,
+        y - 0.33,
+        linestyle='none',
+        marker='x',
+        markersize=5,
+        markeredgewidth=1.5,
+        color=PULL_COLOR,
+        zorder=4,
+    )[0]
+    left.set_xlim(-pull_limit, pull_limit)
+    left.set_xticks([-2, -1, 0, 1, 2])
+    left.tick_params(axis='x', labelsize=14)
+    left.set_xlabel(r'$\hat{\nu} - \nu_{\mathrm{obs}}$', fontsize=18)
+
+    up = np.array([v['impact_up'][poi] for _, v in rows], dtype=np.float64)
+    down = np.array([v['impact_down'][poi] for _, v in rows], dtype=np.float64)
+    bars = {}
+    for key, values in (('up', up), ('down', down)):
+        bars[key] = right.barh(
+            y,
+            np.nan_to_num(values),
+            height=1.0,
+            color=matplotlib.colors.to_rgba(IMPACT_COLORS[key], IMPACT_ALPHA),
+            edgecolor=IMPACT_COLORS[key],
+            linewidth=0.8,
+            zorder=2,
+        )
+    right.set_axisbelow(True)
+    right.grid(axis='x', color='k', linestyle=':', linewidth=1)
+    right.set_xlim(-impact_limit, impact_limit)
+    right.tick_params(axis='x', labelsize=14)
+    right.set_xlabel(rf'$\Delta {hat}$', fontsize=18)
+    right.set_title(header, loc='right', fontsize=16, pad=12)
+
+    names.legend(
+        [fit, cross, bars['up'], bars['down']],
+        [
+            'fit',
+            'constrained pull',
+            r'impact, $\nu = \hat{\nu} + \mathrm{Var}(\hat{\nu})^{1/2}$',
+            r'impact, $\nu = \hat{\nu} - \mathrm{Var}(\hat{\nu})^{1/2}$',
+        ],
+        loc='upper left',
+        bbox_to_anchor=(0.0, 0.0),
+        bbox_transform=names.transAxes + ScaledTranslation(0.0, -0.3, fig.dpi_scale_trans),
+        ncol=2,
+        frameon=False,
+        fontsize=13,
+    )
+    if flagged:
+        fig.text(
+            0.9,
+            0.0,
+            r'* impact fit failed or found a lower minimum, or $\hat{\nu}$ on its bound',
+            ha='right',
+            va='top',
+            fontsize=11,
+            color='#52514e',
+        )
+    mh.cms.label('Preliminary', data=False, rlabel='', ax=names)
     fig.savefig(outname, bbox_inches='tight')
     plt.close(fig)
 
@@ -2970,9 +3130,8 @@ def plot_results(name, lumi=None):
     the best fits and theta_t, without one the SM, with no legend on the plot: <label>_legend.png holds it in one
     row, so that many 2D plots can be shown together with one legend.
     The scans named in the spec's 'overlay' (same pois, at most two) are drawn on the same axes; only the main scan's
-    target and members are drawn. <label>_pulls.png, for a scan with profiled nuisances: nu_hat - nu_obs of each at
-    the best fit (nu_obs from the spec's 'nu_obs', {name: value}, default 0), with the +-1 and +-2 bands of the
-    unit-width constraint.
+    target and members are drawn. <label>_impacts.png (and <label>_impacts_<k>.png for further pages), for a scan
+    with impacts: the pulls and impacts of its profiled nuisances (_impact_plot).
 
     Args:
         name: output directory of write_results
@@ -3005,8 +3164,8 @@ def plot_results(name, lumi=None):
             if len(s['pois']) == 2:
                 _legend_figure(*ax.get_legend_handles_labels(), f'{name}/plots/{label}_legend.png')
             plt.close(fig)
-            if s.get('profiled_nu'):
-                _pull_plot(s, f'{name}/plots/{label}_pulls.png', lumi=lumi)
+            if s.get('impacts'):
+                _impact_plot(s, f'{name}/plots/{label}_impacts.png')
     finally:
         mathtext_log.removeFilter(_no_tex_mapping)
 
@@ -3044,8 +3203,9 @@ def check_scans(config):
     (names or 'all': further WCs whose box enters the event selection), nu_bound, cls (default [0.6827, 0.95] for one
     poi, CONTOUR_CLS = 1, 2, 3 sigma for two), max_selections, box
     ({wc: [lo, hi]}, over the top-level box),
-    overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty), impacts (true:
-    pulls and impacts of the profiled nuisances at the best fit, impacts; one poi and profile_nu needed),
+    overlay (labels of other scans), uncertainty ({members, n_boot, subsets, seed}, scan_uncertainty), impacts
+    (pulls and impacts of the profiled nuisances at the best fit, impacts; default true for one poi with profile_nu,
+    false otherwise; true needs one poi and profile_nu),
     refine (false, or {factor (integer >= 2, default 4), pad (integer >= 0, default 1)}: 2D refinement near the
     contours, refine_points; two pois only, on by default for two pois) and label (legend text). With backgrounds, the
     backgrounds block is checked by check_background_options.
@@ -3110,8 +3270,8 @@ def check_scans(config):
         unknown = sorted(set(entry.get('uncertainty') or {}) - set(UNCERTAINTY_KEYS))
         if unknown:
             sys.exit(f'[error]: scan {label}: unknown uncertainty keys {unknown}')
-        with_impacts = entry.get('impacts', False)
-        if not isinstance(with_impacts, bool):
+        with_impacts = entry.get('impacts')
+        if with_impacts is not None and not isinstance(with_impacts, bool):
             sys.exit(f'[error]: scan {label}: impacts must be true or false, not {with_impacts}')
         if with_impacts:
             if len(pois) != 1:
@@ -3262,7 +3422,8 @@ def scan_settings(config, label, inputs):
         scan_args (keyword arguments of scan other than inputs, target, Gammas, theta_t and keep), target (dict:
         theta_t [n_wcs], nu_t [n_nu] or None, kind, seed) and spec (the entry as written to scans.yml: profile_wcs,
         profile_nu and selection_wcs as name lists, nu_obs and theta_base as {name: value} of their nonzero entries,
-        box as the {wc: [lo, hi]} used, calibration {wc, bins, folds} for ratio calibrated only)
+        box as the {wc: [lo, hi]} used, impacts (true or false, the default resolved), calibration {wc, bins, folds}
+        for ratio calibrated only)
     """
     entry = config['scans'][label]
     wcs = inputs.wcs
@@ -3345,6 +3506,7 @@ def scan_settings(config, label, inputs):
         nu_obs={n: float(v) for n, v in zip(names_nu, nu_obs) if v != 0},
         theta_base={w: float(v) for w, v in zip(wcs, theta_base) if v != 0},
         box=box_used,
+        impacts=entry.get('impacts', len(pois) == 1 and bool(profile_nu)),
     )
     if entry.get('ratio') == 'calibrated':
         calibration = entry.get('calibration') or {}
@@ -3697,8 +3859,9 @@ def main(config_path, plot_only=False, wilks=False, merge=False, first_seed=None
     """
     Run the scans of a scan config: every entry of config['scans'] (check_scans) is scanned on its target (Asimov
     or toy, scan_targets: on the signal events and, with backgrounds, on the background events), with q at the target
-    (scan, q_target) and with scan_uncertainty when the entry has uncertainty. With impacts: true, the pulls and
-    impacts of the profiled nuisances at the best fit follow the scan (impacts). {name}/scans.yml and scans.npz
+    (scan, q_target) and with scan_uncertainty when the entry has uncertainty. With impacts (default for one
+    poi with profiled nuisances), the pulls and impacts of the profiled nuisances at the best fit follow the scan
+    (impacts). {name}/scans.yml and scans.npz
     (write_results) are rewritten after every scan; the plots (plot_results) are drawn at the end. A scan whose grid
     has too few points below the lowest level (grid_resolution) is reported as coarse. With wilks, only one batch of
     the Wilks toys of config['wilks'] is run (run_wilks); with merge, only the batches are merged and compared with
