@@ -79,6 +79,18 @@ def test_merge_sparse_bins():
     assert len(merged) < len(fine)
 
 
+def test_merge_sparse_bins_reference_sample():
+    """a merged bin closes only when every sample reaches min_neff: a target with 100 events per fine bin keeps the
+    fine binning alone, a reference with 20 events per fine bin merges it in pairs"""
+    fine = np.linspace(0, 10, 11)
+    x1 = np.repeat(np.arange(10) + 0.5, 100)
+    x0 = np.repeat(np.arange(10) + 0.5, 20)
+    w1, w0 = np.ones(len(x1)), np.ones(len(x0))
+
+    assert np.array_equal(merge_sparse_bins(x1, w1, fine, min_neff=30), fine)
+    assert np.array_equal(merge_sparse_bins(x1, w1, fine, min_neff=30, others=[(x0, w0)]), fine[::2])
+
+
 # njets probabilities before and after the shift (5% of events gain a jet, at most 5)
 P0 = np.array([0.4, 0.3, 0.2, 0.1])
 P1 = 0.95 * P0 + 0.05 * np.array([0, 0.4, 0.3, 0.3])
@@ -174,7 +186,7 @@ def test_closure_metrics_merges_sparse_target_cells():
     A target that is rare where r_hat is small: the reference x ~ N(0, 1) and the target x' ~ N(3.3, 1) with the same
     yield, so r(x) = exp(3.3x - 3.3^2 / 2) exactly; 0.35 target events are expected in the lowest group bin and none
     falls there. Unmerged, that bin is a pull of about 80 for the exact ratio (w_b = 0 against w_hat_b with only its MC
-    variance); merged with its neighbours until the target has n_eff >= 30, the exact ratio closes (detection of a
+    variance); merged with its neighbours until both samples have n_eff >= 30, the exact ratio closes (detection of a
     real bias with merged cells: test_closure_metrics_detects_regional_bias).
     """
     rng = np.random.default_rng(5)

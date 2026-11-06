@@ -167,34 +167,39 @@ def closure_summary(result, rcond=1e-10):
     }
 
 
-def merge_sparse_bins(x: np.array, weights: np.array, edges: np.array, min_neff: float = 30):
+def merge_sparse_bins(x: np.array, weights: np.array, edges: np.array, min_neff: float = 30, others=()):
     '''
-    Merge neighbouring bins until each holds at least min_neff effective events.
+    Merge neighbouring bins until each holds at least min_neff effective events of every sample.
 
-    Bins are accumulated from the left; a remainder at the right edge that is still below
-    min_neff is folded into the last complete bin, so the tail ends up in one wide bin.
+    Bins are accumulated from the left and closed once every sample reaches min_neff in them; a remainder at the right
+    edge that is still below min_neff is folded into the last complete bin, so the tail ends up in one wide bin.
 
     Args:
         x: values of the binned variable
         weights: event weights used to count effective events, n_eff = (sum w)^2 / sum w^2
         edges: initial (fine) bin edges
         min_neff: minimum effective number of events per merged bin
+        others: further samples (values, weights) that must also reach min_neff in every merged bin, e.g. the
+            reference sample of a closure test next to its target sample (x, weights)
     Returns:
         merged bin edges
     '''
     # float64 sums: with float32 weights the rounding depends on the CPU, and a running n_eff close to min_neff
     # would merge differently on different machines
-    weights = np.asarray(weights, dtype=np.float64)
-    sumw, _ = np.histogram(x, bins=edges, weights=weights)
-    sumw2, _ = np.histogram(x, bins=edges, weights=weights**2)
+    sumw, sumw2 = [], []
+    for values, w in [(x, weights), *others]:
+        w = np.asarray(w, dtype=np.float64)
+        sumw.append(np.histogram(values, bins=edges, weights=w)[0])
+        sumw2.append(np.histogram(values, bins=edges, weights=w**2)[0])
+    sumw, sumw2 = np.array(sumw), np.array(sumw2)  # [n_samples, n_bins]
     merged = [edges[0]]
-    acc, acc2 = 0.0, 0.0
-    for i in range(len(sumw)):
-        acc += sumw[i]
-        acc2 += sumw2[i]
-        if acc2 > 0 and acc**2 / acc2 >= min_neff:
+    acc, acc2 = np.zeros(len(sumw)), np.zeros(len(sumw))
+    for i in range(sumw.shape[1]):
+        acc += sumw[:, i]
+        acc2 += sumw2[:, i]
+        if (acc2 > 0).all() and (acc**2 / acc2 >= min_neff).all():
             merged.append(edges[i + 1])
-            acc, acc2 = 0.0, 0.0
+            acc, acc2 = np.zeros(len(sumw)), np.zeros(len(sumw))
     if merged[-1] != edges[-1]:
         if len(merged) > 1:
             merged[-1] = edges[-1]
@@ -230,12 +235,13 @@ def closure_metrics(
     (a) rate: one bin holding every event; estimates lambda(theta, nu) / lambda(theta, 0).
     (b) r_hat calibration: n_R_bins equal-count quantile bins R_b of f_hat from the nominal events.
     (c) group closure: cells of era x njets (group_caps merged) x n_group_bins bins R_b inside each group, neighbouring
-        bins merged until the target has n_eff >= min_neff (merge_sparse_bins; a cell without target events has no
-        target variance to test against); cells with fewer than min_events reference events, or still below min_neff
-        (a group too sparse for one cell), are left out. Groups come from network inputs, so a calibrated network
-        closes in every cell.
+        bins merged until the reference (w0) and the target (w1) both have n_eff >= min_neff (merge_sparse_bins; a
+        cell with few effective events in either sample has an unreliable variance estimate for that sample); cells
+        with fewer than min_events reference events, or still below min_neff in either sample (a group too sparse for
+        one cell), are left out. Groups come from network inputs, so a calibrated network closes in every cell.
     (d) per-feature closure: each feature of features_config in its fine binning K_b, out-of-range values in the edge
-        bins, merged to n_eff >= min_neff on the shifted sample (merge_sparse_bins, as the closure plots).
+        bins, merged until the reference (w0) and the target (w1) both have n_eff >= min_neff (merge_sparse_bins, as
+        the closure plots).
 
     Args:
         f_hat0: f_hat(x_i) = log r_hat(x_i) per reference row
@@ -286,32 +292,38 @@ def closure_metrics(
     cell0, cell1, cells = np.full(len(x0), -1), np.full(len(x1), -1), []
     for g in np.unique(g0, axis=0):
         in0, in1 = np.flatnonzero((g0 == g).all(1)), np.flatnonzero((g1 == g).all(1))
-        # neighbouring R_b bins merged until the target has n_eff >= min_neff (as the per-feature bins): a cell without
-        # target events has no target variance, so any w_hat_b > 0 would be a large pull, whatever the network does;
-        # target values outside the edges count in the edge bins, as to_bins puts them
+        # neighbouring R_b bins merged until the reference and the target both have n_eff >= min_neff (as the
+        # per-feature bins): Cov_bb sums both samples' squared weights, and a sample with few effective events in a
+        # cell gives an unreliable variance (a cell without target events has none, so any w_hat_b > 0 would be a
+        # large pull, whatever the network does); target values outside the edges count in the edge bins, as to_bins
+        # puts them
         q = quantile_edges(f_hat0[in0], n_group_bins)
-        q = merge_sparse_bins(np.clip(f_hat1[in1], q[0], q[-1]), w1[in1], q, min_neff)
+        q = merge_sparse_bins(np.clip(f_hat1[in1], q[0], q[-1]), w1[in1], q, min_neff, others=[(f_hat0[in0], w0[in0])])
         q = q if len(q) > 1 else np.repeat(q, 2)  # a constant f_hat (edges [c, c]) merges to one edge: one bin again
         b0, b1 = to_bins(f_hat0[in0], q), to_bins(f_hat1[in1], q)
         n_bins = len(q) - 1
+
+        def n_eff(bins, weights):
+            total = np.bincount(bins, weights=weights, minlength=n_bins)
+            total_sq = np.bincount(bins, weights=weights**2, minlength=n_bins)
+            return np.divide(total**2, total_sq, out=np.zeros(n_bins), where=total_sq > 0)
+
         # a group too sparse for one such cell keeps a cell below min_neff, which is left out
-        sum1 = np.bincount(b1, weights=w1[in1], minlength=n_bins)
-        sum1_sq = np.bincount(b1, weights=w1[in1] ** 2, minlength=n_bins)
-        n_eff1 = np.divide(sum1**2, sum1_sq, out=np.zeros(n_bins), where=sum1_sq > 0)
-        for j in np.flatnonzero((np.bincount(b0, minlength=n_bins) >= min_events) & (n_eff1 >= min_neff)):
+        dense = (n_eff(b0, w0[in0]) >= min_neff) & (n_eff(b1, w1[in1]) >= min_neff)
+        for j in np.flatnonzero((np.bincount(b0, minlength=n_bins) >= min_events) & dense):
             cell0[in0[b0 == j]], cell1[in1[b1 == j]] = len(cells), len(cells)
             cells.append((tuple(g.tolist()), int(j)))
     group = closure(cell0, cell1, len(cells))
     group['cells'] = cells
     group['cols'] = tuple(group_cols)
 
-    # (d) per feature, fine binning merged to n_eff >= min_neff on the shifted sample
+    # (d) per feature, fine binning merged until the reference and the target both have n_eff >= min_neff
     per_feature = {}
     for name, p in features_config.items():
         fine = np.linspace(p['min'], p['max'], p['nbins'] + 1)
         v0 = np.clip(x0[:, p['loc']], fine[0], np.nextafter(fine[-1], fine[0]))
         v1 = np.clip(x1[:, p['loc']], fine[0], np.nextafter(fine[-1], fine[0]))
-        edges = merge_sparse_bins(v1, w1, fine, min_neff)
+        edges = merge_sparse_bins(v1, w1, fine, min_neff, others=[(v0, w0)])
         per_feature[name] = closure(to_bins(v0, edges), to_bins(v1, edges), len(edges) - 1)
         per_feature[name]['edges'] = edges
 
