@@ -1,5 +1,5 @@
 import numpy as np
-import os, torch, tqdm, yaml
+import os, torch, yaml
 
 
 def find_zero_terms(
@@ -683,57 +683,3 @@ def sample_bootstrap(sample: torch.utils.data.TensorDataset, seed: int):
     """
     train, test = torch.utils.data.random_split(sample, [0.75, 0.25], generator=torch.Generator().manual_seed(seed))
     return train, test
-
-
-def toy_builder(
-    p_t: torch.tensor,
-    p_c: torch.tensor,
-    n_t: int,
-    M: float = None,
-    n_workers: int = 32,
-) -> torch.tensor:
-    """
-    Rejection-sampled toy of the target theta_t from candidate events at theta_c (methods write-up, rejection
-    sampled toys): event i is kept when U < alpha_i = p_t,i / (M p_c,i), until N_t ~ Poisson(n_t) events are kept.
-    Can be used for Asimov-like data if enough toys are generated.
-
-    Args:
-        p_t: target weight per event, e.g. w^s(theta_t) / sum w^s(theta_t)
-        p_c: candidate weight per event, e.g. w^s(theta_c) / sum w^s(theta_c)
-        n_t: expected number of toy events (mean of the Poisson draw of N_t)
-        M: bound with M > p_t / p_c for every event; the smallest valid value is used if None or too low
-        n_workers: number of workers to use in rejection sample loop
-    Returns:
-        event_mask: indices of the candidate events in the toy
-    """
-    min_m = (p_t / p_c).max().item()
-    print(f'Minimum M is {min_m:.2e}...')
-    if M is None:
-        M = min_m
-        print(f'No M chosen. Setting M to 0.01% above its minimum ({M:.2e})')
-    elif M <= min_m:
-        M = min_m
-        print(f'Choice of M is too low! Setting M to 0.01% above its minimum ({M:.2e})')
-    else:
-        print(f'Using M={M:.2f}')
-    threshold = p_t / (M * p_c)
-    indices = torch.tensor(range(0, p_c.shape[0]))
-    batches = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(threshold, indices), batch_size=1_000, shuffle=True, num_workers=n_workers
-    )
-    event_mask = []
-    print('Rejection sampler prepared')
-    enough = False
-    total = 0
-    n_events = np.random.poisson(n_t)
-    pbar = tqdm.tqdm(total=n_events)
-    while not enough:
-        last = total
-        for t, index in batches:
-            event_mask += [index[torch.where(torch.rand(len(t)) < t)[0]]]
-        total = sum(len(m) for m in event_mask)
-        pbar.update(total - last)
-        if total > n_events:
-            enough = True
-    pbar.close()
-    return torch.concatenate(event_mask)[:n_events]
