@@ -407,6 +407,8 @@ def test_closure_options():
     default = closure_options({'lumi': lumi})
     assert default['group_cols'] == (21, 19) and default['group_caps'] == {19: 4}
     assert default['group_labels'][19] == ('jets', {4: '≥4'})
+    assert default['min_neff'] == 30
+    assert closure_options({'lumi': lumi, 'method': 'kinematic_shift'})['min_neff'] == 100
     # without eras, the eras are labelled by their index
     assert default['value_names'][21] == {0: '0', 1: '1', 2: '2', 3: '3'} == default['group_labels'][21][1]
     named = closure_options({'lumi': lumi, 'eras': ['2016APV', '2016', '2017', '2018']})

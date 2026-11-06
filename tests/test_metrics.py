@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from scipy import stats
 
 from topsbi.tools.metrics import closure_metrics, matched_closure, merge_sparse_bins
 from topsbi.tools.plots import bin_tick_labels
@@ -111,16 +112,13 @@ def exact_log_r(x, njets):
     return 0.0002 + log_normal_pdf(x, 0.1, S1) - log_normal_pdf(x, 0, 1) + np.log(P1[njets - 2] / P0[njets - 2])
 
 
-@pytest.fixture
-def two_samples():
+def two_sample_toy(rng, n):
     """
     Reference and target samples sharing 99% of their events, with the exact log density ratio per row.
 
     x ~ N(0, 1), njets in 2..5, era in 0..3; the target moves x' = x + 0.1 + 0.05 e, gives 5% of events one more jet
     (at most 5) and reweights w1 = w0 exp(0.02 e'); 0.5% of events are only in one sample.
     """
-    rng = np.random.default_rng(3)
-    n = 60_000
     x = rng.normal(size=n)
     njets = rng.choice([2, 3, 4, 5], size=n, p=P0)
     era = rng.integers(0, 4, n)
@@ -140,6 +138,28 @@ def two_samples():
     f0 = exact_log_r(x, njets)[in0]
     f1 = exact_log_r(x_shift, njets_shift)[in1]
     return f0, (features(x, njets)[in0], w0[in0], events[in0]), f1, (features(x_shift, njets_shift)[in1], w1[in1], events[in1])
+
+
+@pytest.fixture
+def two_samples():
+    """two_sample_toy with 60,000 events"""
+    return two_sample_toy(np.random.default_rng(3), 60_000)
+
+
+def paired_toy(rng, n):
+    """
+    eft / weight_shift toy: the same events in both samples, x ~ N(0, 1), njets in 2..5, era in 0..3, w0 ~ Exp(1) and
+    w1 = w0 exp(0.2 x) g with a latent factor g ~ Gamma(4, 1/4) (mean 1), so the exact ratio is r(x) = exp(0.2 x)
+    """
+    x = np.zeros((n, 22))
+    x[:, 0] = rng.normal(size=n)
+    x[:, 19] = rng.integers(2, 6, n)
+    x[:, 21] = rng.integers(0, 4, n)
+    f = 0.2 * x[:, 0]
+    w0 = rng.exponential(1, n)
+    w1 = w0 * np.exp(f) * rng.gamma(4, 0.25, n)
+    events = np.arange(n)
+    return f, (x, w0, events), f, (x, w1, events)
 
 
 def test_matched_closure_sample_variances():
@@ -230,6 +250,53 @@ def test_closure_metrics_constant_f_hat(two_samples):
     performance, _ = closure_metrics(np.zeros(len(nominal[1])), nominal, np.zeros(len(shifted[1])), shifted, {})
     assert performance['r_ndf'] == 1
     assert 'feature_chi2_ndf' not in performance
+
+
+N_TOYS = 200
+TOY_EVENTS = 20_000
+
+
+def toy_chi2(toy, min_neff):
+    """chi2 and ndf of every closure test of closure_metrics over N_TOYS toys with the exact ratio as r_hat"""
+    rng = np.random.default_rng(11)
+    chi2, ndf = {}, {}
+    for _ in range(N_TOYS):
+        f0, nominal, f1, shifted = toy(rng, TOY_EVENTS)
+        _, details = closure_metrics(f0, nominal, f1, shifted, TWO_SAMPLE_FEATURES, min_neff=min_neff)
+        tests = {'r': details['r'], 'group': details['group'], **details['features']}
+        for name, test in tests.items():
+            chi2.setdefault(name, []).append(test['summary']['chi2'])
+            ndf.setdefault(name, []).append(test['summary']['ndf'])
+    return {name: (np.array(chi2[name]), np.array(ndf[name])) for name in chi2}
+
+
+def test_closure_chi2_distribution_paired():
+    """
+    eft / weight_shift: with the exact ratio as r_hat, chi2 = Delta^T Cov^+ Delta of every closure test follows
+    chi2_ndf over many toys (shared events, a latent variable, bins merged to n_eff >= 30 in both samples): Z = (chi2 -
+    ndf) / sqrt(2 ndf) has mean 0 and variance 1 and the p-values are uniform (KS test)
+    """
+    for name, (c, k) in toy_chi2(paired_toy, 30).items():
+        assert (k > 0).all(), name
+        z = (c - k) / np.sqrt(2 * k)
+        assert abs(z.mean()) < 4 / np.sqrt(N_TOYS), name
+        assert 0.6 < z.var() < 1.5, name
+        assert stats.kstest(stats.chi2.sf(c, k), 'uniform').pvalue > 1e-3, name
+
+
+def test_closure_chi2_distribution_two_samples():
+    """
+    kinematic_shift: events that migrate between bins make neighbouring bins anticorrelated, and the variance of those
+    combinations rests on few events, so chi2 computed with the sample's own Cov reads high on sparse bins (the excess
+    falls roughly as 1 / n_eff; with the covariance known chi2 follows chi2_ndf). With bins merged to n_eff >= 100, as
+    training uses for kinematic_shift, chi2 / ndf of every test stays within about 10% of 1 and Z scatters at most a
+    little more than a standard normal
+    """
+    for name, (c, k) in toy_chi2(two_sample_toy, 100).items():
+        assert (k > 0).all(), name
+        excess = c.sum() / k.sum() - 1
+        assert -4 * np.sqrt(2 / k.sum()) < excess < 0.12, name
+        assert ((c - k) / np.sqrt(2 * k)).var() < 1.6, name
 
 
 def test_bin_tick_labels():

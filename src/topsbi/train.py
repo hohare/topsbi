@@ -86,18 +86,22 @@ def check_config(config):
 
 def closure_options(config):
     """
-    Column layout of the closure tests and plots from the config: the era column (year_loc) and its names (eras), and
-    the group columns (closure_groups) with their caps and tick labels.
+    Options of the closure tests and plots from the config: the era column (year_loc) and its names (eras), the group
+    columns (closure_groups) with their caps and tick labels, and the minimum effective number of events per merged
+    bin.
 
-    Default groups: the era, and njets (column 19) with values >= 4 merged.
+    Default groups: the era, and njets (column 19) with values >= 4 merged. min_neff is 30, and 100 for
+    kinematic_shift: events that migrate between bins make neighbouring bins anticorrelated, and the variance of those
+    combinations rests on the few migrating events, so chi2 computed from the sample's own covariance reads high on
+    sparse bins; the excess falls roughly as 1 / n_eff.
     Args:
-        config: training config ('lumi'; optional 'year_loc', default 21; 'eras', era names indexed like lumi,
-            without it the eras are labelled by their index; 'closure_groups', a list of {loc, optional label,
-            optional cap})
+        config: training config ('lumi'; optional 'method'; optional 'year_loc', default 21; 'eras', era names indexed
+            like lumi, without it the eras are labelled by their index; 'closure_groups', a list of {loc, optional
+            label, optional cap})
     Returns:
-        dict: 'year_loc'; 'group_cols' (tuple) and 'group_caps' ({loc: cap}) for closure_metrics; 'group_labels'
-        ({loc: (label, {value: text})}) for group_pull_plot; 'value_names' ({loc: {value: text}}, the era names) for
-        the per-feature tick labels (closure_plot)
+        dict: 'year_loc'; 'group_cols' (tuple), 'group_caps' ({loc: cap}) and 'min_neff' for closure_metrics;
+        'group_labels' ({loc: (label, {value: text})}) for group_pull_plot; 'value_names' ({loc: {value: text}}, the
+        era names) for the per-feature tick labels (closure_plot)
     """
     year_loc = config.get('year_loc', 21)
     # era names for the plots; without 'eras' the eras are labelled by their index (0, 1, ...)
@@ -115,6 +119,7 @@ def closure_options(config):
         'year_loc': year_loc,
         'group_cols': tuple(group['loc'] for group in groups),
         'group_caps': group_caps,
+        'min_neff': 100 if config.get('method') == 'kinematic_shift' else 30,
         'group_labels': group_labels,
         'value_names': value_names,
     }
@@ -286,7 +291,11 @@ def closure_frame(net, kind, split, config, features_config):
         return {}
     groups = closure_options(config)
     _, details = closure_metrics(
-        *closure_inputs(net, kind, split), animate, group_cols=groups['group_cols'], group_caps=groups['group_caps']
+        *closure_inputs(net, kind, split),
+        animate,
+        group_cols=groups['group_cols'],
+        group_caps=groups['group_caps'],
+        min_neff=groups['min_neff'],
     )
     return details['features']
 
@@ -377,6 +386,7 @@ def summary_plots(
         features_config,
         group_cols=groups['group_cols'],
         group_caps=groups['group_caps'],
+        min_neff=groups['min_neff'],
     )
     os.makedirs(label, mode=0o755, exist_ok=True)
     h = hypothesis(config)
