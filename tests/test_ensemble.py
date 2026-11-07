@@ -1,8 +1,12 @@
+import types
+
+import numpy as np
 import pytest
 import torch
+import yaml
 
 import topsbi.tools.build_ratio as build
-from topsbi.tools.data import get_lower_tri
+from topsbi.tools.data import expansion, get_lower_tri
 
 N_EVENTS = 6
 # two WCs: get_lower_tri([1, a, b]) has 6 terms, 3 of which are kept
@@ -18,10 +22,13 @@ class FakeRatioFit:
     """Stands in for RatioFit with known per-event coefficients Gamma."""
 
     masks = {}
+    backgrounds = {}
 
     def __init__(self, config, features):
         self.finite, self.Gamma = SEEDS[config['sm']]
         self.mask = self.masks.get(config['sm'], MASK)
+        self.n_wcs = 2
+        self.background_processes = self.backgrounds.get(config['sm'], [])
         self.residuals = torch.rand(int(self.finite.sum()))
         self.rank = int(self.mask.sum())  # full column rank, as lstsq reports for a well-posed fit
 
@@ -30,6 +37,7 @@ class FakeRatioFit:
 def ensemble_config(monkeypatch):
     monkeypatch.setattr(build, 'RatioFit', FakeRatioFit)
     FakeRatioFit.masks = {}
+    FakeRatioFit.backgrounds = {}
     return {
         'device': 'cpu',
         'c0': [1.0, 0.0, 0.0],
@@ -81,3 +89,142 @@ def test_is_cross_term():
 
     assert is_cross_term('ctGRe_cQd1/p_one_p_point_five')
     assert not is_cross_term('ctGRe/p_one') and not is_cross_term('sm')
+
+
+def test_ensemble_rejects_seeds_with_different_background_processes(ensemble_config):
+    FakeRatioFit.backgrounds = {'s2': ['bg']}
+    with pytest.raises(ValueError, match='background_processes'):
+        build.Ensemble(ensemble_config, torch.zeros(N_EVENTS, 2))
+
+
+# RatioFit with a background column: one WC cA and one background process bg, networks trained against the
+# reference theta_g = (cA = 1, mu_bg = 1) that return the true ratio of the toy
+N_TOY = 200
+TOY_C0 = [1.0, 1.0, 1.0]
+TOY_SM = [1.0, 0.0, 1.0]
+TOY_POINTS = {
+    'cA/p_half': [1.0, 0.5, 1.0],
+    'cA/n_half': [1.0, -0.5, 1.0],
+    'cA/p_two': [1.0, 2.0, 1.0],
+    'cA/n_two': [1.0, -2.0, 1.0],
+}
+MU_POINTS = {'bg/mu_0': [1.0, 1.0, 0.0], 'bg/mu_2': [1.0, 1.0, 2.0]}
+
+
+def toy_components(x):
+    """True s_q(x) (SM, cA, cA^2) and b(x) of every event, [N, 4]; every weight in the toy's range is positive."""
+    x = x[:, 0].astype(np.float64)
+    return np.stack([np.ones_like(x), 0.5 * x, 0.3 + x**2, 0.4 * (1 - x) + 0.1], axis=1)
+
+
+def toy_ratio(x, point, reference):
+    """True r(x; point) against reference; without strengths in the points the background is left out."""
+    T, T0 = (expansion(p, 1, dtype=torch.float64).numpy() for p in (point, reference))
+    c = toy_components(x)[:, : len(T)]
+    return c @ T / (c @ T0)
+
+
+def toy_gamma(x, reference):
+    """True per-event coefficients Gamma [K, N] for the reference."""
+    c = toy_components(x)[:, : len(expansion(reference, 1))]
+    return (c / (c @ expansion(reference, 1, dtype=torch.float64).numpy())[:, None]).T
+
+
+class ToyNetwork:
+    """Stands in for NetworkRatio: the true ratio of the toy at the c1 of its training config."""
+
+    def __init__(self, config, n_features, device='cpu'):
+        with open(config) as f:
+            self.config = yaml.safe_load(f)
+
+    def __call__(self, features):
+        return torch.from_numpy(toy_ratio(features.numpy(), self.config['c1'], self.config['c0'])).float()
+
+
+def toy_configs(root, points, sm, reference, background_processes=('bg',)):
+    """Training configs of the toy networks under root, {name: path}, the SM network under 'sm'."""
+    paths = {}
+    for name, point in {**points, 'sm': sm}.items():
+        directory = root / name
+        directory.mkdir(parents=True)
+        config = {'name': str(directory), 'wcs': ['cA'], 'c0': reference, 'c1': point}
+        if background_processes:
+            config['background_processes'] = list(background_processes)
+        (directory / 'training.yml').write_text(yaml.safe_dump(config))
+        paths[name] = str(directory / 'training.yml')
+    return paths
+
+
+def seed_config(paths):
+    return {'sm': paths['sm'], 'networks': [p for n, p in paths.items() if n != 'sm']}
+
+
+@pytest.fixture
+def toy(tmp_path, monkeypatch):
+    monkeypatch.setattr(build, 'NetworkRatio', ToyNetwork)
+    x = np.random.default_rng(0).uniform(0, 1, (N_TOY, 1))
+    return types.SimpleNamespace(root=tmp_path, x=x, features=torch.from_numpy(x).float())
+
+
+def fit_toy(toy, points, sm=TOY_SM, reference=TOY_C0, background_processes=('bg',), name='fit'):
+    paths = toy_configs(toy.root / name, points, sm, reference, background_processes)
+    config = {**seed_config(paths), 'features': {'x': {'loc': 0}}, 'device': 'cpu'}
+    return build.RatioFit(config, toy.features)
+
+
+def test_ratio_fit_background_column(toy):
+    fit = fit_toy(toy, {**TOY_POINTS, **MU_POINTS})
+    assert fit.n_wcs == 1 and fit.background_processes == ['bg']
+    assert fit.mask.all()
+    assert np.allclose(fit.Gamma.numpy(), toy_gamma(toy.x, TOY_C0), rtol=1e-3, atol=1e-4)
+    point = [1.0, 0.3, 0.7]
+    assert np.allclose(fit(point).numpy(), toy_ratio(toy.x, point, TOY_C0), rtol=1e-3, atol=1e-4)
+
+
+def test_ratio_fit_blind_background_column(toy):
+    # no network moves mu_bg: the column is dropped and the SM column holds the background exactly
+    fit = fit_toy(toy, TOY_POINTS)
+    assert fit.mask.tolist() == [True, True, True, False]
+    gamma = toy_gamma(toy.x, TOY_C0)
+    expected = np.vstack([gamma[0] + gamma[3], gamma[1:3]])
+    assert np.allclose(fit.Gamma.numpy(), expected, rtol=1e-3, atol=1e-4)
+    point = [1.0, 0.3, 1.0]
+    assert np.allclose(fit(point).numpy(), toy_ratio(toy.x, point, TOY_C0), rtol=1e-3, atol=1e-4)
+    with pytest.raises(ValueError, match='no network moved'):
+        fit([1.0, 0.3, 0.7])
+
+
+def test_ratio_fit_without_backgrounds(toy):
+    points = {name: point[:2] for name, point in TOY_POINTS.items()}
+    fit = fit_toy(toy, points, sm=[1.0, 0.0], reference=[1.0, 1.0], background_processes=())
+    assert fit.background_processes == [] and fit.mask.tolist() == [True, True, True]
+    assert np.allclose(fit.Gamma.numpy(), toy_gamma(toy.x, [1.0, 1.0]), rtol=1e-3, atol=1e-4)
+    assert torch.allclose(fit([1.0, 0.3]), get_lower_tri([1.0, 0.3]) @ fit.Gamma)
+
+
+def test_ratio_fit_checks_background_processes(toy):
+    paths = toy_configs(toy.root / 'mixed', {**TOY_POINTS, **MU_POINTS}, TOY_SM, TOY_C0)
+    config = yaml.safe_load(open(paths['bg/mu_0']))
+    del config['background_processes']
+    with open(paths['bg/mu_0'], 'w') as f:
+        yaml.safe_dump(config, f)
+    with pytest.raises(ValueError, match='background_processes'):
+        build.RatioFit({**seed_config(paths), 'features': {'x': {'loc': 0}}, 'device': 'cpu'}, toy.features)
+    # the SM row is (theta_SM, mu = 1): an SM network at another strength is refused
+    with pytest.raises(ValueError, match='not trained at theta_1'):
+        fit_toy(toy, {**TOY_POINTS, **MU_POINTS}, sm=[1.0, 0.0, 0.0], name='sm_mu_0')
+
+
+def test_ensemble_background_column(toy):
+    paths = toy_configs(toy.root / 'ensemble', {**TOY_POINTS, **MU_POINTS}, TOY_SM, TOY_C0)
+    config = {'device': 'cpu', 'c0': TOY_C0, 'features': {'x': {'loc': 0}}, 'seeds': {0: seed_config(paths)}}
+    config['seeds'][1] = config['seeds'][0]
+    ens = build.Ensemble(config, toy.features)
+    assert ens.n_wcs == 1 and ens.background_processes == ['bg'] and ens.mask.all()
+    point = [1.0, 0.3, 0.7]
+    assert np.allclose(ens(point).numpy(), toy_ratio(toy.x, point, TOY_C0), rtol=1e-3, atol=1e-4)
+    blind = toy_configs(toy.root / 'blind', TOY_POINTS, TOY_SM, TOY_C0)
+    ens = build.Ensemble({**config, 'seeds': {0: seed_config(blind)}}, toy.features)
+    assert not ens.mask[-1]
+    with pytest.raises(ValueError, match='no network moved'):
+        ens(point)

@@ -14,7 +14,7 @@ import yaml
 import topsbi.validation as val
 from topsbi.model.net import Net
 from topsbi.tools.build_ratio import NetworkRatio
-from topsbi.tools.data import get_lower_tri
+from topsbi.tools.data import expansion, get_lower_tri
 from topsbi.tools.ensembleCache import (
     EnsembleCache,
     SeedCollector,
@@ -26,6 +26,7 @@ from topsbi.tools.ensembleCache import (
     quantile_binning,
     write_cache,
 )
+from topsbi.tools.plots import component_kinds, component_tex, network_tex, unit_tex, wc_tex
 
 WCS = ['cA', 'cB']
 N_EVENTS = 3000
@@ -118,7 +119,10 @@ def build_toy(root, inject=None, members=MEMBERS):
         collector(e, fit)
         Gamma, rank[e] = Gamma + fit.Gamma / len(members), int(fit.rank)
     ensemble = types.SimpleNamespace(
-        Gamma=Gamma, mask=torch.ones(Theta.shape[1], dtype=torch.bool), finite=torch.ones(N_EVENTS, dtype=torch.bool)
+        Gamma=Gamma,
+        mask=torch.ones(Theta.shape[1], dtype=torch.bool),
+        finite=torch.ones(N_EVENTS, dtype=torch.bool),
+        background_processes=[],
     )
     ensemble.rank = rank
     write_cache(path, config, ensemble)
@@ -426,6 +430,7 @@ def toy_cache(path, config, x, mask=None):
         mask=torch.ones(Theta.shape[1], dtype=torch.bool) if mask is None else mask,
         finite=torch.ones(len(x), dtype=torch.bool),
         rank=rank,
+        background_processes=[],
     )
     write_cache(path, config, ensemble)
 
@@ -648,3 +653,181 @@ def test_run_backgrounds(backgrounds, tmp_path):
     assert not (backgrounds.root / 'validation' / 'plots').exists()  # the bias test did not run
     with pytest.raises(SystemExit, match="'signal'"):
         val.run_backgrounds({**config, 'backgrounds': {'signal': config['backgrounds']['tW']}})
+
+
+# background columns after the expansion, T(theta, mu) = [T(theta), mu_bg] (one process, bg)
+BG = ['bg']
+MASK_BG = np.ones(7, dtype=bool)
+
+
+def test_component_labels_background():
+    labels, kinds = component_labels(WCS, MASK_BG, BG)
+    assert labels == ['sm', 'cA', 'cA^2', 'cB', 'cB*cA', 'cB^2', 'mu_bg']
+    assert kinds[-1] == 'background' and component_kinds(labels) == kinds
+    blind = MASK_BG.copy()
+    blind[-1] = False
+    assert component_labels(WCS, blind, BG)[0] == labels[:-1]
+    with pytest.raises(ValueError):
+        component_labels(WCS, MASK_BG)
+    assert component_tex('mu_bg') == r'$\mu_{\rm bg}$'
+
+
+def test_network_and_unit_tex_background():
+    points = {
+        'cA/p_one': [1.0, 1.0, 0.0, 1.0],
+        'cA_cB/p_one_n_one': [1.0, 1.0, -1.0, 1.0],
+        'bg/mu_0': [1.0, 0.5, -0.5, 0.0],
+        'bg/mu_2': [1.0, 0.5, -0.5, 2.0],
+        'sm': [1.0, 0.0, 0.0, 1.0],
+    }
+    Theta = np.stack([expansion(p, 2, dtype=torch.float64).numpy() for p in points.values()])
+    a, b = wc_tex('cA'), wc_tex('cB')
+    expected = {
+        'cA/p_one': f'${a} = 1.00$',
+        'cA_cB/p_one_n_one': f'${a}, {b} = 1.00, -1.00$',
+        'bg/mu_0': r'$\theta_g, \mu_{\rm bg} = 0.00$',
+        'bg/mu_2': r'$\theta_g, \mu_{\rm bg} = 2.00$',
+        'sm': 'sm',
+    }
+    assert network_tex(Theta, list(points), WCS, MASK_BG, BG, [1.0, 0.5, -0.5, 1.0]) == expected
+    # without backgrounds or reference the labels are the WC values, as before
+    plain = network_tex(Theta[:, :6], list(points), WCS, np.ones(6, dtype=bool))
+    assert plain['cA/p_one'] == expected['cA/p_one'] and plain['bg/mu_0'] == f'${a}, {b} = 0.50, -0.50$'
+    # an SM reference never labels a point theta_g
+    assert network_tex(Theta, list(points), WCS, MASK_BG, BG, [1.0, 0.0, 0.0, 1.0])['bg/mu_0'] == (
+        f'${a}, {b}, \\mu_{{\\rm bg}} = 0.50, -0.50, 0.00$'
+    )
+    assert unit_tex({'points': [{'theta': [1.0, 2.0, 0.0, 1.0]}]}, WCS) == f'${a} = 2.00$'
+
+
+def test_scan_moments_background():
+    bounds = {'cA': 0.5, 'cB': 2.0}
+    plain = val.scan_moments(WCS, bounds, np.ones(6, bool))
+    G = val.scan_moments(WCS, bounds, MASK_BG, n_background=1)
+    # mu_bg = 1 is a constant, like the SM entry
+    assert np.allclose(G[:6, :6], plain) and np.allclose(G[6, :6], plain[0]) and np.isclose(G[6, 6], 1)
+    blind = MASK_BG.copy()
+    blind[-1] = False
+    assert np.allclose(val.scan_moments(WCS, bounds, blind, n_background=1), plain)
+    weights = val.objective_weights({'G': 'scan', 'bounds': bounds}, WCS, MASK_BG, [], None, None, 1)
+    assert np.allclose(weights, G)
+
+
+def test_candidate_units_background(null):
+    misclosure = {n: 0.01 for n in null.names}
+
+    def yield_ratio(theta):
+        return 1 + theta[1] ** 2 + theta[2] ** 2
+
+    plain = val.candidate_units(WCS, null.Theta, null.names, misclosure, np.ones(6, bool), yield_ratio, 9.0)
+    Theta = np.hstack([null.Theta, np.ones((len(null.Theta), 1))])  # every network at mu_bg = 1
+    extra = [('cA/p_two', [1.0, 2.0, 0.0, 0.0])]
+    units = val.candidate_units(WCS, Theta, null.names, misclosure, MASK_BG, yield_ratio, 9.0, extra, BG)
+    cross = [u for u in units if u['kind'] == 'cross']
+    assert len(cross) == len(plain)
+    for u, v in zip(cross, plain):
+        assert [p['theta'] for p in u['points']] == [p['theta'] + [1.0] for p in v['points']]
+        assert np.allclose(u['rows'], np.hstack([v['rows'], np.ones((len(v['rows']), 1))]))
+    (retrain,) = [u for u in units if u['kind'] == 'retrain']
+    assert retrain['points'][0]['theta'] == [1.0, 2.0, 0.0, 0.0] and retrain['rows'][0, -1] == 0
+
+
+def background_column_toy(root, moved):
+    """
+    Validation config and cache of a toy with one background column: the toy signal of truth() plus a background
+    b(x) on the same events; members fitted at the toy points (mu_bg = 1), the SM point and, when moved, at
+    mu_bg = 0 and 2, against theta_0 = (SM, mu_bg = 1).
+    """
+    x, weights, _ = truth()
+    b = 0.3 * weights[:, 0] * (1 + x[:, 0])
+    coefs = np.hstack([weights, b[:, None]]) / 1000
+    c0 = [1.0, 0.0, 0.0, 1.0]
+    points = {n: (1.0, *POINTS[n], 1.0) for n in POINTS}
+    if moved:
+        points.update({'bg/mu_0': (1.0, 0.0, 0.0, 0.0), 'bg/mu_2': (1.0, 0.0, 0.0, 2.0)})
+    points['sm'] = tuple(c0)
+    names = list(points)
+    Theta = np.stack([expansion(list(p), 2, dtype=torch.float64).numpy() for p in points.values()])
+    mask = np.ones(7, dtype=bool)
+    mask[-1] = moved
+    full = np.hstack([weights, b[:, None]])
+    R_true = Theta @ (full / (full @ expansion(c0, 2, dtype=torch.float64).numpy())[:, None]).T
+    Theta = Theta[:, mask]
+    root.mkdir(parents=True, exist_ok=True)
+    data = root / 'data.p'
+    torch.save(torch.utils.data.TensorDataset(torch.from_numpy(x).float(), torch.from_numpy(coefs)), data)
+    seeds = {}
+    for e in MEMBERS:
+        paths = []
+        for name in names:
+            directory = root / f'seed_{e}' / name
+            directory.mkdir(parents=True)
+            (directory / 'model.pt').write_bytes(f'{name} {e}'.encode())
+            (directory / 'training.yml').write_text(yaml.safe_dump({'name': str(directory)}))
+            paths.append(str(directory / 'training.yml'))
+        seeds[e] = {'networks': paths[:-1], 'sm': paths[-1]}
+    config = {
+        'name': str(root / 'validation'),
+        'data': str(data),
+        'c0': c0,
+        'wcs': WCS,
+        'lumi': [1.0, 1.0, 1.0],
+        'year_loc': 2,
+        'device': 'cpu',
+        'features': {name: {**spec, 'label': name} for name, spec in FEATURES.items()},
+        'seeds': seeds,
+        'bias': {'n_bins': 10},
+    }
+    path = f'{config["name"]}/ensemble'
+    collector = SeedCollector(seeds, path)
+    Gamma, rank = 0, {}
+    for e in MEMBERS:
+        rng = np.random.default_rng(300 + e)
+        fit = fake_fit(Theta, R_true * (1 + NOISE * rng.standard_normal(R_true.shape)))
+        collector(e, fit)
+        Gamma, rank[e] = Gamma + fit.Gamma / len(MEMBERS), int(fit.rank)
+    ensemble = types.SimpleNamespace(
+        Gamma=Gamma,
+        mask=torch.from_numpy(mask),
+        finite=torch.ones(N_EVENTS, dtype=torch.bool),
+        rank=rank,
+        background_processes=BG,
+    )
+    write_cache(path, config, ensemble)
+    return config
+
+
+def test_cache_background_column(tmp_path):
+    config = background_column_toy(tmp_path, moved=True)
+    cache = EnsembleCache(f'{config["name"]}/ensemble')
+    assert cache.background_processes == BG and cache.n_wcs == 2
+    point = [1.0, 0.5, -0.5, 0.7]
+    assert np.allclose(cache(point), expansion(point, 2, dtype=torch.float64).numpy() @ cache.Gamma)
+    blind = EnsembleCache(f'{background_column_toy(tmp_path / "blind", moved=False)["name"]}/ensemble')
+    assert np.allclose(blind(point[:3] + [1.0]), expansion(point[:3], 2, dtype=torch.float64).numpy() @ blind.Gamma)
+    with pytest.raises(ValueError, match='no network moved'):
+        blind(point)
+    # a cache written before background_processes was recorded reads as having none
+    manifest = yaml.safe_load(open(f'{config["name"]}/ensemble/ensemble.yml'))
+    del manifest['background_processes']
+    with open(f'{config["name"]}/ensemble/ensemble.yml', 'w') as f:
+        yaml.safe_dump(manifest, f)
+    assert EnsembleCache(f'{config["name"]}/ensemble').background_processes == []
+
+
+@pytest.mark.parametrize('moved', [True, False], ids=['moved', 'blind'])
+def test_main_background_column(tmp_path, moved):
+    # the whole validation on a background column; in the blind fit the SM column holds b, and closes only
+    # because its true weights include b too
+    config = background_column_toy(tmp_path, moved)
+    path = tmp_path / 'validation.yml'
+    path.write_text(yaml.safe_dump(config))
+    val.main(str(path))
+    diagnostics = yaml.safe_load(open(f'{config["name"]}/ensemble_diagnostics.yml'))
+    assert ('mu_bg' in diagnostics['components']) == moved
+    if moved:
+        assert diagnostics['components']['mu_bg']['kind'] == 'background'
+    assert diagnostics['flagged'] == []
+    proposed = yaml.safe_load(open(f'{config["name"]}/proposed_points.yml'))
+    assert proposed['background_processes'] == BG
+    assert all(len(p['theta']) == 4 and p['theta'][3] == 1.0 for p in proposed['points'])

@@ -1,5 +1,5 @@
 from topsbi.tools.build_ratio import Ensemble, NetworkRatio, seed_map
-from topsbi.tools.data import get_lower_tri, sample_weight
+from topsbi.tools.data import expansion, sample_weight
 from topsbi.tools.ensembleCache import (
     EnsembleCache,
     SeedCollector,
@@ -270,7 +270,8 @@ def background_diagnostics(config, caches, ratios):
       <Gamma>_e on the events every member keeps and for each member e on its own kept events;
     - sum w r_hat(x; theta_SM) against sum w on the events every member keeps, with w = L_era w_ref x 1000;
     and for every background network process q the seed spread of r_hat(x; q), the rms over seeds divided by the
-    seed mean per event (median and 90th percentile), on the signal events and on q's own events.
+    seed mean per event (median and 90th percentile), on the signal events and on q's own events. When the ensemble
+    has background_processes, theta_SM holds every strength at mu_p = 1.
 
     Args:
         config: validation config with c0, lumi, backgrounds (optional year_loc)
@@ -281,15 +282,18 @@ def background_diagnostics(config, caches, ratios):
          {'median', 'p90'}}}, 'seeds'}
     """
     c0 = [float(c) for c in config['c0']]
-    points = {'theta_sm': [1.0] + [0.0] * (len(c0) - 1), 'theta_g': c0}
     out = {}
     for p, cache in caches.items():
+        points = {
+            'theta_sm': [1.0] + [0.0] * cache.n_wcs + [1.0] * len(cache.background_processes),
+            'theta_g': c0,
+        }
         tensors = torch.load(f'{config["backgrounds"][p]}/validation.p', weights_only=False, mmap=True).tensors
         w = sample_weight(tensors, 'nominal', config).numpy().astype(np.float64)
         kept = ratios[p]['finite']
         nonpositive = {}
         for key, theta in points.items():
-            T = get_lower_tri(theta, dtype=torch.float64).numpy()[cache.mask]
+            T = expansion(theta, cache.n_wcs, dtype=torch.float64).numpy()[cache.mask]
             members = {
                 int(s): float(np.mean(T @ np.asarray(cache.seed_Gamma[s], dtype=np.float64) <= 0)) for s in cache.seeds
             }
@@ -702,25 +706,28 @@ def network_misclosure(networks, sm_yield, per_seed=False):
     return {name: float(np.sqrt(np.mean(v))) for name, v in m2.items()}
 
 
-def scan_moments(wcs, bounds, mask, mode='box', shape='uniform'):
+def scan_moments(wcs, bounds, mask, mode='box', shape='uniform', n_background=0):
     """
-    Second moments G = E[T(theta) T(theta)^T] over the kept get_lower_tri columns, for theta in the scan region.
-    Every entry of T is a monomial of degree <= 2, so G needs moments of each theta up to 4th order:
+    Second moments G = E[T(theta, mu) T(theta, mu)^T] over the kept columns of T(theta, mu), for theta in the scan
+    region and every background strength mu_p fixed at 1. Every entry of T(theta) is a monomial of degree <= 2, so G
+    needs moments of each theta up to 4th order:
     uniform on [-a, a]: E[theta^n] = a^n / (n + 1); gaussian N(0, a^2): E[theta^n] = (n - 1)!! a^n; 0 for odd n.
+    A background entry mu_p = 1 is a constant, like the SM entry.
 
     Args:
         wcs: WC names in get_lower_tri order
         bounds: {wc: a} scan half-range (uniform) or width (gaussian); WCs not listed are fixed at 0
-        mask: kept get_lower_tri columns
+        mask: kept columns of T(theta, mu)
         mode: 'box' (all listed WCs varied together, profiled or multi-WC scans) or '1d' (average over 1D scans,
             one WC varied at a time)
         shape: 'uniform' or 'gaussian'
+        n_background: number of background columns K after T(theta)
     Returns:
         [K, K] G
     """
     n = len(wcs) + 1
     rows, cols = np.tril_indices(n)
-    powers = np.zeros((len(rows), n), dtype=int)  # exponent of each theta in each column of T
+    powers = np.zeros((len(rows) + n_background, n), dtype=int)  # exponent of each theta in each column of T
     np.add.at(powers, (np.arange(len(rows)), rows), 1)
     np.add.at(powers, (np.arange(len(rows)), cols), 1)
     powers = powers[np.asarray(mask)][:, 1:]  # drop the constant SM entry (theta_0 = 1)
@@ -736,15 +743,17 @@ def scan_moments(wcs, bounds, mask, mode='box', shape='uniform'):
     return np.mean([moments(np.where(np.arange(len(wcs)) == i, a, 0.0)) for i in np.flatnonzero(a)], axis=0)
 
 
-def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield, extra=()):
+def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield, extra=(), background_processes=()):
     """
-    Candidate training units for the point search. Each unit lists its points theta, their rows T(theta)[mask],
-    and the misclosure assumed for their networks.
+    Candidate training units for the point search. Each unit lists its points (theta, mu), their rows
+    T(theta, mu)[mask], and the misclosure assumed for their networks. New points hold every background strength
+    mu_p at 1.
 
     - cross: for every kept interference column (i, j) of T(theta), the 4 points (+-theta_i, +-theta_j) for every pair
       of single-WC magnitude levels of the two WCs, a level pairing the same-rank positive and negative single-WC
       values (assumed m: the worse of the two source networks)
-    - extra: points to retrain, e.g. the points suspects() marks to drop, as (name, theta) with assumed m = median m
+    - extra: points to retrain, e.g. the points suspects() marks to drop, as (name, point) with assumed m = median m;
+      the point is the network's c1, strengths included
     Units whose points all exist already, or with any point above max_yield (inclusive yield / SM yield), are dropped.
 
     Args:
@@ -752,15 +761,17 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
         Theta: [n_networks, K] expanded training points of the current design
         names: network names, rows of Theta
         misclosure: output of network_misclosure
-        mask: kept get_lower_tri columns
-        yield_ratio: callable theta -> inclusive yield at theta / SM yield
+        mask: kept columns of T(theta, mu)
+        yield_ratio: callable point -> inclusive yield at the point / SM yield
         max_yield: largest yield ratio allowed for a new point
+        extra: (name, point) pairs to retrain
+        background_processes: names of the background processes, in the order of their columns
     Returns:
         [dict(kind, points, rows, misclosure, max_yield_ratio)]
     """
     n = len(wcs) + 1
     rows, cols = np.tril_indices(n)
-    kept = [(int(i), int(j)) for i, j, keep in zip(rows, cols, mask) if keep]
+    kept = [(int(i), int(j)) for i, j, keep in zip(rows, cols, mask[: len(rows)]) if keep]
     # the linear columns of Theta are the WC values of each training point
     thetas = np.zeros((len(Theta), n))
     thetas[:, 0] = 1
@@ -768,17 +779,18 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
         if (i, 0) in kept:
             thetas[:, i] = Theta[:, kept.index((i, 0))]
     existing = {tuple(np.round(t, 6)) for t in thetas}
+    nominal = [1.0] * len(background_processes)
 
     def make(kind, points, m, new_only=True):
         yields = [yield_ratio(p['theta']) for p in points]
         if max(yields) > max_yield:
             return None
-        if new_only and all(tuple(np.round(p['theta'], 6)) in existing for p in points):
+        if new_only and all(tuple(np.round(p['theta'][:n], 6)) in existing for p in points):
             return None
         return {
             'kind': kind,
             'points': points,
-            'rows': np.array([get_lower_tri(p['theta'], dtype=torch.float64).numpy()[mask] for p in points]),
+            'rows': np.array([expansion(p['theta'], n - 1, dtype=torch.float64).numpy()[mask] for p in points]),
             'misclosure': np.array(m),
             'max_yield_ratio': float(max(yields)),
         }
@@ -801,7 +813,7 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
                 points, m = [], []
                 for va, ma, la in level_a:
                     for vb, mb, lb in level_b:
-                        theta = [1.0] + [0.0] * len(wcs)
+                        theta = [1.0] + [0.0] * len(wcs) + nominal
                         theta[i], theta[j] = float(va), float(vb)
                         label = f'{wcs[i - 1]}_{os.path.basename(la)}_{wcs[j - 1]}_{os.path.basename(lb)}'
                         points.append({'name': label, 'theta': theta})
@@ -814,11 +826,12 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
     return [u for u in units if u is not None]
 
 
-def objective_weights(cfg, wcs, mask, flagged, Theta, m):
+def objective_weights(cfg, wcs, mask, flagged, Theta, m, n_background=0):
     """
     The weight matrix G of the point-search objective tr(Cov(gamma_hat) G).
 
-    - G: scan  -> scan-region second moments E[T(theta) T(theta)^T] (scan_moments with cfg bounds, mode, shape)
+    - G: scan  -> scan-region second moments E[T(theta, mu) T(theta, mu)^T] with every mu_p = 1 (scan_moments with
+      cfg bounds, mode, shape)
     - G: flagged (default) -> diag(g_q / Var(gamma_hat_q)), Var(gamma_hat_q) propagated for the current design
       (sigma0_2 in code), with objective weights g_q (new symbol, g in code) = 1 for flagged components and
       cfg['unflagged_weight'] (0.1) for the others, or 1 for all if none is flagged. Dividing by Var(gamma_hat_q)
@@ -828,15 +841,16 @@ def objective_weights(cfg, wcs, mask, flagged, Theta, m):
     Args:
         cfg: point_search section of the config
         wcs: WC names in get_lower_tri order
-        mask: kept get_lower_tri columns
+        mask: kept columns of T(theta, mu)
         flagged: indices of the flagged components
         Theta: [n_networks, K] expanded training points of the current design
         m: [n_networks] misclosure of each network
+        n_background: number of background columns after T(theta)
     Returns:
         [K, K] G
     """
     if cfg.get('G', 'flagged') == 'scan':
-        return scan_moments(wcs, cfg['bounds'], mask, cfg.get('mode', 'box'), cfg.get('shape', 'uniform'))
+        return scan_moments(wcs, cfg['bounds'], mask, cfg.get('mode', 'box'), cfg.get('shape', 'uniform'), n_background)
     Hi = np.linalg.pinv(Theta.T @ Theta)
     sigma0_2 = np.diag(Hi @ (Theta.T @ (m[:, None] ** 2 * Theta)) @ Hi)
     g = np.full(Theta.shape[1], cfg.get('unflagged_weight', 0.1) if flagged else 1.0)
@@ -937,8 +951,8 @@ def write_results(
 ):
     """
     Write ensemble_diagnostics.yml (fit health, bias test, attribution, suspects, point search) and
-    proposed_points.yml (the points of the units chosen by the search) to name. Every key is listed in
-    docs/validation.md.
+    proposed_points.yml (the points of the units chosen by the search, background strengths last) to name. Every key
+    is listed in docs/validation.md.
     """
     n_top = config.get('n_top_networks', 5)
     features = binning['names']
@@ -1009,6 +1023,7 @@ def write_results(
         yaml.safe_dump(
             {
                 'wcs': list(config['wcs']),
+                'background_processes': list(cache.background_processes),
                 'points': [
                     {'name': p['name'], 'kind': u['kind'], 'theta': list(map(float, p['theta']))}
                     for u in chosen
@@ -1093,14 +1108,22 @@ def main(config_path, refit=False, backgrounds=False):
         sys.exit(f'[error]: lumi has {len(config["lumi"])} eras but the data use era index {int(eras.max())}')
     lumi = torch.tensor(config['lumi'], dtype=torch.float64)[eras]
     all_weights = lumi[:, None] * coefs.to(torch.float64) * 1000
-    w0 = all_weights @ get_lower_tri(config['c0'], dtype=torch.float64)
+    w0 = all_weights @ expansion(config['c0'], len(config['wcs']), dtype=torch.float64)
 
     # ensemble: cached, or fitted only with --refit
     cache = load_ensemble(config, features, refit)
     residual_outliers = plot_residuals(cache.residuals, f'{name}/plots/fit_residuals.png')
     wcs = cache.manifest['wcs']
+    n_background = len(cache.background_processes)
+    n_theta = len(cache.mask) - n_background
     weights = all_weights[:, torch.from_numpy(cache.mask)]
-    labels, kinds = component_labels(wcs, cache.mask)
+    # a background column no network moved is held by the SM column of Gamma (RatioFit): its true weights go there
+    unmoved = [c for c in range(n_theta, len(cache.mask)) if not cache.mask[c]]
+    if unmoved:
+        weights[:, 0] += all_weights[:, unmoved].sum(1)
+    labels, kinds = component_labels(wcs, cache.mask, cache.background_processes)
+    # (theta_SM, mu = 1): the SM with every background at its nominal yield
+    sm_point = [1.0] + [0.0] * len(wcs) + [1.0] * n_background
 
     # bias test of every gamma component
     cfg = config.get('bias', {})
@@ -1200,7 +1223,7 @@ def main(config_path, refit=False, backgrounds=False):
             )['all']
 
     first = cache.network(cache.seeds[0])
-    tex = network_tex(first['Theta'], first['networks'], wcs, cache.mask)
+    tex = network_tex(first['Theta'], first['networks'], wcs, cache.mask, cache.background_processes, config['c0'])
     # what each suspect drop did to every affected component, and the combined refit
     if groups:
         for version, everything in [('compact', False), ('full', True)]:
@@ -1230,9 +1253,10 @@ def main(config_path, refit=False, backgrounds=False):
     # the design and come back only as candidates to retrain
     cfg = config.get('point_search', {})
     misclosure = network_misclosure(networks, sums['sm_yield'])
-    # size of each training point: inclusive yield at theta_1 relative to the SM yield (the sm column comes first)
+    # size of each training point: inclusive yield at theta_1 relative to the yield at (theta_SM, mu = 1)
     component_totals = weights.sum(0).numpy()
-    ratio = dict(zip(first['networks'], first['Theta'].astype(np.float64) @ component_totals / component_totals[0]))
+    sm_total = float(expansion(sm_point, len(wcs), dtype=torch.float64).numpy()[cache.mask] @ component_totals)
+    ratio = dict(zip(first['networks'], first['Theta'].astype(np.float64) @ component_totals / sm_total))
     notes = {n: 'dropped' for n in drop}
     notes.update({n: 'retrain' for n in retrain})
     plot_network_misclosure(
@@ -1257,13 +1281,16 @@ def main(config_path, refit=False, backgrounds=False):
     Theta, names = Theta[keep], [n for n, k in zip(names, keep) if k]
     m = np.array([misclosure[n] for n in names])
     totals = all_weights.sum(0)
+    sm_inclusive = float(expansion(sm_point, len(wcs), dtype=torch.float64) @ totals)
 
     def yield_ratio(theta):
-        return float(get_lower_tri(theta, dtype=torch.float64) @ totals / totals[0])
+        return float(expansion(theta, len(wcs), dtype=torch.float64) @ totals / sm_inclusive)
 
-    max_yield = cfg.get('max_yield_ratio') or float((Theta @ weights.sum(0).numpy()).max() / totals[0])
-    units = candidate_units(wcs, Theta, names, misclosure, cache.mask, yield_ratio, max_yield, extra)
-    G = objective_weights(cfg, wcs, cache.mask, flagged, Theta, m)
+    max_yield = cfg.get('max_yield_ratio') or float((Theta @ component_totals).max() / sm_total)
+    units = candidate_units(
+        wcs, Theta, names, misclosure, cache.mask, yield_ratio, max_yield, extra, cache.background_processes
+    )
+    G = objective_weights(cfg, wcs, cache.mask, flagged, Theta, m, n_background)
     chosen, sigma0, sigma1, history = search_points(
         Theta, m, units, G, cfg.get('n_units', 10), cfg.get('min_gain', 0.01)
     )

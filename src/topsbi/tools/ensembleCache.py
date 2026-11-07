@@ -1,4 +1,4 @@
-from topsbi.tools.data import get_lower_tri
+from topsbi.tools.data import expansion
 from topsbi.tools.metrics import merge_sparse_bins
 
 import datetime, hashlib, os, shutil, torch, yaml
@@ -128,28 +128,32 @@ def is_cross_term(name):
     return '_' in name.split('/')[0]
 
 
-def component_labels(wcs, mask):
+def component_labels(wcs, mask, background_processes=()):
     """
-    Label and kind of every kept column of T(theta) (get_lower_tri), in the order of the rows of Gamma.
+    Label and kind of every kept column of T(theta, mu) (expansion), in the order of the rows of Gamma.
 
     Column (i, j), j <= i, of T(theta) for theta = (1, theta_1, ..., theta_n) multiplies theta_i theta_j, where the
     constant entry counts as index 0 (so (0, 0) is the 1 of the SM term; theta_0 here is not a hypothesis):
     (0, 0) 'sm', (i, 0) the linear term 'wc_i', (i, i) the quadratic term 'wc_i^2', otherwise the interference
-    term 'wc_i*wc_j'.
+    term 'wc_i*wc_j'. The column of background process p after them multiplies its strength mu_p: 'mu_p'.
 
     Args:
         wcs: WC names in get_lower_tri order
-        mask: kept get_lower_tri columns
+        mask: kept columns of T(theta, mu)
+        background_processes: names of the background processes, in the order of their columns
     Returns:
         labels: [K] names of the components
-        kinds: [K] 'sm', 'linear', 'quadratic' or 'cross'
+        kinds: [K] 'sm', 'linear', 'quadratic', 'cross' or 'background'
     """
     names = ['sm'] + list(wcs)
     rows, cols = np.tril_indices(len(names))
-    if len(rows) != len(mask):
-        raise ValueError(f'{len(wcs)} wcs give {len(rows)} columns but the mask has {len(mask)}')
+    if len(rows) + len(background_processes) != len(mask):
+        raise ValueError(
+            f'{len(wcs)} wcs and {len(background_processes)} background processes give '
+            f'{len(rows) + len(background_processes)} columns but the mask has {len(mask)}'
+        )
     labels, kinds = [], []
-    for i, j, keep in zip(rows, cols, mask):
+    for i, j, keep in zip(rows, cols, mask[: len(rows)]):
         if not keep:
             continue
         if i == 0:
@@ -160,6 +164,9 @@ def component_labels(wcs, mask):
             labels.append(f'{names[i]}^2'), kinds.append('quadratic')
         else:
             labels.append(f'{names[i]}*{names[j]}'), kinds.append('cross')
+    for process, keep in zip(background_processes, mask[len(rows) :]):
+        if keep:
+            labels.append(f'mu_{process}'), kinds.append('background')
     return labels, kinds
 
 
@@ -238,7 +245,7 @@ def write_cache(path, config, ensemble):
     Args:
         path: cache directory, replaced if it exists
         config: validation config (data, c0, wcs, seeds, lumi)
-        ensemble: the fitted Ensemble (its rank: the rank of every seed's Theta)
+        ensemble: the fitted Ensemble (its rank: the rank of every seed's Theta; its background_processes)
     """
     tmp = f'{path}.tmp'
     if not os.path.isdir(tmp):
@@ -250,6 +257,7 @@ def write_cache(path, config, ensemble):
         'data': config['data'],
         'c0': config['c0'],
         'wcs': config['wcs'],
+        'background_processes': list(ensemble.background_processes),
         'lumi': config['lumi'],
         'seeds': config['seeds'],
         'model_hash': model_hashes(config['seeds']),
@@ -269,7 +277,10 @@ class EnsembleCache:
         layer 2 is read on demand with network(seed) and seed_R(seed).
 
         Attributes:
-            Gamma: [K, N_finite] seed-mean Gamma; mask: kept columns of T(theta); finite: [N] events kept by every seed
+            Gamma: [K, N_finite] seed-mean Gamma; mask: kept columns of T(theta, mu); finite: [N] events kept by
+                every seed
+            n_wcs, background_processes: number of WCs and background processes (none in a cache written before
+                they were recorded)
             seed_Gamma, seed_finite: per seed Gamma and kept events; residuals: per seed lstsq residuals or None
         """
         if not os.path.exists(f'{path}/ensemble.yml'):
@@ -279,6 +290,8 @@ class EnsembleCache:
         mode = 'r' if mmap else None
         self.path = path
         self.mode = mode
+        self.n_wcs = len(self.manifest['wcs'])
+        self.background_processes = list(self.manifest.get('background_processes', []))
         self.Gamma = np.load(f'{path}/gamma_cache.npy', mmap_mode=mode)
         self.mask = np.load(f'{path}/mask_cache.npy')
         self.finite = np.load(f'{path}/filter_cache.npy')
@@ -308,5 +321,20 @@ class EnsembleCache:
         return self.manifest['model_hash'] == model_hashes(config['seeds'])
 
     def __call__(self, theta):
-        """Learned ratio r_hat(x; theta) = T(theta)[mask] Gamma for the events kept by every seed."""
-        return get_lower_tri(theta, dtype=torch.float64).numpy()[self.mask] @ self.Gamma
+        """
+        Learned ratio r_hat(x; theta, mu) = T(theta, mu)[mask] Gamma for the events kept by every seed.
+
+        Args:
+            theta: SM-inclusive WC point, followed by the background strengths mu_p when the cache has
+                background_processes
+        Returns:
+            r_hat(x; theta, mu) per kept event
+        Raises:
+            ValueError: a strength whose column no network moved is not 1 (the fit holds that background only at
+                its nominal yield)
+        """
+        point = expansion(theta, self.n_wcs, dtype=torch.float64).numpy()
+        n_theta = len(point) - len(self.background_processes)
+        if (point[n_theta:][~self.mask[n_theta:]] != 1).any():
+            raise ValueError(f'{theta}: a background column no network moved is fixed at mu_p = 1')
+        return point[self.mask] @ self.Gamma

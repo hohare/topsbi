@@ -1070,7 +1070,7 @@ def plot_residuals(residuals, outname, bins=200, outlier_factor=3.0):
 
 # sequential ramp of the reference palette (blue, light to dark)
 SEQUENTIAL = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b']
-KIND_ORDER = ['sm', 'linear', 'quadratic', 'cross']
+KIND_ORDER = ['sm', 'linear', 'quadratic', 'cross', 'background']
 # label colours for networks the suspects step dropped (dark red) or wants retrained (orange)
 NOTE_COLORS = {'dropped': '#a51d1d', 'retrain': '#d95926'}
 
@@ -1086,9 +1086,11 @@ def wc_tex(wc):
 
 
 def component_tex(label):
-    '''TeX label of a gamma component from component_labels: sm, c, |c|^2 or c_a . c_b.'''
+    '''TeX label of a gamma component from component_labels: sm, c, |c|^2, c_a . c_b or a background strength mu_p.'''
     if label == 'sm':
         return 'sm'
+    if label.startswith('mu_'):
+        return rf'$\mu_{{\rm {label[3:]}}}$'
     if label.endswith('^2'):
         return rf'$\left|{wc_tex(label[:-2])}\right|^2$'
     # the space only ends the command name (\cdotc would be read otherwise); TeX does not print it
@@ -1428,33 +1430,49 @@ def plot_nuisance_closure(sums, row, f, z_max, binning, outname, title, nominal=
     )
 
 
-def network_tex(Theta, names, wcs, mask):
+def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None):
     '''
     TeX label of the training point of every network: its nonzero WC values, read from the linear columns of Theta,
-    e.g. "c_Qj^31 = 1.70" or "c_Qj^31, Re[c_tG] = -1.28, 4.27"; the SM anchor is "sm".
+    e.g. "c_Qj^31 = 1.70" or "c_Qj^31, Re[c_tG] = -1.28, 4.27"; the SM anchor is "sm". A point with the WC values of
+    a non-SM reference reads "theta_g", and every background strength other than 1 is appended, e.g.
+    "theta_g, mu_bg = 0.00".
 
     Args:
         Theta: [n_networks, K] expanded training points
         names: network names, rows of Theta
         wcs: WC names in get_lower_tri order
-        mask: kept get_lower_tri columns
+        mask: kept columns of T(theta, mu)
+        background_processes: names of the background processes, in the order of their columns
+        reference: SM-inclusive reference point theta_g (config c0; strengths after the WCs are not used), or None
     Returns:
         {network name: label}
     '''
     rows, cols = np.tril_indices(len(wcs) + 1)
-    kept = [(int(i), int(j)) for i, j, keep in zip(rows, cols, mask) if keep]
+    kept = [(int(i), int(j)) for i, j, keep in zip(rows, cols, mask[: len(rows)]) if keep]
     linear = {i: kept.index((i, 0)) for i in range(1, len(wcs) + 1) if (i, 0) in kept}
+    # kept background columns follow the kept columns of T(theta) in Theta
+    strengths = {}
+    for process, keep in zip(background_processes, mask[len(rows) :]):
+        if keep:
+            strengths[process] = len(kept) + len(strengths)
+    g = None if reference is None else np.array([float(c) for c in reference[1 : len(wcs) + 1]])
     out = {}
     for name, row in zip(names, Theta):
         point = [(wc_tex(wcs[i - 1]), row[c]) for i, c in linear.items() if row[c] != 0]
-        if not point:
+        values = np.array([row[linear[i]] if i in linear else 0.0 for i in range(1, len(wcs) + 1)], dtype=np.float64)
+        head = None
+        if g is not None and g.any() and np.allclose(values, g, rtol=1e-5, atol=1e-6):
+            head, point = r'\theta_g', []
+        point += [(rf'\mu_{{\rm {p}}}', row[c]) for p, c in strengths.items() if row[c] != 1]
+        wc_part = ', '.join(t for t, _ in point)
+        value_part = ', '.join(f'{v:.2f}' for _, v in point)
+        if head is not None and point:
+            out[name] = rf'${head}, {wc_part} = {value_part}$'
+        elif head is not None:
+            out[name] = rf'${head}$'
+        elif not point:
             out[name] = 'sm'
-        elif len(point) == 1:
-            out[name] = rf'${point[0][0]} = {point[0][1]:.2f}$'
         else:
-            # interference point: c_a, c_b = x, y
-            wc_part = ', '.join(t for t, _ in point)
-            value_part = ', '.join(f'{v:.2f}' for _, v in point)
             out[name] = rf'${wc_part} = {value_part}$'
     return out
 
@@ -1641,9 +1659,17 @@ def plot_drop_tests(
 
 
 def component_kinds(labels):
-    '''Kind of every component label from component_labels: sm, linear, quadratic or cross.'''
+    '''Kind of every component label from component_labels: sm, linear, quadratic, cross or background.'''
     return [
-        'sm' if name == 'sm' else 'quadratic' if name.endswith('^2') else 'cross' if '*' in name else 'linear'
+        'sm'
+        if name == 'sm'
+        else 'background'
+        if name.startswith('mu_')
+        else 'quadratic'
+        if name.endswith('^2')
+        else 'cross'
+        if '*' in name
+        else 'linear'
         for name in labels
     ]
 
@@ -1651,10 +1677,11 @@ def component_kinds(labels):
 def unit_tex(unit, wcs):
     '''
     TeX label of a point-search unit: the WCs it varies with their magnitudes; a cross-term unit (the 4 sign
-    combinations) reads "c_a, c_b = +-x, +-y", a single point "c_a, c_b = x, y".
+    combinations) reads "c_a, c_b = +-x, +-y", a single point "c_a, c_b = x, y". Background strengths after the WCs
+    are not shown (the search holds them at 1).
     '''
     theta = np.asarray(unit['points'][0]['theta'])
-    nonzero = np.flatnonzero(theta[1:]) + 1
+    nonzero = np.flatnonzero(theta[1 : len(wcs) + 1]) + 1
     names = ', '.join(wc_tex(wcs[i - 1]) for i in nonzero)
     if len(unit['points']) > 1:
         values = ', '.join(rf'\pm{abs(theta[i]):.2f}' for i in nonzero)
