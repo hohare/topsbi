@@ -13,7 +13,7 @@ import yaml
 
 import topsbi.validation as val
 from topsbi.model.net import Net
-from topsbi.tools.build_ratio import NetworkRatio
+from topsbi.tools.build_ratio import NetworkRatio, fit_gamma, generalized_inverse
 from topsbi.tools.data import expansion, get_lower_tri
 from topsbi.tools.ensembleCache import (
     EnsembleCache,
@@ -71,13 +71,29 @@ def truth():
     return x, weights, w0
 
 
-def fake_fit(Theta, R):
-    """What RatioFit hands to the per-seed callback, for given Theta and R (all events finite)."""
+def fake_fit(Theta, R, background_rows=None):
+    """
+    What RatioFit hands to the per-seed callback, for given Theta and R (all events finite); with background_rows,
+    the fit whose background column (the last) comes from those rows alone.
+    """
     Theta, R = torch.as_tensor(Theta, dtype=torch.float32), torch.as_tensor(R, dtype=torch.float32)
     finite = ~torch.isinf(R).any(0)
-    solution, residuals, rank, _ = torch.linalg.lstsq(Theta, R[:, finite], driver='gelsd')
+    if background_rows is None:
+        solution, residuals, rank, _ = torch.linalg.lstsq(Theta, R[:, finite], driver='gelsd')
+        Gamma = solution[: Theta.shape[1]].clone()
+    else:
+        background_rows = torch.as_tensor(background_rows, dtype=torch.bool)
+        Gamma = fit_gamma(Theta, R[:, finite], background_rows, 1)
+        residuals = ((Theta @ Gamma - R[:, finite]) ** 2).sum(0)
+        rank = torch.linalg.matrix_rank(Theta)
     return types.SimpleNamespace(
-        Theta=Theta, R=R, finite=finite, Gamma=solution[: Theta.shape[1]].clone(), residuals=residuals, rank=rank
+        Theta=Theta,
+        R=R,
+        finite=finite,
+        Gamma=Gamma,
+        residuals=residuals,
+        rank=rank,
+        background_rows=background_rows,
     )
 
 
@@ -698,6 +714,25 @@ def test_network_and_unit_tex_background():
         f'${a}, {b}, \\mu_{{\\rm bg}} = 0.50, -0.50, 0.00$'
     )
     assert unit_tex({'points': [{'theta': [1.0, 2.0, 0.0, 1.0]}]}, WCS) == f'${a} = 2.00$'
+    # a point without signal reads 'b only'; the SM at another strength keeps 'sm' as its head; labels shared by
+    # networks of different groups get the group, unique ones do not
+    more = {
+        'bg/only': [0.0, 0.0, 0.0, 1.0],
+        'nominal/sm': [1.0, 0.0, 0.0, 0.0],
+        'other:sm': [1.0, 0.0, 0.0, 1.0],
+    }
+    rows = np.stack([expansion(p, 2, dtype=torch.float64).numpy() for p in more.values()])
+    Theta_more, names = np.vstack([Theta, rows]), list(points) + list(more)
+    reference = [1.0, 0.5, -0.5, 1.0]
+    plain = network_tex(Theta_more, names, WCS, MASK_BG, BG, reference)
+    assert plain['bg/only'] == '$b$ only'
+    assert plain['nominal/sm'] == r'${\rm sm}, \mu_{\rm bg} = 0.00$'
+    assert plain['sm'] == plain['other:sm'] == 'sm'
+    groups = ['first'] * len(points) + ['second'] * len(more)
+    grouped = network_tex(Theta_more, names, WCS, MASK_BG, BG, reference, groups)
+    assert grouped['sm'] == 'sm (first)' and grouped['other:sm'] == 'sm (second)'
+    unique = [n for n in names if n not in ('sm', 'other:sm')]
+    assert [grouped[n] for n in unique] == [plain[n] for n in unique]
 
 
 def test_scan_moments_background():
@@ -732,24 +767,35 @@ def test_candidate_units_background(null):
     assert retrain['points'][0]['theta'] == [1.0, 2.0, 0.0, 0.0] and retrain['rows'][0, -1] == 0
 
 
-def background_column_toy(root, moved):
+def background_column_toy(root, moved, background_fit=False):
     """
     Validation config and cache of a toy with one background column: the toy signal of truth() plus a background
     b(x) on the same events; members fitted at the toy points (mu_bg = 1), the SM point and, when moved, at
-    mu_bg = 0 and 2, against theta_0 = (SM, mu_bg = 1).
+    mu_bg = 0 and 2, against theta_0 = (SM, mu_bg = 1). With background_fit, the networks come in two groups:
+    'mixed' (the toy points and the SM point at mu_bg = 1) and 'signal' (the toy points at mu_bg = 0 and a
+    background-only point), the SM network is the signal group's 'bg/sm', and the background column comes from the
+    signal group and the SM network alone (config background_fit).
     """
     x, weights, _ = truth()
     b = 0.3 * weights[:, 0] * (1 + x[:, 0])
     coefs = np.hstack([weights, b[:, None]]) / 1000
     c0 = [1.0, 0.0, 0.0, 1.0]
-    points = {n: (1.0, *POINTS[n], 1.0) for n in POINTS}
-    if moved:
-        points.update({'bg/mu_0': (1.0, 0.0, 0.0, 0.0), 'bg/mu_2': (1.0, 0.0, 0.0, 2.0)})
-    points['sm'] = tuple(c0)
-    names = list(points)
-    Theta = np.stack([expansion(list(p), 2, dtype=torch.float64).numpy() for p in points.values()])
+    if background_fit:
+        groups = {
+            'mixed': {**{n: (1.0, *POINTS[n], 1.0) for n in POINTS}, 'sm': tuple(c0)},
+            'signal': {**{n: (1.0, *POINTS[n], 0.0) for n in POINTS}, 'bg/only': (0.0, 0.0, 0.0, 1.0)},
+        }
+        sm_slot = ('signal', 'bg/sm')
+    else:
+        points = {n: (1.0, *POINTS[n], 1.0) for n in POINTS}
+        if moved:
+            points.update({'bg/mu_0': (1.0, 0.0, 0.0, 0.0), 'bg/mu_2': (1.0, 0.0, 0.0, 2.0)})
+        groups = {None: points}
+        sm_slot = (None, 'sm')
+    rows = [(g, n, p) for g, points in groups.items() for n, p in points.items()] + [(*sm_slot, tuple(c0))]
+    Theta = np.stack([expansion(list(p), 2, dtype=torch.float64).numpy() for _, _, p in rows])
     mask = np.ones(7, dtype=bool)
-    mask[-1] = moved
+    mask[-1] = moved or background_fit
     full = np.hstack([weights, b[:, None]])
     R_true = Theta @ (full / (full @ expansion(c0, 2, dtype=torch.float64).numpy())[:, None]).T
     Theta = Theta[:, mask]
@@ -759,13 +805,17 @@ def background_column_toy(root, moved):
     seeds = {}
     for e in MEMBERS:
         paths = []
-        for name in names:
-            directory = root / f'seed_{e}' / name
+        for g, name, _ in rows:
+            directory = root / f'seed_{e}' / (name if g is None else f'{g}/{name}')
             directory.mkdir(parents=True)
-            (directory / 'model.pt').write_bytes(f'{name} {e}'.encode())
+            (directory / 'model.pt').write_bytes(f'{g} {name} {e}'.encode())
             (directory / 'training.yml').write_text(yaml.safe_dump({'name': str(directory)}))
             paths.append(str(directory / 'training.yml'))
-        seeds[e] = {'networks': paths[:-1], 'sm': paths[-1]}
+        if background_fit:
+            networks = {g: [p for (h, _, _), p in zip(rows[:-1], paths[:-1]) if h == g] for g in groups}
+        else:
+            networks = paths[:-1]
+        seeds[e] = {'networks': networks, 'sm': paths[-1]}
     config = {
         'name': str(root / 'validation'),
         'data': str(data),
@@ -778,12 +828,16 @@ def background_column_toy(root, moved):
         'seeds': seeds,
         'bias': {'n_bins': 10},
     }
+    background_rows = None
+    if background_fit:
+        config['background_fit'] = 'signal'
+        background_rows = np.array([g == 'signal' for g, _, _ in rows[:-1]] + [True])
     path = f'{config["name"]}/ensemble'
     collector = SeedCollector(seeds, path)
     Gamma, rank = 0, {}
     for e in MEMBERS:
         rng = np.random.default_rng(300 + e)
-        fit = fake_fit(Theta, R_true * (1 + NOISE * rng.standard_normal(R_true.shape)))
+        fit = fake_fit(Theta, R_true * (1 + NOISE * rng.standard_normal(R_true.shape)), background_rows)
         collector(e, fit)
         Gamma, rank[e] = Gamma + fit.Gamma / len(MEMBERS), int(fit.rank)
     ensemble = types.SimpleNamespace(
@@ -815,11 +869,13 @@ def test_cache_background_column(tmp_path):
     assert EnsembleCache(f'{config["name"]}/ensemble').background_processes == []
 
 
-@pytest.mark.parametrize('moved', [True, False], ids=['moved', 'blind'])
-def test_main_background_column(tmp_path, moved):
+@pytest.mark.parametrize(
+    'moved, background_fit', [(True, False), (False, False), (True, True)], ids=['moved', 'blind', 'background_fit']
+)
+def test_main_background_column(tmp_path, moved, background_fit):
     # the whole validation on a background column; in the blind fit the SM column holds b, and closes only
-    # because its true weights include b too
-    config = background_column_toy(tmp_path, moved)
+    # because its true weights include b too; with background_fit, the two-stage fit of two groups of networks
+    config = background_column_toy(tmp_path, moved, background_fit)
     path = tmp_path / 'validation.yml'
     path.write_text(yaml.safe_dump(config))
     val.main(str(path))
@@ -831,3 +887,39 @@ def test_main_background_column(tmp_path, moved):
     proposed = yaml.safe_load(open(f'{config["name"]}/proposed_points.yml'))
     assert proposed['background_processes'] == BG
     assert all(len(p['theta']) == 4 and p['theta'][3] == 1.0 for p in proposed['points'])
+
+
+def test_background_fit_drops_and_covariance(tmp_path):
+    config = background_column_toy(tmp_path, moved=True, background_fit=True)
+    cache = EnsembleCache(f'{config["name"]}/ensemble')
+    features, coefs = torch.load(config['data'], weights_only=False).tensors
+    weights = coefs.double() * 1000
+    w0 = weights @ expansion(config['c0'], 2, dtype=torch.float64)
+    binning = merge_sparse(quantile_binning(features, FEATURES, 10), features, FEATURES, w0, 30)
+    sums = val.component_sums(cache, binning, w0, weights)
+    # the downdated normal equations of both stages equal an exact refit, for a network outside the background rows
+    # and one inside them
+    groups = {'outside': ['mixed:cA/p_two'], 'inside': ['signal:cA/p_two']}
+    shortcut = val.drop_bias_sums(cache, groups, binning, w0, weights, sums)
+    scale = np.abs(sums['truth']).max()
+    for g, members in groups.items():
+        exact = val.component_sums(val.refit_without(cache, members), binning, w0, weights)['bias']
+        assert np.abs(shortcut[g]['bias'] - exact).max() < 1e-5 * scale
+
+    # Cov(gamma_hat) = Theta^- M^2 Theta^-T, from H and S; a new point joins the fit of the other columns, so the
+    # additive update of H and S gives the covariance of the larger design (batched like the point search)
+    network = cache.network(cache.seeds[0])
+    Theta, rows = network['Theta'].astype(np.float64), network['background_rows']
+    m = np.random.default_rng(0).uniform(0.5, 2.0, len(Theta))
+    H, S = Theta.T @ Theta, Theta.T @ (m[:, None] ** 2 * Theta)
+    fixed = val.fixed_background(Theta, m, rows, 1)
+    inverse = val.seed_inverse(cache, network)
+    assert np.allclose(val.design_covariance(H, S, fixed), inverse @ np.diag(m**2) @ inverse.T, rtol=1e-6, atol=1e-12)
+    u = expansion([1.0, 0.5, 1.5, 1.0], 2, dtype=torch.float64).numpy()[None]
+    larger = generalized_inverse(torch.from_numpy(np.vstack([Theta, u])), np.r_[rows, False], 1).numpy()
+    expected = larger @ np.diag(np.r_[m, 1.0] ** 2) @ larger.T
+    stacked = val.design_covariance(np.stack([H, H + u.T @ u]), np.stack([S, S + u.T @ u]), fixed)
+    assert np.allclose(stacked[1], expected, rtol=1e-6, atol=1e-12)
+    # least squares over every row: H^+ S H^+ = Theta^+ M^2 Theta^+T
+    plain = np.linalg.pinv(Theta)
+    assert np.allclose(val.design_covariance(H, S), plain @ np.diag(m**2) @ plain.T, rtol=1e-6, atol=1e-12)

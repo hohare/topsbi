@@ -7,6 +7,7 @@ import yaml
 
 import topsbi.tools.build_ratio as build
 from topsbi.tools.data import expansion, get_lower_tri
+from topsbi.tools.ensembleCache import network_rows
 
 N_EVENTS = 6
 # two WCs: get_lower_tri([1, a, b]) has 6 terms, 3 of which are kept
@@ -213,6 +214,62 @@ def test_ratio_fit_checks_background_processes(toy):
     # the SM row is (theta_SM, mu = 1): an SM network at another strength is refused
     with pytest.raises(ValueError, match='not trained at theta_1'):
         fit_toy(toy, {**TOY_POINTS, **MU_POINTS}, sm=[1.0, 0.0, 0.0], name='sm_mu_0')
+
+
+# a second group of toy networks: points without background (mu_bg = 0) and a background-only network; with the SM
+# network at (theta_SM, mu_bg = 1) they determine every column, as the background rows of a two-stage fit must
+SIGNAL_POINTS = {'cA/p_half': [1.0, 0.5, 0.0], 'cA/n_two': [1.0, -2.0, 0.0], 'bg/only': [0.0, 0.0, 1.0]}
+
+
+def test_ratio_fit_background_fit(toy):
+    # two groups, the background column from the second group and the SM network alone
+    mixed = toy_configs(toy.root / 'mixed', TOY_POINTS, TOY_SM, TOY_C0)
+    signal = toy_configs(toy.root / 'signal', SIGNAL_POINTS, TOY_SM, TOY_C0)
+    networks = {'mixed': list(mixed.values()), 'signal': [p for n, p in signal.items() if n != 'sm']}
+    config = {'sm': signal['sm'], 'networks': networks, 'features': {'x': {'loc': 0}}, 'device': 'cpu'}
+    fit = build.RatioFit({**config, 'background_fit': 'signal'}, toy.features)
+    assert fit.groups == ['mixed'] * len(mixed) + ['signal'] * len(SIGNAL_POINTS)
+    assert fit.background_rows.tolist() == [False] * len(mixed) + [True] * (len(SIGNAL_POINTS) + 1)
+    # exact networks: the fit recovers the true Gamma
+    assert np.allclose(fit.Gamma.numpy(), toy_gamma(toy.x, TOY_C0), rtol=1e-3, atol=1e-4)
+
+    # on noisy ratios the fit is Gamma = Theta^- R, with Theta^- a left inverse of Theta that is not Theta^+
+    Theta = fit.Theta.double()
+    inverse = build.generalized_inverse(Theta, fit.background_rows, 1)
+    assert torch.allclose(inverse @ Theta, torch.eye(Theta.shape[1], dtype=torch.float64), atol=1e-10)
+    noise = torch.randn(fit.R[:, fit.finite].shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    R = fit.R[:, fit.finite].double() + 0.01 * noise
+    Gamma = build.fit_gamma(Theta, R, fit.background_rows, 1)
+    assert torch.allclose(Gamma, inverse @ R, atol=1e-10)
+    assert not torch.allclose(Gamma, torch.linalg.pinv(Theta) @ R, atol=1e-6)
+    # the background coefficient depends on the background rows alone
+    shifted = R.clone()
+    shifted[~fit.background_rows] += 0.1
+    assert torch.allclose(build.fit_gamma(Theta, shifted, fit.background_rows, 1)[-1], Gamma[-1], atol=1e-10)
+    # without background rows both are least squares over every row
+    assert torch.allclose(build.fit_gamma(Theta, R), torch.linalg.pinv(Theta) @ R, atol=1e-10)
+    assert torch.allclose(build.generalized_inverse(Theta), torch.linalg.pinv(Theta), atol=1e-12)
+
+    with pytest.raises(ValueError, match='not a group'):
+        build.RatioFit({**config, 'background_fit': 'other'}, toy.features)
+    with pytest.raises(ValueError, match='needs an SM network'):
+        build.RatioFit({**config, 'sm': None, 'background_fit': 'signal'}, toy.features)
+
+    # row names: '<group>:' and the directory relative to the group's common directory; the SM network takes the
+    # group whose directory holds it, and the names and groups follow the rows of the fit
+    paths, names, groups = network_rows(networks, signal['sm'])
+    assert paths == networks['mixed'] + networks['signal'] + [signal['sm']]
+    assert names == [f'mixed:{n}' for n in mixed] + [f'signal:{n}' for n in SIGNAL_POINTS] + ['signal:sm']
+    assert groups == fit.groups + ['signal'] and len(names) == fit.Theta.shape[0]
+    with pytest.raises(ValueError, match='no group of networks holds'):
+        network_rows(networks, str(toy.root / 'elsewhere' / 'training.yml'))
+    # a list of networks: names relative to the common directory of every network and the SM network, no groups;
+    # without an SM network the exact last row is 'sm'
+    plain = [p for n, p in mixed.items() if n != 'sm']
+    assert network_rows(plain, mixed['sm']) == (plain + [mixed['sm']], [*TOY_POINTS, 'sm'], [None] * len(mixed))
+    # without an SM network the names are relative to the networks' own common directory (here .../mixed/cA)
+    expected = [n.split('/')[1] for n in TOY_POINTS] + ['sm']
+    assert network_rows(plain, None) == (plain + [None], expected, [None] * (len(plain) + 1))
 
 
 def test_ensemble_background_column(toy):
