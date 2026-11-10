@@ -1,7 +1,7 @@
 from topsbi.model.net import Net
 from topsbi.tools.data import expansion, load_zero_terms, zero_term_mask
 
-import concurrent.futures, multiprocessing, torch, tqdm, yaml
+import concurrent.futures, multiprocessing, numpy as np, torch, tqdm, yaml
 
 torch.set_num_threads(1)
 
@@ -59,9 +59,49 @@ class NetworkRatio:
         return f_hat.cpu()
 
 
-def fit_gamma(Theta, R, background_rows=None, n_background=0):
+def event_blocks(R, rows=None, columns=None, chunk=20_000):
     """
-    Per-event coefficients Gamma of Theta Gamma = R.
+    Consecutive blocks of events of R, as tensors.
+
+    Args:
+        R: [n_networks, N] tensor or array (a memory map is read one block at a time)
+        rows: [n_networks] bool, the rows to keep (None: every row)
+        columns: [N] bool, the events to keep (None: every event)
+        chunk: events of R per block, before columns
+    Yields:
+        (start, block): position of the block's first event among the kept events, [n_rows, <= chunk] tensor in R's
+        dtype
+    """
+    rows = None if rows is None else torch.as_tensor(rows, dtype=torch.bool)
+    columns = None if columns is None else torch.as_tensor(columns, dtype=torch.bool)
+    start = 0
+    for first in range(0, R.shape[1], chunk):
+        block = R[:, first : first + chunk]
+        block = block if isinstance(block, torch.Tensor) else torch.from_numpy(np.array(block))
+        if rows is not None:
+            block = block[rows]
+        if columns is not None:
+            block = block[:, columns[first : first + chunk]]
+        yield start, block
+        start += block.shape[1]
+
+
+def finite_events(R, rows=None, chunk=20_000):
+    """
+    Events where every row of R is finite.
+
+    Args:
+        R, rows, chunk: as event_blocks
+    Returns:
+        [N] bool tensor
+    """
+    return torch.cat([~torch.isinf(block).any(0) for _, block in event_blocks(R, rows, chunk=chunk)])
+
+
+def fit_gamma(Theta, R, background_rows=None, n_background=0, rows=None, columns=None, chunk=20_000):
+    """
+    Per-event coefficients Gamma of Theta Gamma = R: Gamma = Theta^- R, with Theta^- of generalized_inverse, applied
+    to consecutive blocks of events.
 
     Without background_rows: least squares over every row. With background_rows: the last n_background columns
     of Theta (the background strengths) come from the least-squares fit of those rows alone; the other columns
@@ -69,31 +109,43 @@ def fit_gamma(Theta, R, background_rows=None, n_background=0):
     Theta_sig Gamma_sig = R - Theta_bg Gamma_bg.
 
     Args:
-        Theta: [n_networks, K] rows T(theta_1^(a), mu^(a))[mask], the background columns last
-        R: [n_networks, N] r_hat of every network for every event (finite)
-        background_rows: [n_networks] bool, the rows that alone determine the background columns, or None
+        Theta: [n_rows, K] rows T(theta_1^(a), mu^(a))[mask], the background columns last
+        R: [n_networks, N] r_hat of every network for every event, tensor or array (a memory map is read one block
+            at a time)
+        background_rows: [n_rows] bool, the rows of Theta that alone determine the background columns, or None
         n_background: number of background columns of Theta (used with background_rows)
+        rows: [n_networks] bool, the rows of R that are the rows of Theta (None: every row)
+        columns: [N] bool, the events to fit, where every kept row of R is finite (None: every event)
+        chunk: events of R per block
     Returns:
-        Gamma: [K, N]
+        Gamma: [K, n_events] tensor in R's dtype, one column per fitted event
     Raises:
-        ValueError: n_background is not between 1 and K - 1 with background_rows, or the background rows do not
-            determine every column (rank below K)
+        ValueError: as generalized_inverse
     """
-    K = Theta.shape[1]
-    if background_rows is None:
-        # lstsq returns the solution in an [n_networks, N] buffer; keep only Gamma's rows
-        return torch.linalg.lstsq(Theta, R, driver='gelsd').solution[:K].clone()
-    if not 0 < n_background < K:
-        raise ValueError(f'n_background {n_background} must be between 1 and {K - 1}')
-    background_rows = torch.as_tensor(background_rows, dtype=torch.bool)
-    split = K - n_background
-    first = torch.linalg.lstsq(Theta[background_rows], R[background_rows], driver='gelsd')
-    if int(first.rank) < K:
-        raise ValueError(f'background rows of Theta: rank {int(first.rank)} below its {K} columns')
-    Gamma_bg = first.solution[split:K].clone()
-    target = R - Theta[:, split:] @ Gamma_bg
-    Gamma_signal = torch.linalg.lstsq(Theta[:, :split], target, driver='gelsd').solution[:split]
-    return torch.vstack([Gamma_signal, Gamma_bg])
+    Theta_inv = generalized_inverse(Theta, background_rows, n_background)
+    blocks = [
+        (Theta_inv @ block.to(torch.float64)).to(block.dtype) for _, block in event_blocks(R, rows, columns, chunk)
+    ]
+    return torch.cat(blocks, dim=1)
+
+
+def fit_residuals(Theta, Gamma, R, rows=None, columns=None, chunk=20_000):
+    """
+    Squared residuals ||Theta Gamma - R||^2 of every fitted event, over consecutive blocks of events.
+
+    Args:
+        Theta: [n_rows, K] rows of the fit
+        Gamma: [K, n_events] coefficients of the fitted events (fit_gamma with the same rows and columns)
+        R, rows, columns, chunk: as fit_gamma
+    Returns:
+        [n_events] tensor in R's dtype
+    """
+    Theta = Theta.to(torch.float64)
+    residuals = []
+    for start, block in event_blocks(R, rows, columns, chunk):
+        fitted = Theta @ Gamma[:, start : start + block.shape[1]].to(torch.float64)
+        residuals.append(((fitted - block.to(torch.float64)) ** 2).sum(0).to(block.dtype))
+    return torch.cat(residuals)
 
 
 def generalized_inverse(Theta, background_rows=None, n_background=0):
@@ -110,7 +162,8 @@ def generalized_inverse(Theta, background_rows=None, n_background=0):
     Returns:
         Theta_inv: [K, n_networks] float64
     Raises:
-        ValueError: n_background is not between 1 and K - 1 with background_rows
+        ValueError: n_background is not between 1 and K - 1 with background_rows, or the background rows do not
+            determine every column (rank below K)
     """
     Theta = Theta.to(torch.float64)
     if background_rows is None:
@@ -119,6 +172,9 @@ def generalized_inverse(Theta, background_rows=None, n_background=0):
     if not 0 < n_background < K:
         raise ValueError(f'n_background {n_background} must be between 1 and {K - 1}')
     background_rows = torch.as_tensor(background_rows, dtype=torch.bool)
+    rank = int(torch.linalg.matrix_rank(Theta[background_rows]))
+    if rank < K:
+        raise ValueError(f'background rows of Theta: rank {rank} below its {K} columns')
     split = K - n_background
     inverse_bg = torch.zeros((n_background, Theta.shape[0]), dtype=torch.float64)
     inverse_bg[:, background_rows] = torch.linalg.pinv(Theta[background_rows])[split:]
@@ -178,8 +234,7 @@ class RatioFit:
                 the background)
             finite: [N] events where every network's r_hat is finite
             Gamma: [K, N_finite] coefficients of the fit
-            residuals: [N_finite] ||Theta Gamma - R||^2 per event (empty when lstsq returns none), rank and
-                singular_values of Theta
+            residuals: [N_finite] ||Theta Gamma - R||^2 per event (fit_residuals), rank and singular_values of Theta
         Raises:
             ValueError: the SM network is not at theta_1 = (SM, every strength 1); a network uses different wcs,
                 zero_terms, background_processes or theta_0 than the reference network; a network is not trained
@@ -246,7 +301,7 @@ class RatioFit:
         n_theta = self.Theta.shape[1] - len(self.background_processes)
         self.mask[n_theta:] &= (self.Theta[:, n_theta:] != 1).any(dim=0)
         self.Theta = self.Theta[:, self.mask]
-        self.finite = ~torch.isinf(self.R).any(0)
+        self.finite = finite_events(self.R)
         if background_fit is None:
             self.background_rows = None
         else:
@@ -254,30 +309,24 @@ class RatioFit:
         if sm_reference:
             # theta_0 = SM: r_hat(x; theta_SM) = T(theta_SM)[mask] Gamma = Gamma[0] (the SM term is the first kept
             # column) is exactly 1, so Gamma[0] is fixed to 1 and the other rows solve Theta[:, 1:] Gamma[1:] =
-            # R - Theta[:, :1] in least squares; the SM row drops out (1 - 1 = 0 against a row of zeros)
-            rest, self.residuals, rank, self.singular_values = torch.linalg.lstsq(
-                self.Theta[:, 1:], self.R[:, self.finite] - self.Theta[:, :1], driver='gelsd'
-            )
+            # R - Theta[:, :1] in least squares, Gamma[1:] = Theta[:, 1:]^+ R - Theta[:, 1:]^+ Theta[:, :1]; the SM
+            # row drops out (1 - 1 = 0 against a row of zeros)
+            rest = fit_gamma(self.Theta[:, 1:], self.R, columns=self.finite)
+            offset = torch.linalg.pinv(self.Theta[:, 1:].to(torch.float64)) @ self.Theta[:, :1].to(torch.float64)
+            rest -= offset.to(rest.dtype)
+            self.Gamma = torch.vstack([torch.ones((1, rest.shape[1]), dtype=rest.dtype), rest])
             # rank of the full Theta: the fixed SM column is independent of the others in the SM row
-            self.rank = rank + 1
-            self.Gamma = torch.vstack(
-                [torch.ones((1, rest.shape[1]), dtype=rest.dtype), rest[: self.Theta.shape[1] - 1]]
-            )
-        elif self.background_rows is None:
-            Gamma, self.residuals, self.rank, self.singular_values = torch.linalg.lstsq(
-                self.Theta, self.R[:, self.finite], driver='gelsd'
-            )
-            # lstsq returns the solution in an [n_networks, N_finite] buffer; keep only Gamma's rows
-            self.Gamma = Gamma[: self.Theta.shape[1]].clone()
+            self.rank = int(torch.linalg.matrix_rank(self.Theta[:, 1:].to(torch.float64))) + 1
         else:
-            n_background = int(self.mask[n_theta:].sum())
-            if n_background == 0:
-                raise ValueError('background_fit is set, but no network moves a background strength')
-            R = self.R[:, self.finite]
-            self.Gamma = fit_gamma(self.Theta, R, self.background_rows, n_background)
-            self.residuals = ((self.Theta @ self.Gamma - R) ** 2).sum(0)
-            self.rank = torch.linalg.matrix_rank(self.Theta)
-            self.singular_values = torch.linalg.svdvals(self.Theta)
+            n_background = 0
+            if self.background_rows is not None:
+                n_background = int(self.mask[n_theta:].sum())
+                if n_background == 0:
+                    raise ValueError('background_fit is set, but no network moves a background strength')
+            self.Gamma = fit_gamma(self.Theta, self.R, self.background_rows, n_background, columns=self.finite)
+            self.rank = int(torch.linalg.matrix_rank(self.Theta.to(torch.float64)))
+        self.residuals = fit_residuals(self.Theta, self.Gamma, self.R, columns=self.finite)
+        self.singular_values = torch.linalg.svdvals(self.Theta.to(torch.float64))
 
     def __call__(self, theta):
         """

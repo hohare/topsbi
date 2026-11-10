@@ -248,6 +248,15 @@ def test_ratio_fit_background_fit(toy):
     assert torch.allclose(build.fit_gamma(Theta, shifted, fit.background_rows, 1)[-1], Gamma[-1], atol=1e-10)
     # without background rows both are least squares over every row
     assert torch.allclose(build.fit_gamma(Theta, R), torch.linalg.pinv(Theta) @ R, atol=1e-10)
+    # in blocks of events, from an array with a row of R that is not a row of Theta and with events left out: the
+    # same fit and residuals
+    extra = torch.vstack([R, 7 * R[:1]])
+    rows = torch.tensor([True] * len(R) + [False])
+    columns = torch.arange(R.shape[1]) % 3 != 0
+    blocked = build.fit_gamma(Theta, extra.numpy(), fit.background_rows, 1, rows, columns, chunk=2)
+    assert torch.allclose(blocked, Gamma[:, columns], atol=1e-10)
+    residuals = ((Theta @ Gamma - R) ** 2).sum(0)[columns]
+    assert torch.allclose(build.fit_residuals(Theta, blocked, extra.numpy(), rows, columns, chunk=2), residuals, atol=1e-10)
     assert torch.allclose(build.generalized_inverse(Theta), torch.linalg.pinv(Theta), atol=1e-12)
 
     with pytest.raises(ValueError, match='not a group'):

@@ -240,7 +240,7 @@ class SeedCollector:
         # file names are read by EnsembleCache
         np.save(f'{d}/gammas.npy', fit.Gamma.numpy())
         np.save(f'{d}/filter.npy', fit.finite.numpy())
-        # empty unless Theta has more rows than columns and full column rank
+        # one squared residual per finite event (fit_residuals)
         if fit.residuals.numel():
             np.save(f'{d}/residuals.npy', fit.residuals.numpy())
         # R: every network's ratio for every event (inf where a network diverged; filter marks the usable events)

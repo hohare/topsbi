@@ -1,4 +1,4 @@
-from topsbi.tools.build_ratio import Ensemble, NetworkRatio, fit_gamma, generalized_inverse, seed_map
+from topsbi.tools.build_ratio import Ensemble, NetworkRatio, finite_events, fit_gamma, generalized_inverse, seed_map
 from topsbi.tools.data import expansion, sample_weight
 from topsbi.tools.ensembleCache import (
     EnsembleCache,
@@ -574,21 +574,21 @@ def suspects(shares, z, networks, z_threshold=5.0, share_threshold=0.5, seed_fra
 def _refit_seed(seed, path, drop):
     """
     refit_without for one seed (through seed_map): Gamma, kept events and rank of Theta without the drops, from the
-    seed's fit (fit_gamma; the background columns from the seed's remaining background_rows when it has them).
+    seed's fit (fit_gamma on the stored R; the background columns from the seed's remaining background_rows when it
+    has them).
     """
     cache = EnsembleCache(path)
     network = cache.network(seed)
     rows = np.array([name not in drop for name in network['networks']])
     Theta = torch.from_numpy(network['Theta'][rows])
-    R = torch.from_numpy(np.asarray(cache.seed_R(seed))[rows])
-    keep = ~torch.isinf(R).any(0)
+    R = cache.seed_R(seed)
+    keep = finite_events(R, rows)
     background_rows = network.get('background_rows')
     if background_rows is None:
-        Gamma, _, rank, _ = torch.linalg.lstsq(Theta, R[:, keep], driver='gelsd')
-        # lstsq returns the solution in an [n_networks, N_finite] buffer; keep only Gamma's rows
-        return Gamma[: Theta.shape[1]].clone().numpy(), keep.numpy(), int(rank)
-    Gamma = fit_gamma(Theta, R[:, keep], torch.from_numpy(background_rows[rows]), seed_n_background(cache))
-    return Gamma.numpy(), keep.numpy(), int(torch.linalg.matrix_rank(Theta))
+        Gamma = fit_gamma(Theta, R, rows=rows, columns=keep)
+    else:
+        Gamma = fit_gamma(Theta, R, torch.from_numpy(background_rows[rows]), seed_n_background(cache), rows, keep)
+    return Gamma.numpy(), keep.numpy(), int(torch.linalg.matrix_rank(Theta.to(torch.float64)))
 
 
 def refit_without(cache, drop, workers=1):
