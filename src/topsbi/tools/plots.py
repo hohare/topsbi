@@ -1430,12 +1430,14 @@ def plot_nuisance_closure(sums, row, f, z_max, binning, outname, title, nominal=
     )
 
 
-def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None):
+def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None, groups=None):
     '''
     TeX label of the training point of every network: its nonzero WC values, read from the linear columns of Theta,
     e.g. "c_Qj^31 = 1.70" or "c_Qj^31, Re[c_tG] = -1.28, 4.27"; the SM anchor is "sm". A point with the WC values of
     a non-SM reference reads "theta_g", and every background strength other than 1 is appended, e.g.
-    "theta_g, mu_bg = 0.00".
+    "theta_g, mu_bg = 0.00" or "sm, mu_bg = 0.00". A point without signal (SM entry of T 0) reads "b only", with the
+    process when there are several, e.g. "b_tt only". Labels shared by networks of different groups get the group
+    appended, e.g. "sm (mixed)" and "sm (signal)".
 
     Args:
         Theta: [n_networks, K] expanded training points
@@ -1444,12 +1446,14 @@ def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None
         mask: kept columns of T(theta, mu)
         background_processes: names of the background processes, in the order of their columns
         reference: SM-inclusive reference point theta_g (config c0; strengths after the WCs are not used), or None
+        groups: group of every network, rows of Theta (None for a network without a group), or None
     Returns:
         {network name: label}
     '''
     rows, cols = np.tril_indices(len(wcs) + 1)
     kept = [(int(i), int(j)) for i, j, keep in zip(rows, cols, mask[: len(rows)]) if keep]
     linear = {i: kept.index((i, 0)) for i in range(1, len(wcs) + 1) if (i, 0) in kept}
+    constant = kept.index((0, 0)) if (0, 0) in kept else None
     # kept background columns follow the kept columns of T(theta) in Theta
     strengths = {}
     for process, keep in zip(background_processes, mask[len(rows) :]):
@@ -1458,22 +1462,40 @@ def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None
     g = None if reference is None else np.array([float(c) for c in reference[1 : len(wcs) + 1]])
     out = {}
     for name, row in zip(names, Theta):
+        if constant is not None and row[constant] == 0 and strengths:
+            present = [p for p, c in strengths.items() if row[c] != 0]
+            head = ' + '.join('b' if len(strengths) == 1 else rf'b_{{\rm {p}}}' for p in present)
+            point = [(rf'\mu_{{\rm {p}}}', row[c]) for p, c in strengths.items() if row[c] not in (0, 1)]
+            label = rf'${head}$ only'
+            if point:
+                label += rf', ${", ".join(t for t, _ in point)} = {", ".join(f"{v:.2f}" for _, v in point)}$'
+            out[name] = label
+            continue
         point = [(wc_tex(wcs[i - 1]), row[c]) for i, c in linear.items() if row[c] != 0]
         values = np.array([row[linear[i]] if i in linear else 0.0 for i in range(1, len(wcs) + 1)], dtype=np.float64)
         head = None
         if g is not None and g.any() and np.allclose(values, g, rtol=1e-5, atol=1e-6):
             head, point = r'\theta_g', []
+        elif not point:
+            head = r'{\rm sm}'
         point += [(rf'\mu_{{\rm {p}}}', row[c]) for p, c in strengths.items() if row[c] != 1]
         wc_part = ', '.join(t for t, _ in point)
         value_part = ', '.join(f'{v:.2f}' for _, v in point)
         if head is not None and point:
             out[name] = rf'${head}, {wc_part} = {value_part}$'
+        elif head == r'{\rm sm}':
+            out[name] = 'sm'
         elif head is not None:
             out[name] = rf'${head}$'
-        elif not point:
-            out[name] = 'sm'
         else:
             out[name] = rf'${wc_part} = {value_part}$'
+    if groups is not None:
+        counts = {}
+        for label in out.values():
+            counts[label] = counts.get(label, 0) + 1
+        for name, group in zip(names, groups):
+            if group is not None and counts[out[name]] > 1:
+                out[name] = f'{out[name]} ({group})'
     return out
 
 
@@ -1605,7 +1627,9 @@ def plot_drop_tests(
         members = groups[g]
         if len(members) == 1:
             return network_tex[members[0]]
-        return network_tex[members[0]].split(' = ')[0] + f'$ ({len(members)} points)'
+        label = network_tex[members[0]]
+        head = label.split(' = ')[0] + '$' if ' = ' in label else label
+        return f'{head} ({len(members)} points)'
 
     row_names = [row_label(g) for g in names] + (['all accepted (combined)'] if combined is not None else [])
     row_colors = [NOTE_COLORS['dropped'] if g in accepted else '#9a9a9a' if after[g] is None else 'k' for g in names]

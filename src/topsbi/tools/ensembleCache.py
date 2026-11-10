@@ -1,3 +1,4 @@
+from topsbi.tools.build_ratio import network_groups
 from topsbi.tools.data import expansion
 from topsbi.tools.metrics import merge_sparse_bins
 
@@ -170,12 +171,56 @@ def component_labels(wcs, mask, background_processes=()):
     return labels, kinds
 
 
+def network_rows(networks, sm):
+    """
+    The network config, name and group of every row of one seed's Theta and R, in row order: the networks, then
+    the SM network. For a list of networks, a name is the network's directory relative to the common directory of
+    every network and the SM network, and no row has a group. For grouped networks, it is '<group>:' followed by the
+    directory relative to the common directory of that group's networks; the SM network takes the group whose
+    common directory holds it (the innermost one). A seed trained against theta_0 = SM has no SM network: its exact
+    last row has no config and no group and is named 'sm', the name an SM network gets.
+
+    Args:
+        networks: list of network configs, or {group: [network configs]}
+        sm: SM network config, or None
+    Returns:
+        paths: [n_networks] network config of every row (None for the exact SM row)
+        names: [n_networks] name of every row
+        groups: [n_networks] group of every row (None without one)
+    Raises:
+        ValueError: the networks are grouped and no group's common directory holds the SM network
+    """
+    groups = network_groups(networks)
+    paths = [path for members in groups.values() for path in members] + [sm]
+    if not isinstance(networks, dict):
+        base = os.path.commonpath([os.path.dirname(p) for p in paths if p is not None])
+        names = [os.path.relpath(os.path.dirname(p), base) for p in paths[:-1]]
+        names += ['sm' if sm is None else os.path.relpath(os.path.dirname(sm), base)]
+        return paths, names, [None] * len(paths)
+    bases = {group: os.path.commonpath([os.path.dirname(p) for p in members]) for group, members in groups.items()}
+    names = [
+        f'{group}:{os.path.relpath(os.path.dirname(p), bases[group])}'
+        for group, members in groups.items()
+        for p in members
+    ]
+    row_groups = [group for group, members in groups.items() for _ in members]
+    if sm is None:
+        return paths, names + ['sm'], row_groups + [None]
+    sm_dir = os.path.dirname(sm)
+    holders = [group for group, base in bases.items() if os.path.commonpath([base, sm_dir]) == base]
+    if not holders:
+        raise ValueError(f'no group of networks holds the SM network {sm}')
+    group = max(holders, key=lambda g: len(bases[g]))
+    return paths, names + [f'{group}:{os.path.relpath(sm_dir, bases[group])}'], row_groups + [group]
+
+
 class SeedCollector:
     def __init__(self, seeds, path):
         """
         Write each seed's fit while Ensemble discards it, so only one seed's R is in memory: per-event Gamma, kept
-        events and fit residuals (layer 1 of the ensemble cache), and Theta, the network names and R, every network's
-        per-event ratio (layer 2), to {path}.tmp/seed_{seed}. write_cache completes the cache.
+        events and fit residuals (layer 1 of the ensemble cache), and Theta, the network names (network_rows), the
+        rows that alone determine the background columns when the fit has them, and R, every network's per-event
+        ratio (layer 2), to {path}.tmp/seed_{seed}. write_cache completes the cache.
         Pass an instance as Ensemble(..., per_seed=collector). The files are listed in docs/ensemble.md.
 
         Args:
@@ -188,11 +233,8 @@ class SeedCollector:
         os.makedirs(self.tmp)
 
     def __call__(self, seed, fit):
-        # network configs in the row order of Theta and R: the networks, then the SM network; a seed trained against
-        # theta_0 = SM has no SM network and its exact last row is named 'sm', the name an SM network gets
-        sm = self.seeds[seed].get('sm')
-        paths = self.seeds[seed]['networks'] + ([] if sm is None else [sm])
-        base = os.path.commonpath([os.path.dirname(p) for p in paths])
+        # names in the row order of Theta and R: the networks, then the SM network (or the exact SM row)
+        _, names, _ = network_rows(self.seeds[seed]['networks'], self.seeds[seed].get('sm'))
         d = f'{self.tmp}/seed_{seed}'
         os.makedirs(d)
         # file names are read by EnsembleCache
@@ -203,8 +245,10 @@ class SeedCollector:
             np.save(f'{d}/residuals.npy', fit.residuals.numpy())
         # R: every network's ratio for every event (inf where a network diverged; filter marks the usable events)
         np.save(f'{d}/ratios.npy', fit.R.numpy())
-        names = [os.path.relpath(os.path.dirname(p), base) for p in paths] + (['sm'] if sm is None else [])
-        np.savez(f'{d}/network.npz', Theta=fit.Theta.numpy(), networks=np.array(names))
+        arrays = {'Theta': fit.Theta.numpy(), 'networks': np.array(names)}
+        if fit.background_rows is not None:
+            arrays['background_rows'] = fit.background_rows.numpy()
+        np.savez(f'{d}/network.npz', **arrays)
 
 
 def network_hash(training):
@@ -225,12 +269,13 @@ def network_hash(training):
 def model_hashes(seeds):
     """
     sha256 of the model.pt of every network (SM last; none for a seed without an SM network, theta_0 = SM), per seed:
-    {seed: [hash, ...]} in config['seeds'] order.
+    {seed: [hash, ...]} in config['seeds'] order, the networks in the row order of Theta.
     """
     hashes = {}
     for seed, networks in seeds.items():
         sm = networks.get('sm')
-        hashes[seed] = [network_hash(path) for path in networks['networks'] + ([] if sm is None else [sm])]
+        paths = [path for members in network_groups(networks['networks']).values() for path in members]
+        hashes[seed] = [network_hash(path) for path in paths + ([] if sm is None else [sm])]
     return hashes
 
 
@@ -304,7 +349,10 @@ class EnsembleCache:
         }
 
     def network(self, seed):
-        """Theta and the network names of one seed (layer 2); row a of Theta belongs to network a."""
+        """
+        Theta, the network names and, when the fit has them, background_rows (the rows that alone determine the
+        background columns) of one seed (layer 2); row a of Theta belongs to network a.
+        """
         with np.load(f'{self.path}/seed_{seed}/network.npz') as f:
             out = {k: f[k] for k in f.files}
         out['networks'] = [str(n) for n in out['networks']]

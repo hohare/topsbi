@@ -46,9 +46,9 @@ the noise-subtracted rms bias per bin as a fraction of the SM yield $\lambda_{K_
 
 ## 4. Attribution
 
-Since $\hat\Gamma = \Theta^+ R$ for each member, the binned bias of a component is exactly a sum over the training networks,
+Each member's coefficients are linear in its ratios, $\hat\Gamma = \Theta^- R$, with $\Theta^-$ the generalized inverse of the ensemble fit ($\Theta\,\Theta^-\Theta = \Theta$): the pseudo-inverse $\Theta^+$ for least squares over every network, or the inverse of the fit whose background columns come from a subset of the networks (`tools/build_ratio.py` `generalized_inverse`). The binned bias of a component is therefore exactly a sum over the training networks,
 
-$$\Delta_{q,b} = \sum_a (\Theta^+)_{q,a}\, \Delta_{a,b},$$
+$$\Delta_{q,b} = \sum_a (\Theta^-)_{q,a}\, \Delta_{a,b},$$
 
 with $\Delta_{a,b} = \sum_{i \in K_b} w^s_i(\theta_0) \left(\hat r_a(x_i) - r_a(x_i, z_i)\right)$ the binned misclosure of network $a$. The share of network $a$ in the bias of component $q$ is the projection of its term on $\Delta_q$, weighted by $1 / \lambda_{K_b}(\theta_{\rm SM})^2$ and averaged over members; the shares of a component sum to 1 and can be negative (a network that cancels part of the bias). `attribution_identity` checks that the terms rebuild $\Delta$ (up to float32 rounding).
 

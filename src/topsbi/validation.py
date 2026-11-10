@@ -1,4 +1,4 @@
-from topsbi.tools.build_ratio import Ensemble, NetworkRatio, seed_map
+from topsbi.tools.build_ratio import Ensemble, NetworkRatio, fit_gamma, generalized_inverse, seed_map
 from topsbi.tools.data import expansion, sample_weight
 from topsbi.tools.ensembleCache import (
     EnsembleCache,
@@ -8,6 +8,7 @@ from topsbi.tools.ensembleCache import (
     is_cross_term,
     merge_sparse,
     network_hash,
+    network_rows,
     quantile_binning,
     write_cache,
 )
@@ -425,6 +426,27 @@ def component_bias(sums, binning):
     return {'Z': Z, 'rms_bias': rms_bias, 'D': D, 's2': s2}
 
 
+def seed_n_background(cache):
+    """Number of kept background columns of T(theta, mu) in the cache: the last columns of Theta and Gamma."""
+    n_theta = (cache.n_wcs + 1) * (cache.n_wcs + 2) // 2
+    return int(cache.mask[n_theta:].sum())
+
+
+def seed_inverse(cache, network):
+    """
+    The generalized inverse Theta^- of one seed's fit, Gamma = Theta^- R (generalized_inverse): Theta^+, or, when the
+    seed's network.npz holds background_rows, the fit whose background columns come from those rows alone.
+
+    Args:
+        cache: EnsembleCache
+        network: cache.network(seed)
+    Returns:
+        Theta_inv: [K, n_networks] float64
+    """
+    Theta = torch.from_numpy(network['Theta'])
+    return generalized_inverse(Theta, network.get('background_rows'), seed_n_background(cache)).numpy()
+
+
 def _network_sums_seed(seed, path, binning, w0, weights, chunk):
     """network_sums for one seed (through seed_map: the cache is opened here, so workers only memory-map it)."""
     cache = EnsembleCache(path)
@@ -443,6 +465,7 @@ def _network_sums_seed(seed, path, binning, w0, weights, chunk):
     return {
         'networks': list(network['networks']),
         'Theta': network['Theta'],
+        'Theta_inv': seed_inverse(cache, network),
         'bias': np.concatenate(bias),
         'mc_var': np.concatenate(mc_var),
     }
@@ -463,6 +486,7 @@ def network_sums(cache, binning, w0, weights, chunk=32, workers=1):
         {seed: dict with
             networks: network names (rows of Theta)
             Theta: [n_networks, K] expanded training points T(theta_1^(a)), one row per network a
+            Theta_inv: [K, n_networks] generalized inverse Theta^- of the seed's fit, Gamma = Theta^- R (seed_inverse)
             bias: [n_networks, B] sum_i w^s_i(theta_0) (r_hat_a - r_a) over the events the member kept, with r_hat_a the
                 network's row of R and r_a = r(x, z; theta_1^(a))
             mc_var: [n_networks, B] sum_i (w^s_i(theta_0) (r_hat_a - r_a))^2, the MC-statistics variance of bias
@@ -477,9 +501,10 @@ def attribute(networks, components, sm_yield):
     """
     Split the bias of the given gamma components into the contributions of the training networks.
 
-    gamma = Theta^+ r_hat per event, so the binned bias of component q is exactly
-    sum_a Theta^+_qa * bias_a. Each network's share is the projection of its contribution on the total,
-    weighted by 1 / lambda_K_b(theta_SM)^2 (bias relative to the SM yield); the shares of a component sum to 1.
+    gamma = Theta^- r_hat per event, with Theta^- the generalized inverse of the fit (Theta^+ for least squares over
+    every row; seed_inverse), so the binned bias of component q is exactly sum_a Theta^-_qa * bias_a. Each network's
+    share is the projection of its contribution on the total, weighted by 1 / lambda_K_b(theta_SM)^2 (bias relative
+    to the SM yield); the shares of a component sum to 1.
 
     Args:
         networks: output of network_sums
@@ -493,9 +518,9 @@ def attribute(networks, components, sm_yield):
     weight = np.where(occupied, 1 / np.where(occupied, sm_yield, 1) ** 2, 0)
     contributions = {}
     for s in networks.values():
-        pinv = np.linalg.pinv(s['Theta'].astype(np.float64))[components]
+        Theta_inv = s['Theta_inv'][components]
         for a, name in enumerate(s['networks']):
-            contributions[name] = contributions.get(name, 0) + pinv[:, a, None] * s['bias'][a] / len(networks)
+            contributions[name] = contributions.get(name, 0) + Theta_inv[:, a, None] * s['bias'][a] / len(networks)
     total = sum(contributions.values())
     norm = (total**2 * weight).sum(-1)
     shares = {name: (c * total * weight).sum(-1) / norm for name, c in contributions.items()}
@@ -547,21 +572,28 @@ def suspects(shares, z, networks, z_threshold=5.0, share_threshold=0.5, seed_fra
 
 
 def _refit_seed(seed, path, drop):
-    """refit_without for one seed (through seed_map): Gamma, kept events and rank of Theta without the drops."""
+    """
+    refit_without for one seed (through seed_map): Gamma, kept events and rank of Theta without the drops, from the
+    seed's fit (fit_gamma; the background columns from the seed's remaining background_rows when it has them).
+    """
     cache = EnsembleCache(path)
     network = cache.network(seed)
     rows = np.array([name not in drop for name in network['networks']])
     Theta = torch.from_numpy(network['Theta'][rows])
     R = torch.from_numpy(np.asarray(cache.seed_R(seed))[rows])
     keep = ~torch.isinf(R).any(0)
-    Gamma, _, rank, _ = torch.linalg.lstsq(Theta, R[:, keep], driver='gelsd')
-    # lstsq returns the solution in an [n_networks, N_finite] buffer; keep only Gamma's rows
-    return Gamma[: Theta.shape[1]].clone().numpy(), keep.numpy(), int(rank)
+    background_rows = network.get('background_rows')
+    if background_rows is None:
+        Gamma, _, rank, _ = torch.linalg.lstsq(Theta, R[:, keep], driver='gelsd')
+        # lstsq returns the solution in an [n_networks, N_finite] buffer; keep only Gamma's rows
+        return Gamma[: Theta.shape[1]].clone().numpy(), keep.numpy(), int(rank)
+    Gamma = fit_gamma(Theta, R[:, keep], torch.from_numpy(background_rows[rows]), seed_n_background(cache))
+    return Gamma.numpy(), keep.numpy(), int(torch.linalg.matrix_rank(Theta))
 
 
 def refit_without(cache, drop, workers=1):
     """
-    Refit every seed's Gamma without the dropped training points: Theta Gamma = R in least squares on the stored R.
+    Refit every seed's Gamma without the dropped training points, with the seed's fit (fit_gamma) on the stored R.
 
     Args:
         cache: EnsembleCache
@@ -570,6 +602,8 @@ def refit_without(cache, drop, workers=1):
     Returns:
         an object with the EnsembleCache attributes component_sums reads (seeds, seed_Gamma, seed_finite, Gamma,
         finite), plus rank: {seed: rank of the reduced Theta}
+    Raises:
+        ValueError: the drops leave a seed's remaining background rows unable to determine every column
     """
     fits = seed_map(_refit_seed, cache.seeds, (cache.path, drop), workers)
     seed_Gamma = {s: f[0] for s, f in fits.items()}
@@ -591,24 +625,38 @@ def refit_without(cache, drop, workers=1):
 def _drop_bias_seed(seed, path, groups, binning, w0, weights, chunk):
     """
     drop_bias_sums for one seed (through seed_map): {group: binned bias of the seed with the group removed, or None if
-    removing it leaves this seed's Theta rank-deficient}.
+    removing it leaves this seed's fit rank-deficient}.
     """
     cache = EnsembleCache(path)
     index, n_bins = binning['index'], binning['n_bins']
     network = cache.network(seed)
     names, Theta = network['networks'], network['Theta'].astype(np.float64)
+    K = Theta.shape[1]
     keep = cache.seed_finite[seed]
     R = cache.seed_R(seed)
     H = Theta.T @ Theta
-    # groups whose removal leaves Theta full rank: (their rows of Theta, H - Theta_J^T Theta_J)
+    background_rows = network.get('background_rows')
+    if background_rows is not None:
+        split = K - seed_n_background(cache)
+        B = np.flatnonzero(background_rows)
+        H_B = Theta[B].T @ Theta[B]
+    # groups whose removal leaves the fit full rank: their rows of Theta and the downdated normal matrices
     reduced, out = {}, {}
     for g, members in groups.items():
         rows = [names.index(n) for n in members]
         Hg = H - Theta[rows].T @ Theta[rows]
-        if np.linalg.matrix_rank(Hg) < len(Hg):
+        if background_rows is None:
+            if np.linalg.matrix_rank(Hg) < K:
+                out[g] = None
+                continue
+            reduced[g] = {'rows': rows, 'H': Hg}
+            continue
+        rows_B = [r for r in rows if background_rows[r]]
+        HBg = H_B - Theta[rows_B].T @ Theta[rows_B]
+        if np.linalg.matrix_rank(HBg) < K or np.linalg.matrix_rank(Hg[:split, :split]) < split:
             out[g] = None
             continue
-        reduced[g] = (rows, Hg)
+        reduced[g] = {'rows': rows, 'H': Hg, 'rows_B': rows_B, 'H_B': HBg}
     keep_t = torch.from_numpy(keep)
     truth = binned_sums(weights[keep_t].T, index[:, keep_t], n_bins)
     seed_bias = {g: -truth for g in reduced}
@@ -618,9 +666,19 @@ def _drop_bias_seed(seed, path, groups, binning, w0, weights, chunk):
         Rc = np.asarray(R[:, start : start + chunk])[:, kept].astype(np.float64)
         kept = torch.from_numpy(start + kept)
         b = Theta.T @ Rc
-        for g, (rows, Hg) in reduced.items():
-            Gamma = torch.from_numpy(np.linalg.solve(Hg, b - Theta[rows].T @ Rc[rows]))
-            seed_bias[g] += binned_sums(Gamma * w0[kept], index[:, kept], n_bins)
+        if background_rows is not None:
+            b_B = Theta[B].T @ Rc[B]
+        for g, r in reduced.items():
+            rows = r['rows']
+            bg = b - Theta[rows].T @ Rc[rows]
+            if background_rows is None:
+                Gamma = np.linalg.solve(r['H'], bg)
+            else:
+                rows_B = r['rows_B']
+                Gamma_bg = np.linalg.solve(r['H_B'], b_B - Theta[rows_B].T @ Rc[rows_B])[split:]
+                rhs = bg[:split] - r['H'][:split, split:] @ Gamma_bg
+                Gamma = np.vstack([np.linalg.solve(r['H'][:split, :split], rhs), Gamma_bg])
+            seed_bias[g] += binned_sums(torch.from_numpy(Gamma) * w0[kept], index[:, kept], n_bins)
     return out | seed_bias
 
 
@@ -629,8 +687,10 @@ def drop_bias_sums(cache, groups, binning, w0, weights, sums, chunk=50_000, work
     Binned bias of the components gamma_q with each group of training points removed, every group from one pass over
     each seed's R. Dropping rows J of Theta gives Gamma_-J = (H - Theta_J^T Theta_J)^-1 (Theta^T R - Theta_J^T R_J),
     H = Theta^T Theta, so a group costs one K x K solve per seed instead of a new least-squares fit (float64, since the
-    normal equations square the condition number). Each seed keeps its cached finite-event mask, and Var_MC is taken
-    from the full ensemble (removing a few networks hardly changes it).
+    normal equations square the condition number). A seed whose fit takes the background columns from its
+    background_rows B downdates both stages: Gamma_bg from the rows of B outside J, then the other columns from
+    (H_-J)_sig,sig Gamma_sig = (Theta^T R - Theta_J^T R_J)_sig - (H_-J)_sig,bg Gamma_bg. Each seed keeps its cached
+    finite-event mask, and Var_MC is taken from the full ensemble (removing a few networks hardly changes it).
 
     Args:
         cache: EnsembleCache
@@ -640,7 +700,7 @@ def drop_bias_sums(cache, groups, binning, w0, weights, sums, chunk=50_000, work
         chunk: events per step (memory: one step holds R for chunk events in float64)
         workers: seeds processed at once, one process each (seed_map)
     Returns:
-        {group name: sums dict for component_bias, or None if removing the group leaves Theta rank-deficient}
+        {group name: sums dict for component_bias, or None if removing the group leaves a seed's fit rank-deficient}
     """
     w0 = torch.as_tensor(w0, dtype=torch.float64)
     weights = torch.as_tensor(weights, dtype=torch.float64)
@@ -826,17 +886,71 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
     return [u for u in units if u is not None]
 
 
-def objective_weights(cfg, wcs, mask, flagged, Theta, m, n_background=0):
+def fixed_background(Theta, m, background_rows, n_background):
+    """
+    The part of Cov(gamma_hat) that the point search holds fixed when the fit takes the background columns from
+    background_rows alone: new points join only the fit of the other columns. With Theta^-_bg the background rows of
+    the generalized inverse and M = diag(m): C_bg = Theta^-_bg M^2 Theta^-_bg^T (the covariance of the background
+    columns) and W = Theta^-_bg M^2 Theta_sig.
+
+    Args:
+        Theta: [n_networks, K] expanded training points of the current design, the background columns last
+        m: [n_networks] misclosure of each network
+        background_rows: [n_networks] bool, or None
+        n_background: number of background columns of Theta
+    Returns:
+        dict(split, C_bg, W), split = K - n_background, or None without background_rows
+    """
+    if background_rows is None:
+        return None
+    split = Theta.shape[1] - n_background
+    inverse_bg = generalized_inverse(torch.from_numpy(Theta), background_rows, n_background).numpy()[split:]
+    weighted = inverse_bg * m**2
+    return {'split': split, 'C_bg': weighted @ inverse_bg.T, 'W': weighted @ Theta[:, :split]}
+
+
+def design_covariance(H, S, fixed=None):
+    """
+    Cov(gamma_hat) of a design from H = Theta^T Theta and S = Theta^T M^2 Theta (independent network errors of size
+    m, M = diag(m)); H and S may be stacks [..., K, K]. Least squares over every row: H^+ S H^+. With fixed
+    (fixed_background): the background block is C_bg, and the other columns come from least squares over every row
+    with the background term subtracted, Cov_sig = H_ss^+ S_sig H_ss^+ with
+    S_sig = S_ss - H_sb W - W^T H_sb^T + H_sb C_bg H_sb^T, and Cov_sig,bg = H_ss^+ (W^T - H_sb C_bg).
+
+    Args:
+        H: [..., K, K] Theta^T Theta
+        S: [..., K, K] Theta^T M^2 Theta
+        fixed: output of fixed_background, or None
+    Returns:
+        [..., K, K] Cov(gamma_hat) (Sigma in code)
+    """
+    if fixed is None:
+        Hi = np.linalg.pinv(H)
+        return Hi @ S @ Hi
+    k, C, W = fixed['split'], fixed['C_bg'], fixed['W']
+    H_ss, H_sb = H[..., :k, :k], H[..., :k, k:]
+    HW = H_sb @ W
+    S_sig = S[..., :k, :k] - HW - np.swapaxes(HW, -1, -2) + H_sb @ C @ np.swapaxes(H_sb, -1, -2)
+    Hi = np.linalg.pinv(H_ss)
+    sig = Hi @ S_sig @ Hi
+    cross = Hi @ (W.T - H_sb @ C)
+    bg = np.broadcast_to(C, cross.shape[:-2] + C.shape)
+    top = np.concatenate([sig, cross], -1)
+    bottom = np.concatenate([np.swapaxes(cross, -1, -2), bg], -1)
+    return np.concatenate([top, bottom], -2)
+
+
+def objective_weights(cfg, wcs, mask, flagged, Theta, m, n_background=0, fixed=None):
     """
     The weight matrix G of the point-search objective tr(Cov(gamma_hat) G).
 
     - G: scan  -> scan-region second moments E[T(theta, mu) T(theta, mu)^T] with every mu_p = 1 (scan_moments with
       cfg bounds, mode, shape)
     - G: flagged (default) -> diag(g_q / Var(gamma_hat_q)), Var(gamma_hat_q) propagated for the current design
-      (sigma0_2 in code), with objective weights g_q (new symbol, g in code) = 1 for flagged components and
-      cfg['unflagged_weight'] (0.1) for the others, or 1 for all if none is flagged. Dividing by Var(gamma_hat_q)
-      makes the objective the g-weighted sum of relative variance reductions, so components with large
-      uncertainties do not dominate.
+      (sigma0_2 in code, design_covariance), with objective weights g_q (new symbol, g in code) = 1 for flagged
+      components and cfg['unflagged_weight'] (0.1) for the others, or 1 for all if none is flagged. Dividing by
+      Var(gamma_hat_q) makes the objective the g-weighted sum of relative variance reductions, so components with
+      large uncertainties do not dominate.
 
     Args:
         cfg: point_search section of the config
@@ -846,13 +960,13 @@ def objective_weights(cfg, wcs, mask, flagged, Theta, m, n_background=0):
         Theta: [n_networks, K] expanded training points of the current design
         m: [n_networks] misclosure of each network
         n_background: number of background columns after T(theta)
+        fixed: fixed_background of the design, or None (least squares over every row)
     Returns:
         [K, K] G
     """
     if cfg.get('G', 'flagged') == 'scan':
         return scan_moments(wcs, cfg['bounds'], mask, cfg.get('mode', 'box'), cfg.get('shape', 'uniform'), n_background)
-    Hi = np.linalg.pinv(Theta.T @ Theta)
-    sigma0_2 = np.diag(Hi @ (Theta.T @ (m[:, None] ** 2 * Theta)) @ Hi)
+    sigma0_2 = np.diag(design_covariance(Theta.T @ Theta, Theta.T @ (m[:, None] ** 2 * Theta), fixed))
     g = np.full(Theta.shape[1], cfg.get('unflagged_weight', 0.1) if flagged else 1.0)
     g[flagged] = 1.0
     return np.diag(np.where(sigma0_2 > 0, g / np.where(sigma0_2 > 0, sigma0_2, 1), 0))
@@ -875,11 +989,12 @@ def unconstrained_components(Theta, rtol=1e-10):
     return (null**2).sum(0) > rtol
 
 
-def search_points(Theta, m, units, G, n_units=10, min_gain=0.01, chunk=256):
+def search_points(Theta, m, units, G, n_units=10, min_gain=0.01, chunk=256, fixed=None):
     """
-    Greedily add the unit that most reduces tr(Cov(gamma_hat) G), Cov(gamma_hat) = H^+ S H^+ (Sigma in code) with
-    H = Theta^T Theta and S = Theta^T M^2 Theta (independent network errors of size m); stop after n_units or when a
-    unit gains less than min_gain (relative).
+    Greedily add the unit that most reduces tr(Cov(gamma_hat) G), Cov(gamma_hat) from H = Theta^T Theta and
+    S = Theta^T M^2 Theta (independent network errors of size m; design_covariance: H^+ S H^+ for least squares over
+    every row, Sigma in code); stop after n_units or when a unit gains less than min_gain (relative). With fixed
+    (fixed_background), new units join only the fit of the columns other than the background ones.
 
     Returns:
         chosen units, sqrt(Var(gamma_hat_q)) before and after (sigma0, sigma1 in code), objective after each step
@@ -888,8 +1003,7 @@ def search_points(Theta, m, units, G, n_units=10, min_gain=0.01, chunk=256):
     S = Theta.T @ (m[:, None] ** 2 * Theta)
 
     def objective(H, S):
-        Hi = np.linalg.pinv(H)
-        Sigma = Hi @ S @ Hi
+        Sigma = design_covariance(H, S, fixed)
         return np.einsum('...kl,lk->...', Sigma, G), np.sqrt(np.maximum(np.einsum('...kk->...k', Sigma), 0))
 
     current, sigma0 = objective(H, S)
@@ -982,7 +1096,7 @@ def write_results(
             }
         components[label] = entry
 
-    # the networks rebuild the measured bias exactly up to float32 rounding (gamma = Theta^+ r_hat)
+    # the networks rebuild the measured bias exactly up to float32 rounding (gamma = Theta^- r_hat)
     identity = None
     if total is not None:
         D = bias['D'][flagged]
@@ -1223,7 +1337,11 @@ def main(config_path, refit=False, backgrounds=False):
             )['all']
 
     first = cache.network(cache.seeds[0])
-    tex = network_tex(first['Theta'], first['networks'], wcs, cache.mask, cache.background_processes, config['c0'])
+    first_config = config['seeds'][cache.seeds[0]]
+    _, _, row_groups = network_rows(first_config['networks'], first_config.get('sm'))
+    tex = network_tex(
+        first['Theta'], first['networks'], wcs, cache.mask, cache.background_processes, config['c0'], row_groups
+    )
     # what each suspect drop did to every affected component, and the combined refit
     if groups:
         for version, everything in [('compact', False), ('full', True)]:
@@ -1269,17 +1387,20 @@ def main(config_path, refit=False, backgrounds=False):
     )
     design = cache.network(cache.seeds[0])
     Theta, names = design['Theta'].astype(np.float64), list(design['networks'])
-    paths = cache.manifest['seeds'][cache.seeds[0]]
+    seed_paths = cache.manifest['seeds'][cache.seeds[0]]
     # one config per row of Theta, SM last; None for the exact SM row of a seed trained against theta_0 = SM (no
     # network there, so it is never dropped or retrained)
-    paths = paths['networks'] + [paths.get('sm')]
+    paths, _, _ = network_rows(seed_paths['networks'], seed_paths.get('sm'))
     extra = []
     for n in drop:
         with open(paths[names.index(n)]) as f:
             extra.append((n, yaml.safe_load(f)['c1']))
     keep = np.array([n not in drop for n in names])
     Theta, names = Theta[keep], [n for n, k in zip(names, keep) if k]
+    background_rows = design.get('background_rows')
+    background_rows = None if background_rows is None else background_rows[keep]
     m = np.array([misclosure[n] for n in names])
+    fixed = fixed_background(Theta, m, background_rows, seed_n_background(cache))
     totals = all_weights.sum(0)
     sm_inclusive = float(expansion(sm_point, len(wcs), dtype=torch.float64) @ totals)
 
@@ -1290,9 +1411,9 @@ def main(config_path, refit=False, backgrounds=False):
     units = candidate_units(
         wcs, Theta, names, misclosure, cache.mask, yield_ratio, max_yield, extra, cache.background_processes
     )
-    G = objective_weights(cfg, wcs, cache.mask, flagged, Theta, m, n_background)
+    G = objective_weights(cfg, wcs, cache.mask, flagged, Theta, m, n_background, fixed)
     chosen, sigma0, sigma1, history = search_points(
-        Theta, m, units, G, cfg.get('n_units', 10), cfg.get('min_gain', 0.01)
+        Theta, m, units, G, cfg.get('n_units', 10), cfg.get('min_gain', 0.01), fixed=fixed
     )
     # components the design cannot determine have no propagated error (the pseudo-inverse would report 0)
     sigma0 = np.where(unconstrained_components(Theta), np.nan, sigma0)
