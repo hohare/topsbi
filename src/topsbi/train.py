@@ -34,8 +34,9 @@ BACKGROUND_KEYS = ('data', 'background', 'lumi', 'seed')
 def check_config(config):
     """
     Raise before loading anything if the method is missing or unknown, a nuisance or background training misses a
-    key, the optional 'eras', 'closure_groups', 'threads' or 'background_processes' are malformed, or c0 / c1 do not
-    have one entry for the SM, each WC and each background process.
+    key, a nuisance 'systematic' is neither a name nor a non-empty list of distinct names, the optional 'eras',
+    'closure_groups', 'threads' or 'background_processes' are malformed, or c0 / c1 do not have one entry for the SM,
+    each WC and each background process.
     """
     methods = EFT_METHODS + SOFT_PLUS_METHODS
     if config.get('method') not in methods:
@@ -44,6 +45,15 @@ def check_config(config):
     missing = [key for key in required.get(config['method'], ()) if key not in config]
     if missing:
         raise KeyError(f"method {config['method']!r} needs {missing}")
+    systematic = config.get('systematic')
+    if config['method'] in NUISANCE_METHODS and not isinstance(systematic, str):
+        if (
+            not isinstance(systematic, list)
+            or not systematic
+            or not all(isinstance(name, str) for name in systematic)
+            or len(set(systematic)) != len(systematic)
+        ):
+            raise ValueError(f"config 'systematic' must be a name or a list of distinct names, got {systematic!r}")
     if 'eras' in config and 'lumi' in config and len(config['eras']) != len(config['lumi']):
         raise ValueError(f"config 'eras' has {len(config['eras'])} names but 'lumi' {len(config['lumi'])} values")
     locs = []

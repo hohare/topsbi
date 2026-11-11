@@ -290,6 +290,75 @@ def test_kinematic_shift_keeps_variation_eras(nuisance_config):
         load_nuisance_data(config)
 
 
+def test_merged_weight_systematics(tmp_path):
+    """A list of per-era weight systematics gives their columns; w1 = w0 times the product of their ratios."""
+    from topsbi.tools.data import syst_ratio_column, weight_shift_sample
+
+    (tmp_path / 'nominal').mkdir()
+    (tmp_path / 'nominal' / 'systematics.yml').write_text(
+        yaml.safe_dump({'syst_ratio': ['ISR', 'b_2017', 'b_2018'], 'directions': ['Up', 'Down']})
+    )
+    assert syst_ratio_column(str(tmp_path), ['b_2017', 'b_2018'], 'down') == ([1, 2], 1)
+    assert syst_ratio_column(str(tmp_path), 'b_2018', 'Up') == (2, 0)
+    with pytest.raises(ValueError, match='unknown'):
+        syst_ratio_column(str(tmp_path), ['b_2017', 'b_2016'], 'up')
+
+    features = torch.zeros(4, 22)
+    features[2:, 21] = 1  # events 0, 1 in era 0, events 2, 3 in era 1
+    syst_ratio = torch.ones(4, 3, 2)
+    syst_ratio[:2, 1, 1] = 0.9  # b_2017 Down acts on the era-0 events only
+    syst_ratio[2:, 2, 1] = 1.2  # b_2018 Down acts on the era-1 events only
+    tensors = [features, None, None, None, syst_ratio, torch.ones(4, 1)]
+    config = {'lumi': [1.0, 1.0], 'device': 'cpu'}
+    _, w0, w1 = weight_shift_sample(tensors, config, [1, 2], 1)
+    assert torch.allclose(w1 / w0, torch.tensor([0.9, 0.9, 1.2, 1.2]))
+
+    # an event shifted by two of the merged systematics breaks the per-era factorisation
+    syst_ratio[0, 2, 1] = 1.1
+    with pytest.raises(ValueError, match='more than one'):
+        weight_shift_sample(tensors, config, [1, 2], 1)
+
+
+def test_kinematic_shift_merged_eras(nuisance_config):
+    """Per-era variations trained as one: the union of their events against the nominal events of their eras."""
+    import os
+
+    from topsbi.tools.data import load_nuisance_data
+
+    root = nuisance_config['data']
+    os.makedirs(f'{root}/JER_2018Up')
+    for split in ('train', 'validation'):
+        features, _, ids, event_id, _, w_ref = torch.load(f'{root}/nominal/{split}.p', weights_only=False)[:]
+        rows = features[:, 21] == 3
+        shifted = features[rows].clone()
+        shifted[:, 0] *= 1.01
+        torch.save(
+            torch.utils.data.TensorDataset(shifted, w_ref[rows], ids[rows], event_id[rows]),
+            f'{root}/JER_2018Up/{split}.p',
+        )
+
+    kinematic = {**nuisance_config, 'method': 'kinematic_shift'}
+    single = {name: load_nuisance_data({**kinematic, 'systematic': name}) for name in ('JER_2017', 'JER_2018')}
+    merged = load_nuisance_data({**kinematic, 'systematic': ['JER_2017', 'JER_2018']})
+    for key, split in merged.items():
+        assert set(split['nominal'][0][:, 21].tolist()) == {2.0, 3.0}
+        for sample in ('nominal', 'shifted'):
+            assert len(split[sample][0]) == sum(len(single[name][key][sample][0]) for name in single)
+
+    # the same era in two merged variations
+    with pytest.raises(ValueError, match='also in another'):
+        load_nuisance_data({**kinematic, 'systematic': ['JER_2017', 'JER_2017']})
+
+
+@pytest.mark.parametrize('systematic', [[], ['JER_2017', 'JER_2017'], ['JER_2017', 3], 5])
+def test_check_config_systematic(nuisance_config, systematic):
+    """'systematic' is a name or a non-empty list of distinct names."""
+    from topsbi.train import check_config
+
+    with pytest.raises(ValueError, match="'systematic'"):
+        check_config({**nuisance_config, 'method': 'kinematic_shift', 'systematic': systematic})
+
+
 def test_background_training(background_config, tmp_path):
     from topsbi.train import hypothesis, main
 

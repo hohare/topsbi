@@ -313,26 +313,33 @@ def event_split(tensors: list, layout: str, seed: int, test_fraction: float = 0.
     return torch.from_numpy(u < test_fraction)
 
 
-def syst_ratio_column(root: str, systematic: str, direction: str):
+def syst_ratio_column(root: str, systematic, direction: str):
     """
     Index of a weight systematic and direction in the nominal syst_ratio tensor.
 
     Args:
         root: combined data directory (holds nominal/systematics.yml)
-        systematic: name as in systematics.yml, e.g. 'renorm'
+        systematic: name as in systematics.yml, e.g. 'renorm', or a list of names trained as one systematic (per-era
+            systematics, each acting on its own era's events only, e.g. ['btagSFbc_2017', 'btagSFbc_2018'])
         direction: 'up' or 'down' (case-insensitive)
     Returns:
-        (k, d): syst_ratio[:, k, d] is r(x, z; theta, nu) = w^s(theta, nu) / w^s(theta, 0) of that systematic
+        (k, d): syst_ratio[:, k, d] is r(x, z; theta, nu) = w^s(theta, nu) / w^s(theta, 0) of that systematic; for a
+        list, k is the list of its columns and r is the product of syst_ratio[:, k, d] over them
     """
     with open(f'{root}/nominal/systematics.yml') as f:
         spec = yaml.safe_load(f)
     names = spec['syst_ratio']
     directions = [d.lower() for d in spec.get('directions', ['Up', 'Down'])]
-    if systematic not in names:
-        raise ValueError(f'unknown weight systematic {systematic!r}; available: {names}')
+    wanted = [systematic] if isinstance(systematic, str) else list(systematic)
+    unknown = [name for name in wanted if name not in names]
+    if unknown:
+        raise ValueError(f'unknown weight systematic {unknown}; available: {names}')
     if direction.lower() not in directions:
         raise ValueError(f'unknown direction {direction!r}; available: {directions}')
-    return names.index(systematic), directions.index(direction.lower())
+    d = directions.index(direction.lower())
+    if isinstance(systematic, str):
+        return names.index(systematic), d
+    return [names.index(name) for name in wanted], d
 
 
 def load_combined(path: str, layout: str, names: tuple):
@@ -354,21 +361,30 @@ def load_combined(path: str, layout: str, names: tuple):
     return [t.clone() if name in names else None for name, t in zip(NUISANCE_COLUMNS[layout], tensors)]
 
 
-def weight_shift_sample(tensors: list, config: dict, k: int, d: int):
+def weight_shift_sample(tensors: list, config: dict, k, d: int):
     """
     Paired sample of a weight systematic: the nominal events with w^s(theta, 0) and w^s(theta, nu).
 
     Args:
         tensors: nominal tensors (load_combined)
         config: dictionary with 'lumi' and 'device'
-        k: syst_ratio column of the systematic (syst_ratio_column)
+        k: syst_ratio column of the systematic (syst_ratio_column), or a list of columns of per-era systematics
+            trained as one: their ratio is the product, and each event may be shifted by one of them at most
         d: direction index, 0 up / 1 down
     Returns:
         features x, w0 = w^s(theta, 0) (sample_weight), w1 = w^s(theta, nu) = w0 r(x, z; theta, nu)
+    Raises:
+        ValueError: for a list of columns, if an event has a ratio != 1 in more than one of them
     """
     columns = dict(zip(NUISANCE_COLUMNS['nominal'], tensors))
     w0 = sample_weight(tensors, 'nominal', config)
-    return columns['features'], w0, w0 * columns['syst_ratio'][:, k, d]
+    ratio = columns['syst_ratio'][:, k, d]
+    if isinstance(k, list):
+        shared = int(((ratio != 1).sum(dim=1) > 1).sum())
+        if shared:
+            raise ValueError(f'{shared} events are shifted by more than one of the merged systematics {k}')
+        ratio = ratio.prod(dim=1)
+    return columns['features'], w0, w0 * ratio
 
 
 def kinematic_shift_sample(nominal: list, shifted: list, config: dict):
@@ -447,6 +463,24 @@ def _keep_eras(nominal: list, eras: torch.tensor, year_loc: int):
     return _select(nominal, torch.isin(features[:, year_loc].to(torch.int64), eras))
 
 
+def _load_variations(root: str, variations: list, file: str, need: tuple, year_loc: int):
+    """
+    Variation tensors of one file, concatenated over the variation directories, and the era indices they cover.
+    Several directories (per-era variations trained as one systematic) must cover disjoint eras.
+    """
+    parts, eras = [], torch.zeros(0, dtype=torch.int64)
+    for variation in variations:
+        shifted = load_combined(f'{root}/{variation}/{file}', 'variation', need)
+        variation_eras = _variation_eras(shifted, year_loc)
+        overlap = variation_eras[torch.isin(variation_eras, eras)]
+        if len(overlap):
+            raise ValueError(f'{variation}: eras {overlap.tolist()} in {file} are also in another merged variation')
+        parts.append(shifted)
+        eras = torch.cat([eras, variation_eras])
+    merged = [None if parts[0][i] is None else torch.cat([part[i] for part in parts]) for i in range(len(parts[0]))]
+    return merged, torch.unique(eras)
+
+
 def _check_same_sample_setup(root: str, variation: str):
     """
     Nominal and the variation must share the reference point and the train/validation split salt.
@@ -472,24 +506,29 @@ def load_nuisance_data(config: dict):
     train.p is split into train and test (early stopping) by event_split with the training seed, so an event is on
     the same side in nominal and the variation; validation.p is the holdout. The variation of kinematic_shift is the
     directory <systematic><Up|Down>; its nominal sample is restricted to the eras present in the variation (a
-    variation produced only for some eras, e.g. JER per year, leaves the others unchanged).
+    variation produced only for some eras, e.g. JER per year, leaves the others unchanged). A list of systematics
+    (per-era systematics on disjoint eras) is trained as one: weight_shift takes the product of their ratios,
+    kinematic_shift the union of their variation directories.
 
     Args:
-        config: dictionary with 'method', 'data', 'systematic', 'direction', 'seed', 'lumi', 'device'
+        config: dictionary with 'method', 'data', 'systematic' (a name or a list of names), 'direction', 'seed',
+            'lumi', 'device'
     Returns:
         {'train', 'test', 'holdout'}: (features, w0, w1) for weight_shift, kinematic_shift_sample dicts otherwise
     """
     root, method, seed = config['data'], config['method'], config['seed']
     direction = config['direction'].lower()
-    variation = None
+    systematics = [config['systematic']] if isinstance(config['systematic'], str) else list(config['systematic'])
+    variations = None
     if method == 'weight_shift':
         k, d = syst_ratio_column(root, config['systematic'], direction)
         need = ('features', 'ids', 'event_id', 'syst_ratio', 'w_ref')
     elif method == 'kinematic_shift':
-        variation = f"{config['systematic']}{direction.capitalize()}"
-        if not os.path.isdir(f'{root}/{variation}'):
-            raise FileNotFoundError(f'no variation {variation!r} in {root}')
-        _check_same_sample_setup(root, variation)
+        variations = [f'{name}{direction.capitalize()}' for name in systematics]
+        for variation in variations:
+            if not os.path.isdir(f'{root}/{variation}'):
+                raise FileNotFoundError(f'no variation {variation!r} in {root}')
+            _check_same_sample_setup(root, variation)
         need = ('features', 'ids', 'event_id', 'w_ref')
     else:
         raise ValueError(f'{method!r} is not a nuisance method')
@@ -506,14 +545,13 @@ def load_nuisance_data(config: dict):
     for split_name, file in (('train', 'train.p'), ('holdout', 'validation.p')):
         nominal = load_combined(f'{root}/nominal/{file}', 'nominal', need)
         shifted = None
-        if variation is not None:
-            shifted = load_combined(f'{root}/{variation}/{file}', 'variation', need)
-            split_eras = _variation_eras(shifted, year_loc)
+        if variations is not None:
+            shifted, split_eras = _load_variations(root, variations, file, need, year_loc)
             if eras is None:
                 eras = split_eras
-                print(f'[INFO] {variation}: eras {eras.tolist()}; nominal rows of other eras are left out')
+                print(f"[INFO] {' + '.join(variations)}: eras {eras.tolist()}; nominal rows of other eras are left out")
             elif not torch.equal(split_eras, eras):
-                raise ValueError(f'{variation}: eras {split_eras.tolist()} in {file} but {eras.tolist()} in train.p')
+                raise ValueError(f'{variations}: eras {split_eras.tolist()} in {file} but {eras.tolist()} in train.p')
             nominal = _keep_eras(nominal, eras, year_loc)
         if split_name == 'holdout':
             out['holdout'] = build(nominal, shifted)
