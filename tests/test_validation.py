@@ -4,6 +4,7 @@ trained networks): two WCs, three members of twelve training points plus SM, "ne
 with 1% noise per event, optionally with a bias injected into one network.
 """
 
+import pickle
 import types
 
 import numpy as np
@@ -293,16 +294,24 @@ def test_drop_tests(biased):
     assert not result['every cross point']['accepted'] and isinstance(result['every cross point']['harmed'], str)
 
 
+@pytest.mark.slow
 def test_workers_give_identical_results(biased):
+    # one spawn pool (network_sums): seed_map's parallel path gives the serial result bit for bit, in seed order
     args = (biased.cache, biased.binning, biased.w0, biased.weights)
     assert equal(val.network_sums(*args, workers=1), val.network_sums(*args, workers=2))
-    one, two = val.refit_without(biased.cache, [BAD], workers=1), val.refit_without(biased.cache, [BAD], workers=2)
-    assert equal(vars(one), vars(two))
+    # the other per-seed functions go through the same seed_map; in a spawn pool they and their arguments are
+    # pickled, so the pickled call must give the serial result
     groups = {'bad': [BAD]}
-    assert equal(
-        val.drop_bias_sums(*args[:1], groups, *args[1:], biased.sums, workers=1),
-        val.drop_bias_sums(*args[:1], groups, *args[1:], biased.sums, workers=2),
-    )
+    w0 = torch.as_tensor(biased.w0, dtype=torch.float64)
+    weights = torch.as_tensor(biased.weights, dtype=torch.float64)
+    calls = [
+        (val._refit_seed, (biased.cache.path, [BAD])),
+        (val._drop_bias_seed, (biased.cache.path, groups, biased.binning, w0, weights, 50_000)),
+    ]
+    seed = biased.cache.seeds[0]
+    for function, call_args in calls:
+        copy, copied_args = pickle.loads(pickle.dumps((function, call_args)))
+        assert equal(function(seed, *call_args), copy(seed, *copied_args))
 
 
 def test_design_uncertainty(null):

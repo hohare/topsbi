@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import mplhep as mh
 
-import logging, os, re, torch, yaml, hist
+import logging, os, re, torch, yaml
 
 
 # tick labels of the closure groups (era, njets with >= 4 merged): {column: (name, {value: text})}
@@ -56,6 +56,8 @@ def kinematic_ratio_plot(x: np.array, w_hat_dedicated: np.array, w_hat_parametri
         w: w^s(x_i, z_i; theta_1) per event
         params: dictionary containing plotting information
     """
+    import hist  # used only here; importing it pulls in pandas
+
     # initialize the figure
     mh.style.use("CMS")
     ax = []

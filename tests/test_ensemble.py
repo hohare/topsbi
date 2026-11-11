@@ -1,3 +1,4 @@
+import pickle
 import types
 
 import numpy as np
@@ -7,7 +8,7 @@ import yaml
 
 import topsbi.tools.build_ratio as build
 from topsbi.tools.data import expansion, get_lower_tri
-from topsbi.tools.ensembleCache import network_rows
+from topsbi.tools.ensembleCache import SeedCollector, network_rows
 
 N_EVENTS = 6
 # two WCs: get_lower_tri([1, a, b]) has 6 terms, 3 of which are kept
@@ -281,16 +282,33 @@ def test_ratio_fit_background_fit(toy):
     assert network_rows(plain, None) == (plain + [None], expected, [None] * (len(plain) + 1))
 
 
-def test_ensemble_background_column(toy):
+def test_ensemble_background_column(toy, monkeypatch):
     paths = toy_configs(toy.root / 'ensemble', {**TOY_POINTS, **MU_POINTS}, TOY_SM, TOY_C0)
     config = {'device': 'cpu', 'c0': TOY_C0, 'features': {'x': {'loc': 0}}, 'seeds': {0: seed_config(paths)}}
     config['seeds'][1] = config['seeds'][0]
-    ens = build.Ensemble(config, toy.features)
+    ens = serial = build.Ensemble(config, toy.features)
     assert ens.n_wcs == 1 and ens.background_processes == ['bg'] and ens.mask.all()
     point = [1.0, 0.3, 0.7]
     assert np.allclose(ens(point).numpy(), toy_ratio(toy.x, point, TOY_C0), rtol=1e-3, atol=1e-4)
+
     blind = toy_configs(toy.root / 'blind', TOY_POINTS, TOY_SM, TOY_C0)
     ens = build.Ensemble({**config, 'seeds': {0: seed_config(blind)}}, toy.features)
     assert not ens.mask[-1]
     with pytest.raises(ValueError, match='no network moved'):
         ens(point)
+
+    # workers > 1: seed_map sends fit_seed and its arguments (with the per-seed SeedCollector) to spawn processes
+    # by pickling them; the same round trip in this process, without starting a pool, gives the serial ensemble
+    def pickled_map(function, seeds, args, workers=1):
+        function, args = pickle.loads(pickle.dumps((function, args)))
+        return {seed: function(seed, *args) for seed in seeds}
+
+    monkeypatch.setattr(build, 'seed_map', pickled_map)
+    collector = SeedCollector(config['seeds'], str(toy.root / 'cache'))
+    parallel = build.Ensemble(config, toy.features, per_seed=collector, workers=2)
+    assert torch.equal(parallel.Gamma, serial.Gamma) and torch.equal(parallel.Gamma2, serial.Gamma2)
+    assert torch.equal(parallel.finite, serial.finite) and torch.equal(parallel.mask, serial.mask)
+    assert parallel.rank == serial.rank
+    # the collector ran in the 'worker': both seeds are the same networks, so each seed's Gamma is the mean
+    for seed in config['seeds']:
+        assert np.array_equal(np.load(toy.root / 'cache.tmp' / f'seed_{seed}' / 'gammas.npy'), serial.Gamma.numpy())

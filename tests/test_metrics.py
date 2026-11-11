@@ -270,6 +270,7 @@ def toy_chi2(toy, min_neff):
     return {name: (np.array(chi2[name]), np.array(ndf[name])) for name in chi2}
 
 
+@pytest.mark.slow
 def test_closure_chi2_distribution_paired():
     """
     eft / weight_shift: with the exact ratio as r_hat, chi2 = Delta^T Cov^+ Delta of every closure test follows
@@ -284,6 +285,7 @@ def test_closure_chi2_distribution_paired():
         assert stats.kstest(stats.chi2.sf(c, k), 'uniform').pvalue > 1e-3, name
 
 
+@pytest.mark.slow
 def test_closure_chi2_distribution_two_samples():
     """
     kinematic_shift: events that migrate between bins make neighbouring bins anticorrelated, and the variance of those

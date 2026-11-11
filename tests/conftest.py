@@ -42,9 +42,10 @@ def train_config(tmp_path):
     data_dir.mkdir()
     torch.save(make_dataset(2000), data_dir / 'train.p')
 
+    # plotted features: three are enough for the per-feature closure and plots (the network sees every column)
     features = {
         f'feat{i}': {'label': f'feature {i}', 'loc': i, 'min': 0, 'max': 200, 'nbins': 10}
-        for i in range(N_FEATURES)
+        for i in range(3)
     }
     features_path = tmp_path / 'features.yml'
     features_path.write_text(yaml.safe_dump(features))

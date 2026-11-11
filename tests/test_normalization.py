@@ -37,7 +37,7 @@ def test_output_does_not_depend_on_other_events():
 def test_training_stores_training_set_statistics(train_config, tmp_path):
     from topsbi.train import main
 
-    main(train_config)
+    main({**train_config, 'features_to_animate': []})
 
     state = torch.load(tmp_path / 'out' / 'model.pt')
     sample = torch.load(tmp_path / 'data' / 'train.p', weights_only=False)

@@ -517,6 +517,7 @@ def test_moved_era_column_and_threads(train_config, tmp_path):
         'eras': ['A', 'B', 'C', 'D'],
         'closure_groups': [{'loc': 5}],
         'threads': 1,
+        'features_to_animate': [],
     }
     main(config)
     assert (tmp_path / 'moved_out' / 'complete' / 'group_closure.png').exists()
