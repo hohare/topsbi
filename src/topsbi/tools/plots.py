@@ -1860,7 +1860,7 @@ def plot_search_uncertainty(sigma0, sigma1, rms_bias, labels, outname, component
 POINT_KINDS = {
     'scan': ('o', '#2a78d6', 'single-WC point'),
     'cross': ('^', '#1baf7a', 'interference point'),
-    'sm': ('*', 'k', 'SM anchor'),
+    'sm': ('*', 'k', 'SM anchors'),
 }
 
 
@@ -1893,17 +1893,14 @@ def network_kinds(Theta, names, wcs, mask):
     return out
 
 
-def plot_network_misclosure(
-    misclosure, yield_ratio, network_tex, outname, notes=None, n_labels=3, per_seed=None, kinds=None
-):
+def plot_network_misclosure(misclosure, yield_ratio, network_tex, outname, notes=None, per_seed=None, kinds=None):
     '''
     Misclosure m_a of every training network a (a fraction of lambda_K_b(theta_SM), network_misclosure) against the
     size of its training point (inclusive yield relative to the SM, lambda(theta_1) / lambda(theta_SM), linear) on a
-    log scale, by kind of point; the n_labels largest m_a labelled with their training point in a column on the right,
-    joined by leader lines. The kind of point is shown by marker shape in neutral grey; suspects are filled in their
-    status colour. Networks of points without signal (kind 'background') are drawn in a narrow panel on the right with
-    the same m_a axis, one labelled position each. With per_seed, every seed's m_a is drawn as a small marker, joined
-    by a thin line from the smallest to the largest, with the seed average as the large marker.
+    log scale, by kind of point. The kind of point is shown by marker shape in neutral grey; suspects are filled in
+    their status colour. Networks of points without signal (kind 'background') are drawn in a narrow panel on the
+    right with the same m_a axis, one labelled position each. With per_seed, every seed's m_a is drawn as a small
+    marker, joined by a thin line from the smallest to the largest, with the seed average as the large marker.
 
     Args:
         misclosure: {network name: m_a} averaged over seeds (network_misclosure)
@@ -1911,7 +1908,6 @@ def plot_network_misclosure(
         network_tex: {network name: TeX label of its training point}
         outname: file to save the plot to
         notes: {network name: 'dropped'}
-        n_labels: networks labelled, largest m_a first
         per_seed: {network name: [m_a of every seed]} (network_misclosure with per_seed=True), optional
         kinds: {network name: 'background', 'sm', 'cross' or 'scan'} (network_kinds), optional; without it the kind
             is read from the name (after any group prefix: 'sm', or is_cross_term)
@@ -1997,18 +1993,6 @@ def plot_network_misclosure(
     for status, c in NOTE_COLORS.items():
         if status in notes.values():
             ax.scatter([], [], marker='s', s=80, color=c, label=status)
-    # labels stacked in a column at the top right, largest m_a first, each joined to its marker by a leader line
-    for row, i in enumerate(np.argsort(-m)[:n_labels]):
-        ax.annotate(
-            network_tex[names[i]],
-            (x[i], m[i]),
-            xytext=(0.97, 0.95 - 0.07 * row),
-            textcoords='axes fraction',
-            ha='right',
-            va='center',
-            fontsize=14,
-            arrowprops={'arrowstyle': '-', 'color': '#9a9a9a', 'linewidth': 0.8},
-        )
     # networks without signal: their yield ratio is far below the WC points', so they get their own panel, one
     # position each, with the m_a axis of the main panel
     if background:
@@ -2028,7 +2012,7 @@ def plot_network_misclosure(
                 side.scatter(i, low, marker='D', s=60, facecolors='none', edgecolors=c, clip_on=False, zorder=3)
         side.set_xticks(range(len(background)), [network_tex[n] for n in background], rotation=90, fontsize=14)
         side.set_xlim(-0.75, len(background) - 0.25)
-        side.set_title('background', fontsize=16)
+        side.set_title('backgrounds', fontsize=16)
         side.tick_params(axis='y', which='both', left=False, labelleft=False)
     # the yield ratios of the WC points span only about 1-1.2 (training points sized by their yield change), so x
     # stays linear
@@ -2036,7 +2020,7 @@ def plot_network_misclosure(
     ax.set_ylim(low, high)
     ax.set_xlabel(r'$\lambda(\theta_1) / \lambda(\theta_{\mathrm{SM}})$')
     ax.set_ylabel(r'$m_a$')
-    ax.legend(fontsize=16, loc='upper left')
+    ax.legend(fontsize=16, loc='upper left', ncol=2)
     mathtext_log = logging.getLogger('matplotlib.mathtext')
     mathtext_log.addFilter(_no_tex_mapping)
     try:
