@@ -13,7 +13,7 @@ The configuration keys are listed in [`examples/validation/README.md`](../exampl
 1. **Ensemble.** Read the cache `{name}/ensemble/`, or fit it with `--refit`.
 2. **Bias test** (section 3). Compare every component $\hat\gamma_q$ (row $q$ of $\hat\Gamma$) with its truth in bins of every network input, and flag the components with a significant bias.
 3. **Attribution** (section 4). Split the bias of each flagged component exactly into the contributions of the training networks.
-4. **Suspects and drop tests** (section 5). Networks that carry a large share of a bias and close badly on their own are proposed for dropping or retraining; each drop is tested by refitting without it.
+4. **Suspects and drop tests** (section 5). Networks that carry a large share of a bias and close badly on their own are proposed for dropping; each drop is tested by refitting without it.
 5. **Point search** (section 6). Propose new training points that most reduce the uncertainty of the flagged components.
 
 Besides the ensemble it reads `data` (the events the ensemble is evaluated on; the per-event structure constants $s_q(z)$ in it give the truth), `lumi` (luminosity per era, column `year_loc`), `c0` and `features` (the network inputs and their columns). Outputs go to `{name}/`: `ensemble_diagnostics.yml`, `proposed_points.yml` and `plots/`.
@@ -56,7 +56,7 @@ Each network's own closure, from the same sums, gives its misclosure $m_a$: the 
 
 ## 5. Suspects and drop tests
 
-A network is a suspect if its share in some flagged component reaches `suspects.share_threshold`. It closes badly in a member if its own $Z$ (the test of section 3 on $\Delta_{a,b}$) exceeds `suspects.z_threshold` there. Bad in at least `suspects.seed_fraction` of the members: the training point itself is the problem, and it is a drop candidate. Bad in fewer: the bad copies are proposed for retraining (`retrain`) and the point stays.
+A network is a suspect if its share in some flagged component reaches `suspects.share_threshold`. It closes badly in a member if its own $Z$ (the test of section 3 on $\Delta_{a,b}$) exceeds `suspects.z_threshold` there. Bad in at least `suspects.seed_fraction` of the members: the training point itself is the problem, and it is a drop candidate. Bad in fewer, the network stays in the fit.
 
 Drop candidates are grouped (the points of one cross-term pair together, a single-WC point alone) and each group is tested by refitting every member without it. A drop is accepted if the largest $Z$ of some component it was blamed for falls by at least `suspects.min_gain`, and no component ends above `bias.z_threshold` with its largest $Z$ risen by more than `suspects.tolerance`. A group whose removal would leave $\Theta$ rank-deficient is not tested. Drops that pass alone may interact, so all accepted drops are then refitted together (`combined`).
 
@@ -73,7 +73,7 @@ and $\sqrt{\mathrm{Var}(\hat\gamma_q)}$ its diagonal (`sigma_propagated`). Compo
 The search adds candidate units one at a time, each time the one that most lowers the objective $\mathrm{tr}(\mathrm{Cov}(\hat\gamma)\, G)$, and stops after `point_search.n_units` units or when a step lowers it by less than the fraction `point_search.min_gain`.
 
 - **Weights.** `G: flagged` (default): $G = \mathrm{diag}(g_q / \mathrm{Var}(\hat\gamma_q))$ with the variance of the current design, $g_q = 1$ for flagged components and `unflagged_weight` for the others, so the objective is the $g$-weighted sum of relative variance reductions. `G: scan`: $G = \langle T(\theta) T(\theta)^T \rangle$ over a scan region (`bounds` per WC, `mode` box or 1d, `shape` uniform or gaussian), the uncertainty of $\hat r$ averaged over the region.
-- **Candidates.** For every cross term $\theta_i \theta_j$, units of the four points $(\pm\theta_i, \pm\theta_j)$ built from the existing single-WC training values, with the misclosure of the worse of the two source networks assumed for the new networks; and the dropped points, as candidates to retrain. Units whose points all exist, or with a point whose inclusive yield relative to the SM exceeds `max_yield_ratio` (default: the largest of the existing points), are left out.
+- **Candidates.** For every cross term $\theta_i \theta_j$, units of the four points $(\pm\theta_i, \pm\theta_j)$ built from the existing single-WC training values, with the misclosure of the worse of the two source networks assumed for the new networks. Units whose points all exist, or with a point whose inclusive yield relative to the SM exceeds `max_yield_ratio` (default: the largest of the existing points), are left out.
 
 The dropped networks leave the design before the search. `sigma_after_search` is the propagated uncertainty with the chosen units added. The search assumes the new networks close as well as existing ones; it cannot fix a bias that every network shares.
 
@@ -97,7 +97,6 @@ The dropped networks leave the design before the search. `sigma_after_search` is
 | `components.<q>.top_networks` | flagged components: the `n_top_networks` largest signed shares | |
 | `components.<q>.refit.max_Z`, `refit.rms_bias` | after refitting without the accepted drops | |
 | `suspects.drop` | networks dropped (accepted drop tests) | empty |
-| `suspects.retrain` | {network: members whose copy closes badly} | empty |
 | `suspects.drop_tests.<group>.members`, `accepted`, `gain`, `harmed` | the networks of a group; accepted; largest fall of $Z$ among the components it was blamed for; {component: [Z before, Z after]} for harmed components, or why the group could not be tested | |
 | `suspects.combined` | the same for all accepted drops at once | |
 | `network_misclosure.<network>` | $m_a$ of every training network (section 4) | similar for all networks of a kind |
@@ -110,7 +109,7 @@ The settings of a run (thresholds, `n_units`, ...) are those of its config.
 
 ### `proposed_points.yml`
 
-`wcs` (the WC order) and `points`, each with `name`, `kind` (`cross` or `retrain`) and `theta` (SM-inclusive, first entry 1): the new training points, ready to be turned into training configs.
+`wcs` (the WC order) and `points`, each with `name`, `kind` (`cross`) and `theta` (SM-inclusive, first entry 1): the new training points, ready to be turned into training configs.
 
 ## 8. Plots (`plots/`)
 
@@ -119,7 +118,7 @@ The settings of a run (thresholds, `n_units`, ...) are those of its config.
 | `fit_residuals.png`, `fit_residuals_log.png` | distribution of the per-event fit residuals: median over members, band of their spread, outlying members as separate lines | a member far from the others |
 | `z_heatmap_full.png`, `z_heatmap_compact.png` | $Z$ of every component (columns, grouped by kind) in every input (rows); cells above the threshold outlined. Compact: the flagged components and the next 10 | rows (inputs) or columns (components) with many outlined cells |
 | `closure/flagged/<q>.png`, `closure/passed/<q>.png` | one component in its worst input: learned and true sums per bin, and $\Delta$ relative to the SM yield with the noise band $\sqrt{\mathrm{Var}_{\rm MC} + \mathrm{Var}_{\rm seeds}}$ | where in the input the bias sits, and whether it is a shape or a normalisation |
-| `attribution/<q>.png` | flagged components: the signed shares of the 10 largest networks and the sum of the others | one dominant network (a candidate to drop or retrain) or many small shares (a bias the networks share) |
+| `attribution/<q>.png` | flagged components: the signed shares of the 10 largest networks and the sum of the others | one dominant network (a candidate to drop) or many small shares (a bias the networks share) |
 | `drop_tests_compact.png`, `drop_tests_full.png` | change of the largest $Z$ of the affected components for every tested group and for the combined refit; blamed cells outlined, accepted groups in dark red | gains where the group was blamed, no new outlined cells elsewhere |
 | `network_misclosure.png` | $m_a$ of every network against the inclusive yield of its training point, by kind, with the spread over members; suspects marked | networks far above the others of their kind |
 | `point_search_objective.png` | the objective after each added unit, relative to the current design | how fast the gain falls off: a flat curve means more points will not help |
@@ -128,7 +127,7 @@ The settings of a run (thresholds, `n_units`, ...) are those of its config.
 ## 9. Reading the results
 
 - **Nothing flagged.** The ensemble closes in every term within the noise of the validation sample; it can be used.
-- **A flagged component with one dominant network.** Check that network's own closure (`network_misclosure`, its training plots); accept the drop if the test does, or retrain the copies listed in `retrain`. Rerun with `--refit` after retraining.
+- **A flagged component with one dominant network.** Check that network's own closure (`network_misclosure`, its training plots); accept the drop if the test does. A network whose share is large but whose copies close badly in only a few members is left in; its share is noise of those members.
 - **A flagged component with many small shares** and a bias well above `sigma_propagated`: every network carries the same bias, so neither dropping nor adding points removes it; the networks themselves need to learn that term better (capacity, training points closer to where the term matters, more training events), or the term may vanish by construction and belong in `zero_terms`.
 - **A bias comparable to `sigma_propagated`**: more training points help; `proposed_points.yml` lists them.
 - **Remaining flags after all of this** limit what the ensemble can be trusted for: test their effect on the scan (bias of the scan minimum on Asimov data) before using it.

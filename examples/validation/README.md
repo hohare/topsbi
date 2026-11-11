@@ -27,7 +27,7 @@ Run with `python -m topsbi.validation -c config.yml [--refit]`. What the ensembl
 - `seeds`: the ensemble members, `{member: {networks: [...], sm: ...}}`; per member the paths of the training configs (`training.yml`) of its networks and of its SM network. Each network's `c1` gives its training point and its `name` the directory with `model.pt` and `complete/performance.yml`. Every member must be trained at the same set of points, with at least as many networks as kept terms of $T(\theta)$, and every network with the same `wcs` and `zero_terms`. Changing the list (or retraining a network) makes the cache stale: rerun with `--refit`
 - `suspects`: optional settings of the suspects and drop tests
     - `min_gain`: a drop is accepted only if the largest $Z$ of a component it was blamed for falls by at least this (default 2.0)
-    - `seed_fraction`: a suspect network that closes badly in at least this fraction of the members is a drop candidate; in fewer, its bad copies are proposed for retraining (default 0.5)
+    - `seed_fraction`: a suspect network that closes badly in at least this fraction of the members is a drop candidate (default 0.5)
     - `share_threshold`: smallest share in a flagged component's bias that makes a network a suspect (default 0.5)
     - `tolerance`: a drop is rejected if another component ends above `bias.z_threshold` with its largest $Z$ risen by more than this (default 1.0)
     - `z_threshold`: a suspect closes badly in a member if its own largest $Z$ exceeds this (default 5.0)

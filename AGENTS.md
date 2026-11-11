@@ -42,8 +42,8 @@ CI (`.github/workflows/tests.yml`) runs `uv sync --locked`, `ruff check`, `ruff 
 
 **Validation (`validation.py`, `python -m topsbi.validation -c config.yml [--refit]`; described in `docs/validation.md`, config keys in `examples/validation/README.md`).** The last check before likelihood scans. `load_ensemble` reads the cache (a missing or stale cache stops the run unless `--refit`); `lumi` is required. Steps:
 - Bias test (`component_sums`, `component_bias`): per component q (`k` in code) and network input, Δ_q,b = ⟨ŵ_q,b − w_q,b⟩_e (`D`) in merged equal-count bins K_b; Z is the excess χ² over Var_MC + Var_seeds in units of its noise standard deviation, a screening statistic (flagging: Z > `bias.z_threshold`), with the rms bias as its size.
-- Attribution (`network_sums`, `attribute`): Δ_q split exactly into signed shares of the networks, Δ_q,b = Σ_a (Θ⁺)_q,a Δ_a,b.
-- Suspects (`suspects`, `drop_bias_sums`, `test_drops`, `refit_without`): networks with a large share that close badly are dropped or retrained; each drop is tested by refitting from the stored R.
+- Attribution (`network_sums`, `attribute`): Δ_q split exactly into signed shares of the networks, Δ_q,b = Σ_a (Θ⁻)_q,a Δ_a,b, with Θ⁻ the generalized inverse of the fit (Θ⁺ for least squares over every row).
+- Suspects (`suspects`, `drop_bias_sums`, `test_drops`, `refit_without`): networks with a large share that close badly are dropped; each drop is tested by refitting from the stored R.
 - Point search (`candidate_units`, `objective_weights`, `search_points`): greedily adds training points that minimise tr(Cov(γ̂) G).
 
 `network_sums`, `drop_bias_sums` and `refit_without` take `workers` too (`seed_map`). Outputs under `config['name']`: `ensemble_diagnostics.yml`, `proposed_points.yml`, `plots/`; their keys are listed in `docs/validation.md`.
@@ -67,6 +67,7 @@ Symbols follow `main.tex` and the dissertation. Ratios are written with the nume
 | `w_ref` (data column), `sample_weight` | weight at the reference point θ_ref (θ_SM or θ_g, from sample.yml), and L w_ref × 1000 |
 | `syst_ratio` (data column) | r(x, z; θ, ν) = w^s(θ, ν) / w^s(θ, 0) per weight systematic and direction |
 | `Theta`, `R`, `Gamma` | Θ, R, Γ of ΘΓ = R; cache files `network.npz` (Theta), `ratios.npy` (R), `gammas.npy` / `gamma_cache.npy` (Γ), `filter.npy` / `filter_cache.npy` (finite events), `mask_cache.npy` (kept columns of T) |
+| `Theta_inv`, `generalized_inverse` | Θ⁻, the generalized inverse of the ensemble fit, Γ = Θ⁻R (ΘΘ⁻Θ = Θ); Θ⁺, the pseudo-inverse, for least squares over every row |
 | `k` (component index in validation code and plots) | q, restricted to the kept terms of T(θ) |
 | `D`, `mc_var`, `s2` (code and ensemble_diagnostics.yml) | Δ, Var_MC, Var_seeds |
 | `seed` (config key, loop variable) | ensemble member e |

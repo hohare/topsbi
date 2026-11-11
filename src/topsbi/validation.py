@@ -13,6 +13,7 @@ from topsbi.tools.ensembleCache import (
     write_cache,
 )
 from topsbi.tools.plots import (
+    network_kinds,
     network_tex,
     plot_attribution,
     plot_closure,
@@ -546,29 +547,27 @@ def network_z(networks, sm_yield, binning):
 
 def suspects(shares, z, networks, z_threshold=5.0, share_threshold=0.5, seed_fraction=0.5):
     """
-    Training points whose networks drive a flagged bias, split into points to drop and copies to retrain.
+    Training points whose networks drive a flagged bias and close badly in most seeds: candidates to drop.
 
     A network is a candidate if |share| >= share_threshold for any flagged component. It is bad in a seed if its
     max-over-features own Z exceeds z_threshold there. Bad in at least seed_fraction of the seeds: the point is a
-    problem, drop it from every seed. Bad in fewer: retrain the bad copies, keep the point.
+    problem, drop it from every seed. Bad in fewer, it is left in the fit.
 
     Args:
         shares: first output of attribute
         z: output of network_z
         networks: output of network_sums, for the network names of each seed
     Returns:
-        drop: [names], retrain: {name: [seeds]}
+        [names] to drop
     """
-    drop, retrain = [], {}
+    drop = []
     for name, share in shares.items():
         if name == 'sm' or np.max(np.abs(share)) < share_threshold:
             continue
         bad = [seed for seed, s in networks.items() if np.nanmax(z[seed][s['networks'].index(name)]) > z_threshold]
         if len(bad) >= seed_fraction * len(networks):
             drop.append(name)
-        elif bad:
-            retrain[name] = bad
-    return drop, retrain
+    return drop
 
 
 def _refit_seed(seed, path, drop):
@@ -803,7 +802,7 @@ def scan_moments(wcs, bounds, mask, mode='box', shape='uniform', n_background=0)
     return np.mean([moments(np.where(np.arange(len(wcs)) == i, a, 0.0)) for i in np.flatnonzero(a)], axis=0)
 
 
-def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield, extra=(), background_processes=()):
+def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield, background_processes=()):
     """
     Candidate training units for the point search. Each unit lists its points (theta, mu), their rows
     T(theta, mu)[mask], and the misclosure assumed for their networks. New points hold every background strength
@@ -812,8 +811,6 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
     - cross: for every kept interference column (i, j) of T(theta), the 4 points (+-theta_i, +-theta_j) for every pair
       of single-WC magnitude levels of the two WCs, a level pairing the same-rank positive and negative single-WC
       values (assumed m: the worse of the two source networks)
-    - extra: points to retrain, e.g. the points suspects() marks to drop, as (name, point) with assumed m = median m;
-      the point is the network's c1, strengths included
     Units whose points all exist already, or with any point above max_yield (inclusive yield / SM yield), are dropped.
 
     Args:
@@ -824,7 +821,6 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
         mask: kept columns of T(theta, mu)
         yield_ratio: callable point -> inclusive yield at the point / SM yield
         max_yield: largest yield ratio allowed for a new point
-        extra: (name, point) pairs to retrain
         background_processes: names of the background processes, in the order of their columns
     Returns:
         [dict(kind, points, rows, misclosure, max_yield_ratio)]
@@ -841,11 +837,11 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
     existing = {tuple(np.round(t, 6)) for t in thetas}
     nominal = [1.0] * len(background_processes)
 
-    def make(kind, points, m, new_only=True):
+    def make(kind, points, m):
         yields = [yield_ratio(p['theta']) for p in points]
         if max(yields) > max_yield:
             return None
-        if new_only and all(tuple(np.round(p['theta'][:n], 6)) in existing for p in points):
+        if all(tuple(np.round(p['theta'][:n], 6)) in existing for p in points):
             return None
         return {
             'kind': kind,
@@ -879,10 +875,6 @@ def candidate_units(wcs, Theta, names, misclosure, mask, yield_ratio, max_yield,
                         points.append({'name': label, 'theta': theta})
                         m.append(max(ma, mb))
                 units.append(make('cross', points, m))
-    median = float(np.median(list(misclosure.values())))
-    for name, theta in extra:
-        # a dropped point is still in Theta, so it is offered even though it exists
-        units.append(make('retrain', [{'name': name, 'theta': list(theta)}], [median], new_only=False))
     return [u for u in units if u is not None]
 
 
@@ -1050,7 +1042,6 @@ def write_results(
     shares,
     total,
     drop,
-    retrain,
     refit_bias,
     misclosure,
     units,
@@ -1116,7 +1107,6 @@ def write_results(
         'components': components,
         'suspects': {
             'drop': list(drop),
-            'retrain': {n: list(s) for n, s in retrain.items()},
             'drop_tests': {g: drop_test_entry(drop_tests[g], labels) | {'members': list(m)} for g, m in groups.items()},
             'combined': None if combined is None else drop_test_entry(combined, labels),
         },
@@ -1294,10 +1284,10 @@ def main(config_path, refit=False, backgrounds=False):
 
     # suspect networks, and the bias test refitted without the points to drop
     cfg = config.get('suspects', {})
-    drop, retrain = [], {}
+    drop = []
     if flagged:
         z = network_z(networks, sums['sm_yield'], binning)
-        drop, retrain = suspects(
+        drop = suspects(
             shares,
             z,
             networks,
@@ -1361,14 +1351,13 @@ def main(config_path, refit=False, backgrounds=False):
     # attribution of every flagged component, with the suspects' outcome noted next to the networks
     if flagged:
         notes = {n: 'dropped' for n in drop}
-        notes.update({n: 'retrain' for n in retrain})
         os.makedirs(f'{name}/plots/attribution', mode=0o755, exist_ok=True)
         for k in flagged:
             safe = labels[k].replace('^2', '_sq').replace('*', '_x_')
             plot_attribution(k, shares, flagged, labels, bias, tex, f'{name}/plots/attribution/{safe}.png', notes=notes)
 
     # point search on the design of the first seed (all seeds share the training points); dropped suspects leave
-    # the design and come back only as candidates to retrain
+    # the design
     cfg = config.get('point_search', {})
     misclosure = network_misclosure(networks, sums['sm_yield'])
     # size of each training point: inclusive yield at theta_1 relative to the yield at (theta_SM, mu = 1)
@@ -1376,7 +1365,6 @@ def main(config_path, refit=False, backgrounds=False):
     sm_total = float(expansion(sm_point, len(wcs), dtype=torch.float64).numpy()[cache.mask] @ component_totals)
     ratio = dict(zip(first['networks'], first['Theta'].astype(np.float64) @ component_totals / sm_total))
     notes = {n: 'dropped' for n in drop}
-    notes.update({n: 'retrain' for n in retrain})
     plot_network_misclosure(
         misclosure,
         ratio,
@@ -1384,17 +1372,10 @@ def main(config_path, refit=False, backgrounds=False):
         f'{name}/plots/network_misclosure.png',
         notes=notes,
         per_seed=network_misclosure(networks, sums['sm_yield'], per_seed=True),
+        kinds=network_kinds(first['Theta'], first['networks'], wcs, cache.mask),
     )
     design = cache.network(cache.seeds[0])
     Theta, names = design['Theta'].astype(np.float64), list(design['networks'])
-    seed_paths = cache.manifest['seeds'][cache.seeds[0]]
-    # one config per row of Theta, SM last; None for the exact SM row of a seed trained against theta_0 = SM (no
-    # network there, so it is never dropped or retrained)
-    paths, _, _ = network_rows(seed_paths['networks'], seed_paths.get('sm'))
-    extra = []
-    for n in drop:
-        with open(paths[names.index(n)]) as f:
-            extra.append((n, yaml.safe_load(f)['c1']))
     keep = np.array([n not in drop for n in names])
     Theta, names = Theta[keep], [n for n, k in zip(names, keep) if k]
     background_rows = design.get('background_rows')
@@ -1409,7 +1390,7 @@ def main(config_path, refit=False, backgrounds=False):
 
     max_yield = cfg.get('max_yield_ratio') or float((Theta @ component_totals).max() / sm_total)
     units = candidate_units(
-        wcs, Theta, names, misclosure, cache.mask, yield_ratio, max_yield, extra, cache.background_processes
+        wcs, Theta, names, misclosure, cache.mask, yield_ratio, max_yield, cache.background_processes
     )
     G = objective_weights(cfg, wcs, cache.mask, flagged, Theta, m, n_background, fixed)
     chosen, sigma0, sigma1, history = search_points(
@@ -1451,7 +1432,6 @@ def main(config_path, refit=False, backgrounds=False):
         shares=shares,
         total=total,
         drop=drop,
-        retrain=retrain,
         refit_bias=refit_bias,
         misclosure=misclosure,
         units=units,

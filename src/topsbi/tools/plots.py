@@ -1071,8 +1071,8 @@ def plot_residuals(residuals, outname, bins=200, outlier_factor=3.0):
 # sequential ramp of the reference palette (blue, light to dark)
 SEQUENTIAL = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b']
 KIND_ORDER = ['sm', 'linear', 'quadratic', 'cross', 'background']
-# label colours for networks the suspects step dropped (dark red) or wants retrained (orange)
-NOTE_COLORS = {'dropped': '#a51d1d', 'retrain': '#d95926'}
+# label colour for networks the suspects step dropped (dark red)
+NOTE_COLORS = {'dropped': '#a51d1d'}
 
 
 def wc_tex(wc):
@@ -1435,9 +1435,11 @@ def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None
     TeX label of the training point of every network: its nonzero WC values, read from the linear columns of Theta,
     e.g. "c_Qj^31 = 1.70" or "c_Qj^31, Re[c_tG] = -1.28, 4.27"; the SM anchor is "sm". A point with the WC values of
     a non-SM reference reads "theta_g", and every background strength other than 1 is appended, e.g.
-    "theta_g, mu_bg = 0.00" or "sm, mu_bg = 0.00". A point without signal (SM entry of T 0) reads "b only", with the
-    process when there are several, e.g. "b_tt only". Labels shared by networks of different groups get the group
-    appended, e.g. "sm (mixed)" and "sm (signal)".
+    "theta_g, mu_bg = 0.00" or "sm, mu_bg = 0.00". On the points labelled by their WC values, a strength is appended
+    only when it differs from the strength every such point of the same group shares (1 when they do not share one),
+    so the points of a group trained at mu_bg = 0 read as their WC values alone. A point without signal (SM entry of
+    T 0) reads "b only", with the process when there are several, e.g. "b_tt only". Labels shared by networks of
+    different groups get the group appended, e.g. "sm (mixed)" and "sm (signal)".
 
     Args:
         Theta: [n_networks, K] expanded training points
@@ -1460,8 +1462,24 @@ def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None
         if keep:
             strengths[process] = len(kept) + len(strengths)
     g = None if reference is None else np.array([float(c) for c in reference[1 : len(wcs) + 1]])
+    group_of = list(groups) if groups is not None else [None] * len(names)
+
+    def wc_values(row):
+        return np.array([row[linear[i]] if i in linear else 0.0 for i in range(1, len(wcs) + 1)], dtype=np.float64)
+
+    def is_reference(values):
+        return g is not None and g.any() and np.allclose(values, g, rtol=1e-5, atol=1e-6)
+
+    # the strength every WC-labelled point of a group shares is the group's own and is not repeated in its labels
+    shared = {}
+    for group, row in zip(group_of, Theta):
+        values = wc_values(row)
+        if (constant is None or row[constant] != 0) and values.any() and not is_reference(values):
+            for p, c in strengths.items():
+                shared.setdefault((group, p), set()).add(float(row[c]))
+    fixed = {key: next(iter(v)) for key, v in shared.items() if len(v) == 1}
     out = {}
-    for name, row in zip(names, Theta):
+    for name, group, row in zip(names, group_of, Theta):
         if constant is not None and row[constant] == 0 and strengths:
             present = [p for p, c in strengths.items() if row[c] != 0]
             head = ' + '.join('b' if len(strengths) == 1 else rf'b_{{\rm {p}}}' for p in present)
@@ -1472,13 +1490,16 @@ def network_tex(Theta, names, wcs, mask, background_processes=(), reference=None
             out[name] = label
             continue
         point = [(wc_tex(wcs[i - 1]), row[c]) for i, c in linear.items() if row[c] != 0]
-        values = np.array([row[linear[i]] if i in linear else 0.0 for i in range(1, len(wcs) + 1)], dtype=np.float64)
+        values = wc_values(row)
         head = None
-        if g is not None and g.any() and np.allclose(values, g, rtol=1e-5, atol=1e-6):
+        if is_reference(values):
             head, point = r'\theta_g', []
         elif not point:
             head = r'{\rm sm}'
-        point += [(rf'\mu_{{\rm {p}}}', row[c]) for p, c in strengths.items() if row[c] != 1]
+        if head is None:
+            point += [(rf'\mu_{{\rm {p}}}', row[c]) for p, c in strengths.items() if row[c] != fixed.get((group, p), 1)]
+        else:
+            point += [(rf'\mu_{{\rm {p}}}', row[c]) for p, c in strengths.items() if row[c] != 1]
         wc_part = ', '.join(t for t, _ in point)
         value_part = ', '.join(f'{v:.2f}' for _, v in point)
         if head is not None and point:
@@ -1513,7 +1534,7 @@ def plot_attribution(k, shares, flagged, labels, bias, network_tex, outname, n_t
         network_tex: {network name: TeX label of its training point}
         outname: file to save the plot to
         n_top: networks shown individually
-        notes: {network name: 'dropped' or 'retrain'}; their labels are coloured and a legend names the colours
+        notes: {network name: 'dropped'}; their labels are coloured and a legend names the colours
     '''
     column = flagged.index(k)
     ranked = sorted(shares, key=lambda n: -abs(shares[n][column]))
@@ -1529,7 +1550,7 @@ def plot_attribution(k, shares, flagged, labels, bias, network_tex, outname, n_t
     ax.axvline(0, color='k', linewidth=1)
     ax.axvline(1, color='k', linewidth=1, linestyle=':')
     ax.set_yticks(y, names, fontsize=16)
-    # networks the suspects step dropped or wants retrained: coloured labels, named in a legend
+    # networks the suspects step dropped: coloured labels, named in a legend
     for tick, n in zip(ax.get_yticklabels(), top):
         if n in notes:
             tick.set_color(NOTE_COLORS[notes[n]])
@@ -1843,35 +1864,83 @@ POINT_KINDS = {
 }
 
 
-def plot_network_misclosure(misclosure, yield_ratio, network_tex, outname, notes=None, n_labels=3, per_seed=None):
+def network_kinds(Theta, names, wcs, mask):
+    '''
+    Kind of the training point of every network, read from its row of Theta: 'background' for a point without signal
+    (SM entry of T 0), 'sm' for the SM at any background strengths, otherwise 'cross' for an interference point and
+    'scan' for a single-WC point (by name, is_cross_term, after any group prefix).
+
+    Args:
+        Theta: [n_networks, K] expanded training points
+        names: network names, rows of Theta
+        wcs: WC names in get_lower_tri order
+        mask: kept columns of T(theta, mu)
+    Returns:
+        {network name: 'background', 'sm', 'cross' or 'scan'}
+    '''
+    rows, cols = np.tril_indices(len(wcs) + 1)
+    kept = [(int(i), int(j)) for i, j, keep in zip(rows, cols, mask[: len(rows)]) if keep]
+    constant = kept.index((0, 0)) if (0, 0) in kept else None
+    linear = [kept.index((i, 0)) for i in range(1, len(wcs) + 1) if (i, 0) in kept]
+    out = {}
+    for name, row in zip(names, Theta):
+        if constant is not None and row[constant] == 0:
+            out[name] = 'background'
+        elif not np.any(row[linear]):
+            out[name] = 'sm'
+        else:
+            out[name] = 'cross' if is_cross_term(name.split(':', 1)[-1]) else 'scan'
+    return out
+
+
+def plot_network_misclosure(
+    misclosure, yield_ratio, network_tex, outname, notes=None, n_labels=3, per_seed=None, kinds=None
+):
     '''
     Misclosure m_a of every training network a (a fraction of lambda_K_b(theta_SM), network_misclosure) against the
     size of its training point (inclusive yield relative to the SM, lambda(theta_1) / lambda(theta_SM), linear) on a
-    log scale, by kind of point; suspects ringed in their
-    attribution colours and the n_labels largest m_a labelled with their training point in a column on the right,
+    log scale, by kind of point; the n_labels largest m_a labelled with their training point in a column on the right,
     joined by leader lines. The kind of point is shown by marker shape in neutral grey; suspects are filled in their
-    status colour. With per_seed, every seed's m_a is drawn as a small marker, joined by a thin line from the smallest
-    to the largest, with the seed average as the large marker.
+    status colour. Networks of points without signal (kind 'background') are drawn in a narrow panel on the right with
+    the same m_a axis, one labelled position each. With per_seed, every seed's m_a is drawn as a small marker, joined
+    by a thin line from the smallest to the largest, with the seed average as the large marker.
 
     Args:
         misclosure: {network name: m_a} averaged over seeds (network_misclosure)
         yield_ratio: {network name: lambda(theta_1) / lambda(theta_SM)}
         network_tex: {network name: TeX label of its training point}
         outname: file to save the plot to
-        notes: {network name: 'dropped' or 'retrain'}
+        notes: {network name: 'dropped'}
         n_labels: networks labelled, largest m_a first
         per_seed: {network name: [m_a of every seed]} (network_misclosure with per_seed=True), optional
+        kinds: {network name: 'background', 'sm', 'cross' or 'scan'} (network_kinds), optional; without it the kind
+            is read from the name (after any group prefix: 'sm', or is_cross_term)
     '''
     notes = notes or {}
-    names = [n for n in misclosure if n in yield_ratio]
-    kind = {n: 'sm' if n == 'sm' else 'cross' if is_cross_term(n) else 'scan' for n in names}
+    every = [n for n in misclosure if n in yield_ratio]
+    if kinds is None:
+        kinds = {}
+        for n in every:
+            point = n.split(':', 1)[-1]
+            kinds[n] = 'sm' if point == 'sm' else 'cross' if is_cross_term(point) else 'scan'
+    background = [n for n in every if kinds[n] == 'background']
+    names = [n for n in every if kinds[n] != 'background']
+    kind = {n: kinds[n] for n in names}
     m = np.array([misclosure[n] for n in names])
     x = np.array([yield_ratio[n] for n in names])
-    shown = np.concatenate([m] + ([np.concatenate([per_seed[n] for n in names])] if per_seed else []))
+    shown = np.concatenate(
+        [np.array([misclosure[n] for n in every])]
+        + ([np.concatenate([per_seed[n] for n in every])] if per_seed else [])
+    )
     shown = shown[shown > 0]
     low, high = shown.min() / 2, shown.max() * 2
 
-    fig, ax = plt.subplots(figsize=(12, 9))
+    if background:
+        fig, (ax, side) = plt.subplots(
+            1, 2, figsize=(14, 9), sharey=True, gridspec_kw={'width_ratios': [6, 1], 'wspace': 0.04}
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(12, 9))
     # scheme A: the kind of point by marker shape, all in neutral grey; suspects filled in their status colour
     # the SM anchor is blue-green (cool against the warm suspect colours) and, with the suspects, drawn in front of
     # everything else
@@ -1889,9 +1958,9 @@ def plot_network_misclosure(misclosure, yield_ratio, network_tex, outname, notes
                 ax.vlines(xi, seeds.min(), seeds.max(), colors=c, linewidth=1, alpha=0.6, zorder=z)
                 ax.scatter(np.full(len(seeds), xi), seeds, marker=marker, s=10, color=c, alpha=0.6, zorder=z)
     for k, (marker, _, label) in POINT_KINDS.items():
-        of_kind = np.array([kind[n] == k for n in names])
+        of_kind = np.array([kind[n] == k for n in names], dtype=bool)
         size = 200 if k == 'sm' else 60
-        plain = of_kind & np.array([not front[n] for n in names])
+        plain = of_kind & np.array([not front[n] for n in names], dtype=bool)
         ax.scatter(
             x[plain & (m > 0)],
             m[plain & (m > 0)],
@@ -1919,7 +1988,7 @@ def plot_network_misclosure(misclosure, yield_ratio, network_tex, outname, notes
                 zorder=3,
             )
         for status, c in NOTE_COLORS.items():
-            sel = of_kind & np.array([notes.get(n) == status for n in names]) & (m > 0)
+            sel = of_kind & np.array([notes.get(n) == status for n in names], dtype=bool) & (m > 0)
             if sel.any():
                 ax.scatter(
                     x[sel], m[sel], marker=marker, s=size * 1.6, color=c, edgecolors='k', linewidths=0.8, zorder=6
@@ -1940,7 +2009,29 @@ def plot_network_misclosure(misclosure, yield_ratio, network_tex, outname, notes
             fontsize=14,
             arrowprops={'arrowstyle': '-', 'color': '#9a9a9a', 'linewidth': 0.8},
         )
-    # the yield ratios span only about 1-1.2 (training points sized by their yield change), so x stays linear
+    # networks without signal: their yield ratio is far below the WC points', so they get their own panel, one
+    # position each, with the m_a axis of the main panel
+    if background:
+        for i, n in enumerate(background):
+            c = NOTE_COLORS.get(notes.get(n), base)
+            if per_seed:
+                seeds = np.asarray(per_seed[n])
+                seeds = seeds[seeds > 0]
+                if len(seeds):
+                    cs = c if n in notes else seed_grey
+                    side.vlines(i, seeds.min(), seeds.max(), colors=cs, linewidth=1, alpha=0.6, zorder=1)
+                    side.scatter(np.full(len(seeds), i), seeds, marker='D', s=10, color=cs, alpha=0.6, zorder=1)
+            if misclosure[n] > 0:
+                edge = 'k' if n in notes else 'none'
+                side.scatter(i, misclosure[n], marker='D', s=60, color=c, edgecolors=edge, linewidths=0.8, zorder=3)
+            else:
+                side.scatter(i, low, marker='D', s=60, facecolors='none', edgecolors=c, clip_on=False, zorder=3)
+        side.set_xticks(range(len(background)), [network_tex[n] for n in background], rotation=90, fontsize=14)
+        side.set_xlim(-0.75, len(background) - 0.25)
+        side.set_title('background', fontsize=16)
+        side.tick_params(axis='y', which='both', left=False, labelleft=False)
+    # the yield ratios of the WC points span only about 1-1.2 (training points sized by their yield change), so x
+    # stays linear
     ax.set_yscale('log')
     ax.set_ylim(low, high)
     ax.set_xlabel(r'$\lambda(\theta_1) / \lambda(\theta_{\mathrm{SM}})$')

@@ -26,7 +26,7 @@ from topsbi.tools.ensembleCache import (
     quantile_binning,
     write_cache,
 )
-from topsbi.tools.plots import component_kinds, component_tex, network_tex, unit_tex, wc_tex
+from topsbi.tools.plots import component_kinds, component_tex, network_kinds, network_tex, unit_tex, wc_tex
 
 WCS = ['cA', 'cB']
 N_EVENTS = 3000
@@ -179,7 +179,7 @@ def bad_copies(tmp_path_factory):
     """
     Ten members, bias of 10% in network BAD of four of them. A bad copy in few members mostly raises Var_seeds rather
     than the ensemble-mean bias (with one bad copy among three members, Delta^2 = Var_seeds exactly, so it never
-    flags); four of ten still flag, and are fewer than seed_fraction (0.5) of the members.
+    flags); four of ten still flag, and are fewer than seed_fraction (0.5) of the members, so the point is not dropped.
     """
     return build_toy(tmp_path_factory.mktemp('bad_copies'), inject=(0.1, [0, 1, 2, 3]), members=list(range(10)))
 
@@ -258,18 +258,16 @@ def test_suspects_drop_a_bad_point(biased):
     networks = val.network_sums(biased.cache, biased.binning, biased.w0, biased.weights)
     shares, _ = val.attribute(networks, flagged(biased), biased.sums['sm_yield'])
     z = val.network_z(networks, biased.sums['sm_yield'], biased.binning)
-    drop, retrain = val.suspects(shares, z, networks)
-    assert drop == [BAD] and retrain == {}
+    assert val.suspects(shares, z, networks) == [BAD]
 
 
-def test_suspects_retrain_bad_copies(bad_copies):
+def test_suspects_few_bad_copies(bad_copies):
     toy = bad_copies
     networks = val.network_sums(toy.cache, toy.binning, toy.w0, toy.weights)
     shares, _ = val.attribute(networks, flagged(toy), toy.sums['sm_yield'])
     z = val.network_z(networks, toy.sums['sm_yield'], toy.binning)
-    drop, retrain = val.suspects(shares, z, networks)
     assert flagged(toy)
-    assert drop == [] and retrain == {BAD: [0, 1, 2, 3]}
+    assert val.suspects(shares, z, networks) == []
 
 
 def test_drop_shortcut_equals_exact_refit(biased):
@@ -733,6 +731,35 @@ def test_network_and_unit_tex_background():
     assert grouped['sm'] == 'sm (first)' and grouped['other:sm'] == 'sm (second)'
     unique = [n for n in names if n not in ('sm', 'other:sm')]
     assert [grouped[n] for n in unique] == [plain[n] for n in unique]
+    # a strength every WC point of a group shares is the group's and is left out, so the same point in two groups
+    # reads the same, with the group; theta_g points keep their strength
+    signal = {'signal:cA/p_one': [1.0, 1.0, 0.0, 0.0], 'signal:cA_cB/p_one_n_one': [1.0, 1.0, -1.0, 0.0]}
+    rows = np.stack([expansion(p, 2, dtype=torch.float64).numpy() for p in signal.values()])
+    both = network_tex(
+        np.vstack([Theta, rows]),
+        list(points) + list(signal),
+        WCS,
+        MASK_BG,
+        BG,
+        reference,
+        ['mixed'] * len(points) + ['signal'] * len(signal),
+    )
+    assert both['signal:cA/p_one'] == f'${a} = 1.00$ (signal)' and both['cA/p_one'] == f'${a} = 1.00$ (mixed)'
+    assert both['bg/mu_0'] == expected['bg/mu_0']
+    # without groups the two strengths are not shared, so the mu_bg = 0 points keep theirs
+    ungrouped = network_tex(np.vstack([Theta, rows]), list(points) + list(signal), WCS, MASK_BG, BG, reference)
+    assert ungrouped['signal:cA/p_one'] == f'${a}, \\mu_{{\\rm bg}} = 1.00, 0.00$'
+    # kinds from the rows of Theta: no signal is background, no WC is sm (under any group prefix or strength)
+    assert network_kinds(Theta_more, names, WCS, MASK_BG) == {
+        'cA/p_one': 'scan',
+        'cA_cB/p_one_n_one': 'cross',
+        'bg/mu_0': 'scan',
+        'bg/mu_2': 'scan',
+        'sm': 'sm',
+        'bg/only': 'background',
+        'nominal/sm': 'sm',
+        'other:sm': 'sm',
+    }
 
 
 def test_scan_moments_background():
@@ -756,15 +783,12 @@ def test_candidate_units_background(null):
 
     plain = val.candidate_units(WCS, null.Theta, null.names, misclosure, np.ones(6, bool), yield_ratio, 9.0)
     Theta = np.hstack([null.Theta, np.ones((len(null.Theta), 1))])  # every network at mu_bg = 1
-    extra = [('cA/p_two', [1.0, 2.0, 0.0, 0.0])]
-    units = val.candidate_units(WCS, Theta, null.names, misclosure, MASK_BG, yield_ratio, 9.0, extra, BG)
+    units = val.candidate_units(WCS, Theta, null.names, misclosure, MASK_BG, yield_ratio, 9.0, BG)
     cross = [u for u in units if u['kind'] == 'cross']
-    assert len(cross) == len(plain)
+    assert len(cross) == len(units) == len(plain)
     for u, v in zip(cross, plain):
         assert [p['theta'] for p in u['points']] == [p['theta'] + [1.0] for p in v['points']]
         assert np.allclose(u['rows'], np.hstack([v['rows'], np.ones((len(v['rows']), 1))]))
-    (retrain,) = [u for u in units if u['kind'] == 'retrain']
-    assert retrain['points'][0]['theta'] == [1.0, 2.0, 0.0, 0.0] and retrain['rows'][0, -1] == 0
 
 
 def background_column_toy(root, moved, background_fit=False):
