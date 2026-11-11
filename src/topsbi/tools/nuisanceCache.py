@@ -223,7 +223,7 @@ def interpolate(f_hat, nu):
     delta^+ = f_hat^Up, delta^- = f_hat^Down (log r_hat = 0 at nu = 0):
     f(nu) = 1/2 [(delta^+ - delta^-) nu + 1/8 (delta^+ + delta^-)(3 nu^6 - 10 nu^4 + 15 nu^2)] for |nu| <= 1,
     delta^+ nu for nu > 1 and delta^- |nu| for nu < -1; f and its first two derivatives are continuous
-    (docs/ensemble.md; https://cms-analysis.github.io/HiggsAnalysis-CombinedLimit/latest/part2/settinguptheanalysis/).
+    (https://cms-analysis.github.io/HiggsAnalysis-CombinedLimit/latest/part2/settinguptheanalysis/).
 
     Args:
         f_hat: [n_n, 2, N] f_hat^Down, f_hat^Up per nuisance and event

@@ -1078,8 +1078,8 @@ NOTE_COLORS = {'dropped': '#a51d1d'}
 
 
 def wc_tex(wc):
-    r'''TeX of a WC name, the dissertation's symbols (theory chapter, operator table): ctu1 -> c_{tu}^1,
-    cQj31 -> c_{Qj}^{3,1}, ctGRe -> \Re[c_{tG}].'''
+    r'''TeX of a WC name in the dim6top conventions (arXiv:1802.07237): ctu1 -> c_{tu}^1, cQj31 -> c_{Qj}^{3,1},
+    ctGRe -> \Re[c_{tG}].'''
     m = re.fullmatch(r'c([A-Za-z]+?)(Re|Im)', wc)
     if m:
         return rf'\{m.group(2)}\left[c_{{{m.group(1)}}}\right]'
