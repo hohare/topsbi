@@ -3191,6 +3191,128 @@ def _check_names(names, known, what, label):
         sys.exit(f'[error]: scan {label}: unknown {what} {unknown}')
 
 
+def _is_number(x):
+    """True for a finite int or float (a bool is not a number here)."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and bool(np.isfinite(x))
+
+
+def _check_numbers(values, what, label):
+    """Stop the run unless values is a {name: number} dict."""
+    if not isinstance(values, dict) or not all(_is_number(v) for v in values.values()):
+        sys.exit(f'[error]: scan {label}: {what} must be {{name: number}}, not {values}')
+
+
+def _check_name_list(value, known, what, label):
+    """Stop the run unless value is 'all' or a list of names; with known, every name must be one of them."""
+    if value == 'all':
+        return
+    if not isinstance(value, list) or not all(isinstance(n, str) for n in value):
+        sys.exit(f"[error]: scan {label}: {what} must be 'all' or a list of names, not {value}")
+    if known is not None:
+        _check_names(value, known, what, label)
+
+
+def _check_box(box, label):
+    """Stop the run unless box is {wc: [lo, hi]} with finite lo < hi in every row."""
+    if not isinstance(box, dict):
+        sys.exit(f'[error]: scan {label}: box must be {{wc: [lo, hi]}}, not {box}')
+    for wc, row in box.items():
+        if not (
+            isinstance(row, (list, tuple)) and len(row) == 2 and all(_is_number(v) for v in row) and row[0] < row[1]
+        ):
+            sys.exit(f'[error]: scan {label}: box of {wc} must be [lo, hi] with lo < hi, not {row}')
+
+
+def _check_values(config, label, entry, pois):
+    """
+    The value checks of one scan entry (check_scans) that need no inputs: profile_wcs and selection_wcs ('all' or
+    known WCs, no poi among them, each with a box row in the entry's or the top-level box), profile_nu ('all' or a
+    list; the names are checked against the loaded nuisances in scan_settings), box rows [lo, hi] with lo < hi, each
+    poi's grid inside its box row if it has one, numbers in target theta / nu, nu_obs and theta_base, nu_bound > 0,
+    cls (1 to len(LEVEL_STYLES) increasing values in (0, 1)), max_selections (integer >= 1), label (text), overlay (a
+    list without the scan itself) and uncertainty (a dict: members true or false, n_boot integer >= 0, subsets
+    {n_e: draws} of integers >= 1, seed integer).
+
+    Args:
+        config: scan config (load_config)
+        label: scan label
+        entry: config['scans'][label]
+        pois: the entry's pois
+    """
+    wcs = config['wcs']
+    _check_name_list(entry.get('profile_wcs', []), wcs, 'profile_wcs', label)
+    _check_name_list(entry.get('selection_wcs', []), wcs, 'selection_wcs', label)
+    _check_name_list(entry.get('profile_nu', []), None, 'profile_nu', label)
+    _check_box(entry.get('box', {}), label)
+    box = {**config.get('box', {}), **entry.get('box', {})}
+    moving = []
+    for key in ('profile_wcs', 'selection_wcs'):
+        names = entry.get(key, [])
+        if names != 'all' and set(names) & set(pois):
+            sys.exit(f'[error]: scan {label}: {key} must not contain the pois {sorted(set(names) & set(pois))}')
+        moving += [w for w in wcs if w not in pois] if names == 'all' else list(names)
+    unbounded = [w for w in dict.fromkeys(moving) if w not in box]
+    if unbounded:
+        sys.exit(f'[error]: scan {label}: profiled and selection WCs {unbounded} need a box entry')
+    for poi in pois:
+        if poi in box:
+            g = _grid(entry, poi, label)
+            lo, hi = box[poi]
+            if g[0] < lo or g[-1] > hi:
+                sys.exit(
+                    f'[error]: scan {label}: the grid of {poi} [{g[0]:g}, {g[-1]:g}] leaves its box [{lo:g}, {hi:g}]'
+                )
+    target = entry.get('target') or {}
+    _check_numbers(target.get('theta', {}), 'target theta', label)
+    _check_numbers(target.get('nu', {}), 'target nu', label)
+    nu_obs = entry.get('nu_obs')
+    if nu_obs is not None and nu_obs != 'target':
+        _check_numbers(nu_obs, "nu_obs ('target' or {name: number})", label)
+    base = entry.get('theta_base')
+    if isinstance(base, dict):
+        _check_numbers(base, 'theta_base', label)
+    nu_bound = entry.get('nu_bound', 5.0)
+    if not (_is_number(nu_bound) and nu_bound > 0):
+        sys.exit(f'[error]: scan {label}: nu_bound must be a positive number, not {nu_bound}')
+    cls = entry.get('cls')
+    if cls is not None and not (
+        isinstance(cls, list)
+        and 1 <= len(cls) <= len(LEVEL_STYLES)
+        and all(_is_number(c) and 0 < c < 1 for c in cls)
+        and all(a < b for a, b in zip(cls, cls[1:]))
+    ):
+        sys.exit(f'[error]: scan {label}: cls must be 1 to {len(LEVEL_STYLES)} increasing values in (0, 1), not {cls}')
+    max_selections = entry.get('max_selections', 5)
+    if not (isinstance(max_selections, int) and not isinstance(max_selections, bool) and max_selections >= 1):
+        sys.exit(f'[error]: scan {label}: max_selections must be an integer >= 1, not {max_selections}')
+    if not isinstance(entry.get('label', ''), str):
+        sys.exit(f'[error]: scan {label}: label must be text, not {entry["label"]}')
+    overlay = entry.get('overlay', [])
+    if not isinstance(overlay, list) or label in overlay:
+        sys.exit(f'[error]: scan {label}: overlay must be a list of other scans, not {overlay}')
+    u = entry.get('uncertainty')
+    if u is not None and u is not False:
+        if not isinstance(u, dict):
+            sys.exit(f'[error]: scan {label}: uncertainty must be {{members, n_boot, subsets, seed}}, not {u}')
+        if not isinstance(u.get('members', True), bool):
+            sys.exit(f'[error]: scan {label}: uncertainty members must be true or false, not {u["members"]}')
+        integers = [('n_boot', u.get('n_boot', 0), 0), ('seed', u.get('seed', 0), None)]
+        for key, value, minimum in integers:
+            if not (isinstance(value, int) and not isinstance(value, bool) and (minimum is None or value >= minimum)):
+                sys.exit(
+                    f'[error]: scan {label}: uncertainty {key} must be an integer'
+                    f'{"" if minimum is None else f" >= {minimum}"}, not {value}'
+                )
+        subsets = u.get('subsets')
+        if subsets is not None and not (
+            isinstance(subsets, dict)
+            and all(isinstance(k, int) and isinstance(v, int) and k >= 1 and v >= 1 for k, v in subsets.items())
+        ):
+            sys.exit(
+                f'[error]: scan {label}: uncertainty subsets must be {{n_e: draws}} of integers >= 1, not {subsets}'
+            )
+
+
 def check_scans(config):
     """
     Check the scan entries of a config before any input is loaded. A scan entry (config['scans'][label]) has pois
@@ -3207,8 +3329,8 @@ def check_scans(config):
     (pulls and impacts of the profiled nuisances at the best fit, impacts; default true for one poi with profile_nu,
     false otherwise; true needs one poi and profile_nu),
     refine (false, or {factor (integer >= 2, default 4), pad (integer >= 0, default 1)}: 2D refinement near the
-    contours, refine_points; two pois only, on by default for two pois) and label (legend text). With backgrounds, the
-    backgrounds block is checked by check_background_options.
+    contours, refine_points; two pois only, on by default for two pois) and label (legend text). Values are checked by
+    _check_values. With backgrounds, the backgrounds block is checked by check_background_options.
 
     Args:
         config: scan config (load_config)
@@ -3267,9 +3389,10 @@ def check_scans(config):
             if not isinstance(base, dict):
                 sys.exit(f"[error]: scan {label}: theta_base must be 'target' or {{wc: value}}, not {base}")
             _check_names(base, config['wcs'], 'WCs in theta_base', label)
-        unknown = sorted(set(entry.get('uncertainty') or {}) - set(UNCERTAINTY_KEYS))
-        if unknown:
-            sys.exit(f'[error]: scan {label}: unknown uncertainty keys {unknown}')
+        if isinstance(entry.get('uncertainty'), dict):
+            unknown = sorted(set(entry['uncertainty']) - set(UNCERTAINTY_KEYS))
+            if unknown:
+                sys.exit(f'[error]: scan {label}: unknown uncertainty keys {unknown}')
         with_impacts = entry.get('impacts')
         if with_impacts is not None and not isinstance(with_impacts, bool):
             sys.exit(f'[error]: scan {label}: impacts must be true or false, not {with_impacts}')
@@ -3301,6 +3424,8 @@ def check_scans(config):
             if list(scans[other].get('pois', [])) != list(pois):
                 sys.exit(f'[error]: scan {label}: overlay {other} does not scan {pois}')
         _check_names(entry.get('box', {}), config['wcs'], 'WCs in box', label)
+        _check_values(config, label, entry, pois)
+    _check_box(config.get('box', {}), 'top-level')
     _check_names(config.get('box', {}), config['wcs'], 'WCs in box', 'top-level')
     if config.get('backgrounds') is not None:
         check_background_options(config)
