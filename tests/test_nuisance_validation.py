@@ -1,68 +1,55 @@
 """
-Background step of the nuisance validation (--backgrounds) on a small synthetic nuisance ensemble, written through
-the real cache code: two members of two untrained nuisance networks per direction, a weight_shift in every era and a
-kinematic_shift whose variation exists in era 2 only, evaluated on a signal event set and two background event sets.
+Nuisance validation on a small synthetic production built from the samples of conftest: a mixed event set (the
+signal events of make_combined_sample followed by the events of make_background_sample, process bg) with its EFT
+reference c0 = (theta_SM, mu_bg = 1); signal nuisance networks trained on the signal sample (ISR as a weight_shift,
+JER_2017 as a kinematic_shift whose variation exists in era 2 only) and a background nuisance network trained on the
+background sample (ISR as a weight_shift, named ISR_bg). Every network is untrained, two members per direction. The
+nuisance cache is built and the validation run once per module, against a stand-in EFT cache whose Gamma gives the
+exact background term and a signal term off by about 1% per event; the tests read its outputs.
 """
 
+import os
+import shutil
 import types
 
 import numpy as np
 import pytest
 import torch
 import yaml
+from conftest import N_FEATURES, N_WCS, WCS, make_background_sample, make_combined_sample
 
 import topsbi.nuisance_validation as nv
 from topsbi.model.net import Net
 from topsbi.tools.build_ratio import NetworkRatio
+from topsbi.tools.data import expansion
 
 MEMBERS = [0, 1]
-C0 = [1.0, 0.5, -0.5]
-WCS = ['cA', 'cB']
-FEATURES = {'x0': {'loc': 0}, 'x1': {'loc': 1}, 'x2': {'loc': 2}}
-NUISANCES = {'ISR': 'weight_shift', 'JER_X': 'kinematic_shift'}  # sorted by name: row n of f_hat
-N_SIGNAL = 600
-BACKGROUNDS = {'tW': 300, 'Others': 400}
+N_EVENTS = 1000  # train events per sample; the validation.p of each holds half
+N_Q = (N_WCS + 1) * (N_WCS + 2) // 2
+SM = [1.0] + [0.0] * N_WCS
+C0 = SM + [1.0]  # the EFT reference: the reference_point of both samples, then mu_bg
+POINTS = {'sm': SM, 'theta': [1.0, 0.3, -0.2] + [0.0] * (N_WCS - 2)}  # factorisation points
+LUMI = [19.52, 16.81, 41.48, 59.83]
+FEATURES = {
+    'feat0': {'label': 'feature 0', 'loc': 0},
+    'feat1': {'label': 'feature 1', 'loc': 1},
+    'year': {'label': 'era', 'loc': 21},
+}
+# (term, systematic, method) of every network; the cache rows are sorted by name
+NETWORKS = [('signal', 'ISR', 'weight_shift'), ('signal', 'JER_2017', 'kinematic_shift'), ('bg', 'ISR', 'weight_shift')]
+ROWS = {'ISR': 0, 'ISR_bg': 2, 'JER_2017': 1}  # cache row name: index into NETWORKS
 NETWORK = [
     {'type': 'Linear', 'out': 8, 'activation': 'LeakyReLU'},
     {'type': 'Linear', 'in': 8, 'out': 1, 'activation': 'None'},
 ]
 
 
-def toy_features(n, seed):
-    """Features of a toy event set: x0, x1 uniform, x2 an era index 0-2."""
-    rng = np.random.default_rng(seed)
-    x = rng.uniform(0, 1, (n, 3))
-    x[:, 2] = rng.integers(0, 3, n)
-    return x
-
-
-def nominal_dataset(x):
-    """Combined nominal layout (features, coefs, ids, event_id, syst_ratio, w_ref) of the events x."""
-    n = len(x)
-    return torch.utils.data.TensorDataset(
-        torch.from_numpy(x).float(),
-        torch.zeros(n, 6, dtype=torch.float64),
-        torch.zeros(n, 3),
-        torch.stack([torch.arange(n)] * 4, dim=1),
-        torch.ones(n, 1, 2),
-        torch.ones(n, 1),
-    )
-
-
-def variation_dataset(x):
-    """Combined variation layout (features, w_ref, ids, event_id) of the events x."""
-    n = len(x)
-    return torch.utils.data.TensorDataset(
-        torch.from_numpy(x).float(), torch.ones(n, 1), torch.zeros(n, 3), torch.stack([torch.arange(n)] * 4, dim=1)
-    )
-
-
-def nuisance_network(directory, data, systematic, direction, seed):
+def nuisance_network(directory, data, systematic, direction, method, seed):
     """An untrained nuisance network (linear output) with its training.yml and complete/performance.yml."""
     (directory / 'complete').mkdir(parents=True)
     torch.manual_seed(seed)
-    net = Net(3, 'cpu', NETWORK)
-    net.set_feature_normalization(torch.tensor([0.5, 0.5, 1.0]), torch.tensor([0.3, 0.3, 0.8]))
+    net = Net(N_FEATURES, 'cpu', NETWORK)
+    net.set_feature_normalization(torch.full((N_FEATURES,), 100.0), torch.full((N_FEATURES,), 58.0))
     torch.save(net.state_dict(), directory / 'model.pt')
     training = {
         'name': str(directory),
@@ -70,7 +57,7 @@ def nuisance_network(directory, data, systematic, direction, seed):
         'data': str(data),
         'systematic': systematic,
         'direction': direction,
-        'method': NUISANCES[systematic],
+        'method': method,
     }
     (directory / 'training.yml').write_text(yaml.safe_dump(training))
     (directory / 'complete' / 'performance.yml').write_text(yaml.safe_dump({}))
@@ -80,48 +67,56 @@ def nuisance_network(directory, data, systematic, direction, seed):
 @pytest.fixture(scope='module')
 def toy(tmp_path_factory):
     """
-    EFT validation config (eft.yml, with backgrounds) and the nuisance validation config's seeds, on a combined
-    nominal sample with reference_point C0, a JER_X variation in era 2 only and two background holdouts.
+    The signal, background and mixed samples, the networks of NETWORKS for every member and the EFT validation config
+    of the mixed sample (eft.yml).
     """
-    root = tmp_path_factory.mktemp('nuisance_backgrounds')
-    data = root / 'combined'
-    x = {'signal': toy_features(N_SIGNAL, 0)}
-    (data / 'nominal').mkdir(parents=True)
-    torch.save(nominal_dataset(x['signal']), data / 'nominal' / 'validation.p')
-    (data / 'nominal' / 'sample.yml').write_text(yaml.safe_dump({'reference_point': C0}))
+    root = tmp_path_factory.mktemp('nuisance_validation')
+    data = {
+        'signal': make_combined_sample(root / 'signal', N_EVENTS),
+        'bg': make_background_sample(root / 'bg', N_EVENTS, process='bg'),
+    }
+    # the era-2 variation in both directions at the signal's reference point, and the background sample at it too
+    shutil.copytree(data['signal'] / 'JER_2017Up', data['signal'] / 'JER_2017Down')
     for direction in ('Up', 'Down'):
-        (data / f'JER_X{direction}').mkdir()
-        era2 = x['signal'][x['signal'][:, 2] == 2]
-        torch.save(variation_dataset(era2), data / f'JER_X{direction}' / 'validation.p')
-        (data / f'JER_X{direction}' / 'sample.yml').write_text(yaml.safe_dump({'reference_point': C0}))
-    directories = {}
-    for i, (p, n) in enumerate(BACKGROUNDS.items()):
-        x[p] = toy_features(n, 10 + i)
-        directory = root / 'backgrounds' / p
-        directory.mkdir(parents=True)
-        torch.save(nominal_dataset(x[p]), directory / 'validation.p')
-        directories[p] = str(directory)
+        variation = {'variation': f'JER_2017{direction}', 'reference_point': SM}
+        (data['signal'] / f'JER_2017{direction}' / 'sample.yml').write_text(yaml.safe_dump(variation))
+    sample = yaml.safe_load((data['bg'] / 'nominal' / 'sample.yml').read_text())
+    (data['bg'] / 'nominal' / 'sample.yml').write_text(yaml.safe_dump({**sample, 'reference_point': SM}))
+    # the mixed sample: the signal events, then the background events, with one background column after T(theta)
+    signal = list(torch.load(data['signal'] / 'nominal' / 'validation.p', weights_only=False).tensors)
+    background = list(torch.load(data['bg'] / 'nominal' / 'validation.p', weights_only=False).tensors)
+    signal[1] = torch.cat([signal[1], torch.zeros(len(signal[1]), 1, dtype=torch.float64)], dim=1)
+    background[1] = torch.cat(
+        [torch.zeros(len(background[1]), N_Q, dtype=torch.float64), background[5].double()], dim=1
+    )
+    mixed = root / 'mixed' / 'nominal'
+    mixed.mkdir(parents=True)
+    tensors = [torch.cat([a, b]) for a, b in zip(signal, background)]
+    torch.save(torch.utils.data.TensorDataset(*tensors), mixed / 'validation.p')
+    for name in ('sample.yml', 'systematics.yml'):
+        shutil.copy(data['signal'] / 'nominal' / name, mixed / name)
     seeds = {}
     for e in MEMBERS:
         networks = []
-        for k, systematic in enumerate(NUISANCES):
+        for k, (term, systematic, method) in enumerate(NETWORKS):
             for d, direction in enumerate(('down', 'up')):
-                directory = root / 'networks' / f'seed_{e}' / systematic / direction
-                networks.append(nuisance_network(directory, data, systematic, direction, 100 * e + 10 * k + d))
+                directory = root / 'networks' / f'seed_{e}' / f'{term}_{systematic}' / direction
+                seed = 100 * e + 10 * k + d
+                networks.append(nuisance_network(directory, data[term], systematic, direction, method, seed))
         seeds[e] = {'networks': networks}
     eft = {
         'name': str(root / 'eft'),
-        'data': str(data / 'nominal' / 'validation.p'),
+        'data': str(mixed / 'validation.p'),
         'c0': C0,
         'wcs': WCS,
-        'lumi': [1.0, 2.0, 3.0],
-        'year_loc': 2,
+        'lumi': LUMI,
         'features': FEATURES,
-        'backgrounds': directories,
     }
     eft_path = root / 'eft.yml'
     eft_path.write_text(yaml.safe_dump(eft, sort_keys=False))
-    return types.SimpleNamespace(root=root, eft=eft, eft_path=str(eft_path), seeds=seeds, x=x)
+    return types.SimpleNamespace(
+        root=root, eft=eft, eft_path=str(eft_path), seeds=seeds, data=data, tensors=tensors, n_signal=len(signal[0])
+    )
 
 
 def write_config(toy, directory, eft_path=None, **extra):
@@ -139,162 +134,261 @@ def write_config(toy, directory, eft_path=None, **extra):
     return str(path)
 
 
-def member_mean(toy, x, systematic):
-    """[2, N] member mean of the networks' f_hat (Down, Up) of systematic on the events x, in float64."""
-    k = list(NUISANCES).index(systematic)
-    features = torch.from_numpy(x).float()
+def member_mean(toy, features, row):
+    """[2, N] member mean of the networks' f_hat (Down, Up) of cache row row on the events features, in float64."""
+    k = ROWS[row]
     f_hat = [
-        [NetworkRatio(toy.seeds[e]['networks'][2 * k + d], 3).log_ratio(features).double().numpy() for d in (0, 1)]
+        [
+            NetworkRatio(toy.seeds[e]['networks'][2 * k + d], N_FEATURES).log_ratio(features).double().numpy()
+            for d in (0, 1)
+        ]
         for e in MEMBERS
     ]
     return np.mean(f_hat, axis=0)
 
 
-def test_load_config_backgrounds(toy, tmp_path):
-    config = nv.load_config(write_config(toy, tmp_path))
-    assert config['backgrounds'] == toy.eft['backgrounds']
-    with pytest.raises(SystemExit, match='backgrounds is taken from'):
-        nv.load_config(write_config(toy, tmp_path, backgrounds=toy.eft['backgrounds']))
+def stand_in_eft(coefs, noise=0.0):
+    """
+    A stand-in for EnsembleCache: Gamma = s_q(z) / s(z) . T(c0) per event for every column of T(theta, mu), the exact
+    ratio, with the signal columns of each event scaled by 1 + epsilon_i (epsilon_i normal with standard deviation
+    noise), and two members scattered around it by 1%.
+    """
+    reference = coefs @ expansion(C0, N_WCS, dtype=torch.float64)
+    gamma = (coefs / reference[:, None]).T.numpy()
+    n = gamma.shape[1]
+    gamma[:N_Q] *= 1 + noise * np.random.default_rng(7).standard_normal(n)
+    return types.SimpleNamespace(
+        path='stand-in',
+        n_wcs=N_WCS,
+        background_processes=['bg'],
+        mask=np.ones(len(gamma), dtype=bool),
+        Gamma=gamma,
+        finite=np.ones(n, dtype=bool),
+        seeds=MEMBERS,
+        seed_Gamma={e: gamma * (1 + 0.01 * (2 * e - 1)) for e in MEMBERS},
+        seed_finite={e: np.ones(n, dtype=bool) for e in MEMBERS},
+        matches=lambda config: True,
+    )
 
 
-def test_load_nuisance_ensemble_data_override(toy, tmp_path):
-    config = nv.load_config(write_config(toy, tmp_path))
-    data = f'{toy.eft["backgrounds"]["tW"]}/validation.p'
-    path = str(tmp_path / 'nuisance_tW')
-    features = torch.from_numpy(toy.x['tW']).float()
-    cache = nv.load_nuisance_ensemble(config, features, refit=True, data=data, path=path)
-    assert cache.manifest['data'] == data and cache.manifest['ensemble'] == toy.eft_path
-    assert config['data'] == toy.eft['data']  # the caller's config is unchanged
-    assert [n['eras'] for n in cache.nuisances] == [None, [2]]
-    assert cache.f_hat.shape == (len(NUISANCES), 2, BACKGROUNDS['tW']) and cache.finite.all()
-    assert np.allclose(cache.f_hat[0], member_mean(toy, toy.x['tW'], 'ISR'), rtol=1e-5, atol=1e-6)
-    # the era rule: the kinematic_shift is 0 outside its eras
-    era2 = toy.x['tW'][:, 2] == 2
-    assert np.all(cache.f_hat[1][:, ~era2] == 0)
-    assert np.allclose(cache.f_hat[1][:, era2], member_mean(toy, toy.x['tW'][era2], 'JER_X'), rtol=1e-5, atol=1e-6)
-    # read back with the same data path; another data path or c0 stops the run
-    assert nv.load_nuisance_ensemble(config, None, data=data, path=path).manifest['data'] == data
-    with pytest.raises(SystemExit, match='another ensemble, data'):
-        nv.load_nuisance_ensemble(config, None, path=path)
-    # theta_ref is recorded, not required to equal c0 (the checks move to it through reference_nominal)
-    other = nv.load_nuisance_ensemble({**config, 'c0': [1.0, 0.0, 0.0]}, None, data=data, path=path)
-    assert np.allclose(other.theta_ref, C0)
-
-
-def test_background_nuisances(toy, tmp_path, monkeypatch):
-    config = nv.load_config(write_config(toy, tmp_path))
-    caches = nv.background_nuisances(config)
-    assert list(caches) == list(BACKGROUNDS)
-    for p, cache in caches.items():
-        assert cache.path == f'{config["name"]}/nuisance_{p}'
-        assert cache.manifest['data'] == f'{toy.eft["backgrounds"][p]}/validation.p'
-        assert cache.finite.shape == (BACKGROUNDS[p],)
-
-    # a matching cache is read; refit builds every one from the background's own features
-    calls = []
-
-    def fake_load(config, features, refit=False, data=None, path=None):
-        calls.append((refit, None if features is None else tuple(features.shape)))
-        return nv.NuisanceCache(path)
-
-    monkeypatch.setattr(nv, 'load_nuisance_ensemble', fake_load)
-    nv.background_nuisances(config)
-    assert calls == [(False, None)] * len(BACKGROUNDS)
-    calls.clear()
-    nv.background_nuisances(config, refit=True)
-    assert calls == [(True, (n, 3)) for n in BACKGROUNDS.values()]
-
-
-def test_run_backgrounds(toy, tmp_path):
-    path = write_config(toy, tmp_path)
-    with pytest.raises(SystemExit, match='no nuisance cache'):
-        nv.main(path, backgrounds=True)
-    nv.main(path, refit=True, backgrounds=True)
-    name = tmp_path / 'validation'
-    diagnostics = yaml.safe_load(open(name / 'background_diagnostics.yml'))
-    assert list(diagnostics) == ['seeds', 'event_sets'] and diagnostics['seeds'] == MEMBERS
-    assert list(diagnostics['event_sets']) == ['signal', *BACKGROUNDS]
-    for set_name, n in [('signal', N_SIGNAL), *BACKGROUNDS.items()]:
-        entry = diagnostics['event_sets'][set_name]
-        assert entry['events'] == n and entry['dropped'] == 0.0
-        assert entry['dropped_members'] == {e: 0.0 for e in MEMBERS}
-    assert (name / 'nuisance' / 'nuisance.yml').exists()
-    assert not (name / 'nuisance_diagnostics.yml').exists()  # the checks did not run
-    # the caches now match, so the step runs again without refit
-    nv.main(path, backgrounds=True)
-
+@pytest.fixture(scope='module')
+def run(toy, tmp_path_factory):
+    """
+    The validation of toy, run once with a fresh nuisance cache against the stand-in EFT cache with a 1% signal term
+    error: config and cache.
+    """
+    directory = tmp_path_factory.mktemp('run')
+    path = write_config(toy, directory, factorisation={'points': POINTS})
+    coefs = toy.tensors[1]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(nv, 'EnsembleCache', lambda path: stand_in_eft(coefs, noise=0.01))
+        nv.main(path, refit=True)
     config = nv.load_config(path)
-    with pytest.raises(SystemExit, match='needs the key backgrounds'):
-        nv.run_backgrounds({k: v for k, v in config.items() if k != 'backgrounds'})
-    with pytest.raises(SystemExit, match="'signal'"):
-        nv.run_backgrounds({**config, 'backgrounds': {'signal': config['backgrounds']['tW']}})
-    with pytest.raises(SystemExit, match='no validation.p'):
-        nv.run_backgrounds({**config, 'backgrounds': {**config['backgrounds'], 'tW': str(tmp_path)}})
+    return types.SimpleNamespace(path=path, config=config, cache=nv.NuisanceCache(f'{config["name"]}/nuisance'))
 
 
-def reference_file(directory, x, point, w_ref=2.0):
-    """validation.p of the events x in the nominal layout with w_ref, and a sample.yml with reference_point point."""
-    directory.mkdir(parents=True)
-    dataset = nominal_dataset(x)
-    tensors = list(dataset.tensors)
-    tensors[5] = torch.full_like(tensors[5], w_ref)
-    torch.save(torch.utils.data.TensorDataset(*tensors), directory / 'validation.p')
-    (directory / 'sample.yml').write_text(yaml.safe_dump({'reference_point': point}))
-    return str(directory / 'validation.p')
+def moved_networks(toy, directory, e, k, data):
+    """toy's seeds with both networks k (index into NETWORKS) of member e pointing to the data directory data."""
+    seeds = {m: {'networks': list(s['networks'])} for m, s in toy.seeds.items()}
+    for d in (0, 1):
+        with open(seeds[e]['networks'][2 * k + d]) as f:
+            training = yaml.safe_load(f)
+        path = directory / f'{data.name}_{e}_{k}_{d}.yml'
+        path.write_text(yaml.safe_dump({**training, 'data': str(data)}))
+        seeds[e]['networks'][2 * k + d] = str(path)
+    return seeds
 
 
-def test_reference_nominal(toy, tmp_path):
-    config = nv.load_config(write_config(toy, tmp_path))
+def test_nuisance_networks_terms(toy, tmp_path):
+    nuisances, networks = nv.nuisance_networks(toy.seeds)
+    # the background network of the same systematic as a signal one is its own row, named <systematic>_<process>
+    assert [nuisance['name'] for nuisance in nuisances] == list(ROWS)
+    for nuisance in nuisances:
+        term, systematic, method = NETWORKS[ROWS[nuisance['name']]]
+        assert nuisance == {
+            'name': nuisance['name'],
+            'systematic': systematic,
+            'method': method,
+            'term': term,
+            'data': str(toy.data[term]),
+        }
+    for e in MEMBERS:
+        assert networks[e] == [toy.seeds[e]['networks'][2 * k : 2 * k + 2] for k in ROWS.values()]
+
+    # a background sample without its process, and one network trained on two data directories, stop
+    unnamed = tmp_path / 'unnamed'
+    (unnamed / 'nominal').mkdir(parents=True)
+    (unnamed / 'nominal' / 'sample.yml').write_text(yaml.safe_dump({'eft': False}))
+    with pytest.raises(ValueError, match='eft: false and no process'):
+        nv.nuisance_networks(moved_networks(toy, tmp_path, 0, ROWS['ISR_bg'], unnamed))
+    other = tmp_path / 'other'
+    (other / 'nominal').mkdir(parents=True)
+    (other / 'nominal' / 'sample.yml').write_text(yaml.safe_dump({'eft': True}))
+    with pytest.raises(ValueError, match='is trained on both'):
+        nv.nuisance_networks(moved_networks(toy, tmp_path, 1, ROWS['ISR'], other))
+
+
+def test_nuisance_cache(toy, run, tmp_path):
+    cache = run.cache
+    n = len(toy.tensors[0])
+    assert cache.manifest['data'] == toy.eft['data'] and np.allclose(cache.theta_ref, SM)
+    assert [nuisance['name'] for nuisance in cache.nuisances] == list(ROWS)
+    assert [nuisance['eras'] for nuisance in cache.nuisances] == [None, None, [2]]
+    assert cache.f_hat.shape == (len(ROWS), 2, n) and cache.finite.all()
+    # every row on every event of the mixed sample, the background events included
+    features = toy.tensors[0]
+    for row in ('ISR', 'ISR_bg'):
+        assert np.allclose(cache.f_hat[list(ROWS).index(row)], member_mean(toy, features, row), rtol=1e-5, atol=1e-6)
+    # the kinematic_shift with a variation in era 2 only is 0 in the other eras
+    era2 = (features[:, 21] == 2).numpy()
+    jer = cache.f_hat[list(ROWS).index('JER_2017')]
+    assert np.all(jer[:, ~era2] == 0)
+    assert np.allclose(jer[:, era2], member_mean(toy, features[era2], 'JER_2017'), rtol=1e-5, atol=1e-6)
+
+    # c0 at another WC point than the networks' theta_ref stops the run, on reading and before building
+    other = {**run.config, 'c0': POINTS['theta'] + [1.0]}
+    with pytest.raises(SystemExit, match='share the reference point'):
+        nv.load_nuisance_ensemble(other, None)
+    rebuilt = {**other, 'name': str(tmp_path / 'validation')}
+    with pytest.raises(SystemExit, match='share the reference point'):
+        nv.load_nuisance_ensemble(rebuilt, features, refit=True)
+    assert not (tmp_path / 'validation').exists()
+
+
+def test_event_terms_and_binning(toy):
+    coefs, features = toy.tensors[1], toy.tensors[0]
+    terms = nv.event_terms(coefs, N_WCS, ['bg'])
+    assert list(terms[: toy.n_signal]) == ['signal'] * toy.n_signal
+    assert list(terms[toy.n_signal :]) == ['bg'] * (len(terms) - toy.n_signal)
+    # without background columns every event is signal
+    assert set(nv.event_terms(coefs[:, :N_Q], N_WCS, [])) == {'signal'}
+    with pytest.raises(ValueError, match='columns but coefs has'):
+        nv.event_terms(coefs, N_WCS, [])
+    with pytest.raises(ValueError, match='another background process'):
+        nv.event_terms(torch.cat([coefs, coefs[:, N_Q:]], dim=1), N_WCS, ['bg', 'copy'])
+
+    # the shared bins hold min_neff effective events of every term in every feature
+    w0 = nv.sample_weight(toy.tensors, 'nominal', {'lumi': LUMI}).double().numpy()
+    binning = nv.closure_binning(features, FEATURES, w0, terms, nbins=20, min_neff=30)
+    index = binning['index'].numpy()
+    for term in ('signal', 'bg'):
+        rows = terms == term
+        for f in range(len(binning['names'])):
+            sumw = np.bincount(index[f, rows], w0[rows], binning['n_bins'])
+            sumw2 = np.bincount(index[f, rows], w0[rows] ** 2, binning['n_bins'])
+            bins = binning['feature'] == f
+            assert np.all(sumw[bins] ** 2 / sumw2[bins] >= 30)
+
+
+def test_closure_targets(toy, run):
+    config, cache = run.config, run.cache
     columns = ('features', 'ids', 'event_id', 'syst_ratio', 'w_ref')
     nominal = nv.load_combined(config['data'], 'nominal', columns)
-    sm = [1.0, 0.0, 0.0]
+    features = nominal[0]
+    terms = nv.event_terms(toy.tensors[1], N_WCS, ['bg'])
+    w0 = nv.sample_weight(nominal, 'nominal', config).double().numpy()
+    binning = nv.closure_binning(features, FEATURES, w0, terms)
+    targets = nv.ClosureTargets(config, cache, nominal, w0, binning, terms)
+    row = {name: list(ROWS).index(name) for name in ROWS}
+    signal, era2 = terms == 'signal', (features[:, 21] == 2).numpy()
+    events = np.arange(len(w0))
 
-    # theta_ref = c0: the checks read config['data']
-    tensors, checks = nv.reference_nominal(config, C0, nominal)
-    assert tensors is nominal and checks is config
-    with pytest.raises(SystemExit, match='set reference_data'):
-        nv.reference_nominal(config, sm, nominal)
+    # each nuisance is tested on the events of its term, in its eras
+    assert np.array_equal(targets.rows0(row['ISR']), signal)
+    assert np.array_equal(targets.rows0(row['ISR_bg']), ~signal)
+    assert np.array_equal(targets.rows0(row['JER_2017']), signal & era2)
+    assert np.array_equal(targets.era_rows(row['JER_2017']), era2)
 
-    # theta_ref != c0: the same events combined at theta_ref
-    path = reference_file(tmp_path / 'sm' / 'nominal', toy.x['signal'], sm)
-    tensors, checks = nv.reference_nominal({**config, 'reference_data': path}, sm, nominal)
-    assert checks['data'] == path and config['data'] == toy.eft['data']
-    assert torch.equal(tensors[0], nominal[0]) and torch.all(tensors[5] == 2.0)
-    assert np.allclose(nv.sample_weight(tensors, 'nominal', checks), 2 * nv.sample_weight(nominal, 'nominal', config))
+    # weight_shift: the true ratio on the events of the nuisance's term, 1 on the others
+    for name in ('ISR', 'ISR_bg'):
+        own = terms == NETWORKS[ROWS[name]][0]
+        for d, direction in enumerate(nv.DIRECTIONS):
+            k, j = nv.syst_ratio_column(str(toy.root / 'mixed'), 'ISR', direction)
+            r = nominal[4][:, k, j].double().numpy()
+            t = targets(row[name], d)
+            assert np.allclose(t['w1'], w0 * np.where(own, r, 1.0))
+            assert np.array_equal(t['i0'], events) and np.array_equal(t['i1'], events)
+            assert torch.equal(t['index1'], binning['index'])
 
-    # another reference point, or other events, stop the run
-    with pytest.raises(SystemExit, match='reference_point'):
-        nv.reference_nominal({**config, 'reference_data': path}, C0, nominal)
-    shuffled = reference_file(tmp_path / 'shuffled' / 'nominal', toy.x['signal'][::-1].copy(), sm)
-    with pytest.raises(SystemExit, match='differ in features'):
-        nv.reference_nominal({**config, 'reference_data': shuffled}, sm, nominal)
+    # kinematic_shift: the variation of the networks' training data, matched to the events of its term only
+    keys = nv.event_keys(nominal, 'nominal', 21)
+    for d, direction in enumerate(nv.DIRECTIONS):
+        path = f'{toy.data["signal"]}/JER_2017{direction.capitalize()}/validation.p'
+        assert targets._path(row['JER_2017'], d) == path
+        shifted = nv.load_combined(path, 'variation', ('features', 'ids', 'event_id', 'w_ref'))
+        i0, i1 = nv.matched_events(keys[signal], nv.event_keys(shifted, 'variation', 21))
+        t = targets(row['JER_2017'], d)
+        assert np.all(t['i0'][~signal] == -1) and np.array_equal(t['i0'][signal], i0.numpy())
+        assert np.array_equal(t['i1'], i1.numpy())
+        assert np.allclose(t['w1'], nv.sample_weight(shifted, 'variation', config).double().numpy())
+    down, up = targets.pair(row['JER_2017'])
+    assert np.array_equal(down['i0'], up['i0']) and np.all(down['i0'][~signal] == -1)
+    # the Down sample is a copy of Up, so both give every shifted event the index of its nominal event
+    assert np.array_equal(down['i1'], up['i1'])
 
 
-def test_eft_closure_member_scatter():
+def test_eft_helpers(toy):
+    coefs = toy.tensors[1]
+    signal = np.arange(len(coefs)) < toy.n_signal
+
+    # rho: the change of the signal weight on the signal events, 1 on the background events
+    rho = nv.factorisation_weights(coefs, SM, POINTS, n_backgrounds=1)
+    structure = coefs[signal][:, :N_Q]
+    for label, theta in POINTS.items():
+        expected = structure @ expansion(theta, N_WCS, dtype=torch.float64)
+        expected = expected / (structure @ expansion(SM, N_WCS, dtype=torch.float64))
+        assert np.allclose(rho[label][signal], expected.numpy()) and np.all(rho[label][~signal] == 1)
+
+    # the terms of the learned EFT ratio: each 0 on the events of the other, and with the exact ratio w^s(c0) times
+    # their sum is the weight at (theta, mu_bg = 1)
+    eft = stand_in_eft(coefs)
+    w_ref = toy.tensors[5][:, 0].double().numpy()
+    for theta in POINTS.values():
+        terms = nv.eft_terms(eft, theta)
+        assert list(terms) == ['signal', 'bg']
+        assert np.all(terms['signal'][~signal] == 0) and np.all(terms['bg'][signal] == 0)
+        weight = coefs @ expansion(theta + [1.0], N_WCS, dtype=torch.float64)
+        assert np.allclose(w_ref * (terms['signal'] + terms['bg']), weight.numpy())
+    # an event the ensemble drops is nan in every term; a dropped background column cannot be separated
+    kept = np.arange(len(coefs)) > 0
+    terms = nv.eft_terms(types.SimpleNamespace(**{**vars(eft), 'finite': kept, 'Gamma': eft.Gamma[:, 1:]}), SM)
+    assert all(np.isnan(term[0]) and np.isfinite(term[1:]).all() for term in terms.values())
+    mask = np.r_[np.ones(N_Q, dtype=bool), False]
+    with pytest.raises(ValueError, match='not separable'):
+        nv.eft_terms(types.SimpleNamespace(**{**vars(eft), 'mask': mask, 'Gamma': eft.Gamma[:N_Q]}), SM)
+
+    # member ratios on the events every member keeps, and the closure of the learned EFT ratio with their scatter
     rng = np.random.default_rng(3)
-    n, n_q, n_bins = 200, 6, 4
+    n, n_wcs, n_bins = 200, 2, 4
+    n_columns = (n_wcs + 1) * (n_wcs + 2) // 2 + 1
     theta = [1.0, 0.4, -0.3]
     finite = {e: np.ones(n, dtype=bool) for e in MEMBERS}
     finite[1][0] = False
-    gammas = {e: rng.normal(1.0, 0.1, (n_q, finite[e].sum())) for e in MEMBERS}
-    eft = types.SimpleNamespace(
+    gammas = {e: rng.normal(1.0, 0.1, (n_columns, finite[e].sum())) for e in MEMBERS}
+    members_eft = types.SimpleNamespace(
         seeds=MEMBERS,
-        mask=np.ones(n_q, dtype=bool),
+        n_wcs=n_wcs,
+        background_processes=['bg'],
+        mask=np.ones(n_columns, dtype=bool),
         seed_finite=finite,
         seed_Gamma=gammas,
         finite=finite[0] & finite[1],
     )
-    keep = eft.finite
-    ratios = nv.eft_member_ratios(eft, theta, keep)
-    t = nv.get_lower_tri(theta, dtype=torch.float64).numpy()
+    keep = members_eft.finite
+    ratios = nv.eft_member_ratios(members_eft, theta, keep)
+    t = expansion(theta + [1.0], n_wcs, dtype=torch.float64).numpy()
     assert ratios.shape == (len(MEMBERS), n) and np.all(ratios[:, ~keep] == 0)
     assert np.allclose(ratios[0, keep], t @ gammas[0][:, keep])
     # member 1's coefficients are stored on its own kept events
     assert np.allclose(ratios[1, keep], t @ gammas[1][:, keep[finite[1]]])
 
     bins = np.arange(n) % n_bins
-    binning = {'index': torch.from_numpy(bins)[None], 'n_bins': n_bins, 'feature': np.zeros(n_bins, dtype=int),
-               'names': ['x0']}
+    binning = {
+        'index': torch.from_numpy(bins)[None],
+        'n_bins': n_bins,
+        'feature': np.zeros(n_bins, dtype=int),
+        'names': ['x0'],
+    }
     w0, rho = rng.uniform(0.5, 1.5, n), rng.uniform(0.8, 1.2, n)
     members = w0[None] * ratios
     w_hat0 = members.mean(0)
@@ -305,3 +399,49 @@ def test_eft_closure_member_scatter():
     assert np.allclose(bias['D'][0], np.bincount(bins[keep], w_hat0[keep], n_bins) - true)
     assert np.allclose(bias['s2'][0], per_member.var(0, ddof=1) / len(MEMBERS))
     assert np.allclose(sums['mc_var'][0], np.bincount(bins[keep], (w_hat0 - w0 * rho)[keep] ** 2, n_bins))
+
+
+def test_main_outputs(toy, run):
+    name = run.config['name']
+    with open(f'{name}/nuisance_diagnostics.yml') as f:
+        diagnostics = yaml.safe_load(f)
+    sums = np.load(f'{name}/nuisance_sums.npz')
+    entries = diagnostics['nuisances']
+    assert list(entries) == list(ROWS) and diagnostics['factorisation_points'] == list(POINTS)
+    assert {row: entries[row]['term'] for row in ROWS} == {row: NETWORKS[k][0] for row, k in ROWS.items()}
+
+    # the factorisation test runs on the signal weight_shift networks, the tests with the learned EFT ratio on every
+    # weight_shift network, measured against the factorisation test or, for the background one, the closure
+    for label in POINTS:
+        assert entries['ISR_bg']['factorisation'][label] is None and entries['JER_2017']['factorisation'][label] is None
+        assert entries['JER_2017']['combined'][label] is None and entries['JER_2017']['difference'][label] is None
+        for row, baseline in (('ISR', 'factorisation'), ('ISR_bg', 'closure')):
+            for key in ('combined', 'difference'):
+                for direction in nv.DIRECTIONS:
+                    test = entries[row][key][label][direction]
+                    if baseline == 'closure':
+                        reference = entries[row][direction]
+                    else:
+                        reference = entries[row]['factorisation'][label][direction]
+                    assert test['baseline'] == baseline
+                    assert np.isclose(test['rms_bias_change'], test['rms_bias'] - reference['rms_bias'], equal_nan=True)
+
+    def same(a, b):
+        """Whether two [rows, B] arrays of per-bin sums agree, rows not tested (nan) included."""
+        scale = np.nanmax(np.abs(sums['closure/truth']))
+        return np.allclose(a, b, rtol=1e-6, atol=1e-9 * scale, equal_nan=True)
+
+    row = {name: [2 * list(ROWS).index(name) + d for d in range(len(nv.DIRECTIONS))] for name in ROWS}
+    tested = row['ISR'] + row['ISR_bg']
+    # per event the combined and difference tests differ by w^s(c0, 0) r_hat(x; theta) - w^s(theta, 0), the closure
+    # of the learned EFT ratio alone
+    for label in POINTS:
+        change = sums[f'combined/{label}/D'][tested] - sums[f'difference/{label}/D'][tested]
+        assert same(change, np.broadcast_to(sums[f'eft_only/{label}/D'], change.shape))
+    # at theta_SM (rho = 1): the factorisation test of the signal network is its closure, and the difference test of
+    # the background network is its closure, the signal term of the learned EFT ratio entering neither
+    assert same(sums['factorisation/sm/D'][row['ISR']], sums['closure/D'][row['ISR']])
+    assert same(sums['difference/sm/D'][row['ISR_bg']], sums['closure/D'][row['ISR_bg']])
+
+    for plot in ('z_heatmap_networks', 'interpolation_yield', 'factorisation_theta', 'eft_combined_theta'):
+        assert os.path.exists(f'{name}/plots/{plot}.png')

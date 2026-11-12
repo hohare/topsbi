@@ -1403,7 +1403,8 @@ def plot_nuisance_closure(sums, row, f, z_max, binning, outname, title, nominal=
         binning: {'names', 'edges', 'feature'} of the closure
         outname: file to save the plot to
         title: drawn above the top panel
-        nominal: draw the nominal yield and the true shift (for the networks of check 1, not the parts)
+        nominal: draw the nominal yield and the true shift (for the closure of a network, not of the parts of the
+            interpolation)
         feature_config: contents of the features yml, for the feature's TeX label
     '''
     b = binning['feature'] == f

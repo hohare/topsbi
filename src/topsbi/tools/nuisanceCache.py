@@ -1,5 +1,5 @@
 from topsbi.tools.build_ratio import NetworkRatio
-from topsbi.tools.data import load_combined
+from topsbi.tools.data import NUISANCE_COLUMNS, load_combined, syst_ratio_column
 
 import datetime, hashlib, os, shutil, torch, tqdm, yaml
 import numpy as np
@@ -9,40 +9,88 @@ DIRECTIONS = ('down', 'up')  # direction index of f_hat: 0 = Down, 1 = Up
 
 def nuisance_networks(seeds):
     """
-    Pair every member's nuisance training configs by systematic and direction.
+    Pair every member's nuisance training configs by term, systematic and direction. The term of a network is the
+    process its training data belong to, read from the sample.yml of its nominal data: 'signal' for an EFT sample
+    (eft: true, the default), otherwise the sample's process. A background nuisance is named
+    <systematic>_<process>, so that it is distinct from the signal nuisance of the same systematic. A network whose
+    systematic is a list of per-era names (one network for several per-era nuisances, each acting on its own era's
+    events only) gives one nuisance per listed name, every one of them pointing to the same configs; its names are
+    kept in 'network'.
 
     Args:
         seeds: config['seeds'], {e: {'networks': [training yml paths]}}
     Returns:
-        nuisances: [{'name': systematic, 'method': method}] sorted by name; entry n is row n of f_hat
+        nuisances: [{'name': nuisance name, 'systematic': systematic in the data, 'method': method, 'term': 'signal'
+            or the background process, 'data': training data directory of its networks}, with 'network': [per-era
+            systematics of the shared network] for a nuisance of a list systematic] sorted by name; entry n is row n
+            of f_hat
         networks: {e: [[down yml, up yml] for each nuisance n]}, direction index as in DIRECTIONS
     """
-    methods, pairs = {}, {}
+    samples = {}
+
+    def term_of(path, data):
+        sample = f'{data}/nominal/sample.yml'
+        if sample not in samples:
+            if not os.path.exists(sample):
+                raise ValueError(f'{sample} not found: the term of {path} is unknown')
+            with open(sample) as f:
+                specs = yaml.safe_load(f)
+            if specs.get('eft', True):
+                samples[sample] = 'signal'
+            elif 'process' in specs:
+                samples[sample] = specs['process']
+            else:
+                raise ValueError(f'{sample} has eft: false and no process')
+        return samples[sample]
+
+    methods, datas, pairs = {}, {}, {}
     for seed, members in seeds.items():
         pairs[seed] = {}
         for path in members['networks']:
             with open(path) as f:
                 config = yaml.safe_load(f)
-            name, direction = config['systematic'], config['direction'].lower()
+            systematic, direction = config['systematic'], config['direction'].lower()
             if direction not in DIRECTIONS:
                 raise ValueError(f'{path}: unknown direction {config["direction"]!r}; expected one of {DIRECTIONS}')
-            if methods.setdefault(name, config['method']) != config['method']:
-                raise ValueError(f'{name} is trained with both {methods[name]!r} and {config["method"]!r}')
-            pair = pairs[seed].setdefault(name, [None, None])
+            # a network is keyed by its term and its systematic, the tuple of its names for a list of per-era names
+            key = (term_of(path, config['data']), systematic if isinstance(systematic, str) else tuple(systematic))
+            if methods.setdefault(key, config['method']) != config['method']:
+                raise ValueError(
+                    f'{key[0]} {systematic} is trained with both {methods[key]!r} and {config["method"]!r}'
+                )
+            if datas.setdefault(key, config['data']) != config['data']:
+                raise ValueError(f'{key[0]} {systematic} is trained on both {datas[key]} and {config["data"]}')
+            pair = pairs[seed].setdefault(key, [None, None])
             if pair[DIRECTIONS.index(direction)] is not None:
-                raise ValueError(f'member {seed}: {name} {direction} is listed twice')
+                raise ValueError(f'member {seed}: {key[0]} {systematic} {direction} is listed twice')
             pair[DIRECTIONS.index(direction)] = path
-    names = sorted(methods)
+    # one row per nuisance name: the network it is trained in and the systematic it is stored as in the data
+    rows = {}
+    for key in methods:
+        term, systematic = key
+        for name in [systematic] if isinstance(systematic, str) else systematic:
+            row = name if term == 'signal' else f'{name}_{term}'
+            if row in rows:
+                raise ValueError(f'{row} is trained in two networks, {rows[row][0]} and {key}')
+            rows[row] = (key, name)
+    names = sorted(rows)
     networks = {}
     for seed, pair in pairs.items():
-        if sorted(pair) != names:
-            missing = sorted(set(names) - set(pair))
+        if set(pair) != set(methods):
+            missing = sorted(set(methods) - set(pair), key=str)
             raise ValueError(f'member {seed} lacks nuisances {missing}')
-        for name in names:
-            if None in pair[name]:
-                raise ValueError(f'member {seed}: {name} has no {DIRECTIONS[pair[name].index(None)]} network')
-        networks[seed] = [pair[name] for name in names]
-    nuisances = [{'name': name, 'method': methods[name]} for name in names]
+        for key in methods:
+            if None in pair[key]:
+                raise ValueError(f'member {seed}: {key} has no {DIRECTIONS[pair[key].index(None)]} network')
+        networks[seed] = [pair[rows[name][0]] for name in names]
+    nuisances = []
+    for name in names:
+        key, stored = rows[name]
+        term, systematic = key
+        nuisance = {'name': name, 'systematic': stored, 'method': methods[key], 'term': term, 'data': datas[key]}
+        if not isinstance(systematic, str):
+            nuisance['network'] = list(systematic)
+        nuisances.append(nuisance)
     return nuisances, networks
 
 
@@ -65,7 +113,7 @@ def reference_point(nuisances, networks):
                     data = yaml.safe_load(f)['data']
                 names = ['nominal']
                 if nuisance['method'] == 'kinematic_shift':
-                    names.append(f'{nuisance["name"]}{direction.capitalize()}')
+                    names.append(f'{nuisance["systematic"]}{direction.capitalize()}')
                 for name in names:
                     sample = f'{data}/{name}/sample.yml'
                     if sample not in points:
@@ -84,27 +132,45 @@ def reference_point(nuisances, networks):
 
 def nuisance_eras(nuisances, networks, year_loc=21):
     """
-    The eras each nuisance network is trained on. A kinematic_shift variation may be produced only in some eras (JER
-    per year); load_nuisance_data then trains on the nominal events of those eras only, and r(x, z; theta, nu) = 1 in
-    the others. Read from the era index (year_int feature) of each variation's validation.p, which must be the same
-    for Up and Down.
+    The eras each nuisance acts in. A kinematic_shift variation may be produced only in some eras (JER per year);
+    load_nuisance_data then trains on the nominal events of those eras only, and r(x, z; theta, nu) = 1 in the others.
+    Read from the era index (year_int feature) of each variation's validation.p, which must be the same for Up and
+    Down. A weight_shift nuisance of a shared network (one per-era name of a list systematic) acts in the eras where
+    its syst_ratio column differs from 1 in either direction, read from the nominal validation.p; every other
+    weight_shift nuisance acts in every era.
 
     Args:
         nuisances, networks: as returned by nuisance_networks
         year_loc: feature column of the era index
     Returns:
-        [eras per nuisance n]: a sorted list of era indices, or None for every era (weight_shift, or a variation
-        present in every era of nominal)
+        [eras per nuisance n]: a sorted list of era indices, or None for every era (a weight_shift nuisance of its own
+        network, or a variation present in every era of nominal)
     """
 
     def eras_of(path, layout):
         features = load_combined(path, layout, ('features',))[0]
         return sorted(torch.unique(features[:, year_loc].to(torch.int64)).tolist())
 
-    nominal, variations = {}, {}
+    def weight_eras(root, name):
+        if root not in weights:
+            columns = dict(
+                zip(
+                    NUISANCE_COLUMNS['nominal'],
+                    load_combined(f'{root}/nominal/validation.p', 'nominal', ('features', 'syst_ratio')),
+                )
+            )
+            weights[root] = (columns['features'][:, year_loc].to(torch.int64), columns['syst_ratio'])
+        event_eras, syst_ratio = weights[root]
+        shifted = torch.zeros(len(event_eras), dtype=torch.bool)
+        for direction in DIRECTIONS:
+            k, d = syst_ratio_column(root, name, direction)
+            shifted |= syst_ratio[:, k, d] != 1
+        return sorted(torch.unique(event_eras[shifted]).tolist())
+
+    nominal, variations, weights = {}, {}, {}
     out = []
     for n, nuisance in enumerate(nuisances):
-        if nuisance['method'] != 'kinematic_shift':
+        if nuisance['method'] != 'kinematic_shift' and 'network' not in nuisance:
             out.append(None)
             continue
         eras = set()
@@ -112,9 +178,12 @@ def nuisance_eras(nuisances, networks, year_loc=21):
             for direction, path in zip(DIRECTIONS, pairs[n]):
                 with open(path) as f:
                     root = yaml.safe_load(f)['data']
+                if nuisance['method'] != 'kinematic_shift':
+                    eras.add(tuple(weight_eras(root, nuisance['systematic'])))
+                    continue
                 if root not in nominal:
                     nominal[root] = eras_of(f'{root}/nominal/validation.p', 'nominal')
-                variation = f'{root}/{nuisance["name"]}{direction.capitalize()}/validation.p'
+                variation = f'{root}/{nuisance["systematic"]}{direction.capitalize()}/validation.p'
                 if variation not in variations:
                     variations[variation] = eras_of(variation, 'variation')
                 eras.add(None if variations[variation] == nominal[root] else tuple(variations[variation]))
@@ -143,7 +212,8 @@ def nuisance_hashes(networks):
 def nuisance_seed(seed, networks, features, device, tmp):
     """
     One ensemble member's f_hat (through seed_map): every nuisance network evaluated on every event, written to
-    {tmp}/seed_{seed} (f_hat.npy, filter.npy).
+    {tmp}/seed_{seed} (f_hat.npy, filter.npy). A network shared by several nuisances (the per-era names of one
+    network) is evaluated once and copied to each of their rows.
 
     Args:
         seed: the member e to evaluate
@@ -157,7 +227,14 @@ def nuisance_seed(seed, networks, features, device, tmp):
     pairs = networks[seed]
     # filled row by row, preallocated so the heap does not fragment (as RatioFit.R)
     f_hat = torch.empty((len(pairs), len(DIRECTIONS), features.shape[0]))
+    # the first row of each distinct pair of configs; later rows of the same network copy it
+    first = {}
     for n, pair in tqdm.tqdm(enumerate(pairs), total=len(pairs)):
+        key = tuple(pair)
+        if key in first:
+            f_hat[n] = f_hat[first[key]]
+            continue
+        first[key] = n
         for d, path in enumerate(pair):
             f_hat[n, d] = NetworkRatio(path, features.shape[1], device).log_ratio(features)
     finite = torch.isfinite(f_hat).all(dim=(0, 1))
