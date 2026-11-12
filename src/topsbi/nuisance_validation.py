@@ -26,6 +26,7 @@ from topsbi.tools.plots import (
     plot_interpolation_shape,
     plot_interpolation_yield,
     plot_nuisance_closure,
+    plot_nuisance_misclosure,
     plot_rms_comparison,
     plot_size_significance,
     plot_z_heatmap,
@@ -36,20 +37,30 @@ import numpy as np
 
 import argparse, os, shutil, sys, torch, yaml
 
-# taken from the EFT validation config, so both ensembles see the same events, reference point and luminosities
-SHARED_KEYS = ('data', 'c0', 'wcs', 'lumi', 'features', 'year_loc')
+# taken from the EFT validation config, so both ensembles see the same events, reference point, luminosities and
+# bias-test settings (bins, min_neff, z_threshold)
+SHARED_KEYS = ('data', 'c0', 'wcs', 'lumi', 'features', 'year_loc', 'bias')
 # max over nu of |d (nu S(nu)) / d nu| for Combine's smooth step, at nu = +-1/sqrt(3): log r_hat(x; nu) is monotonic in
 # nu for every nu exactly when |f_hat^slope| >= MONOTONIC * |f_hat^sym|
 MONOTONIC = 7 * np.sqrt(3) / 9
 # the parts of the interpolation in nu whose closure is tested, with their TeX labels
 PARTS = {'fit_slope': r'$\hat{f}\,^{\mathrm{slope}}$', 'fit_symmetry': r'$\hat{f}\,^{\mathrm{sym}}$'}
+# legend text of the closure plots of the parts, (truth, learned): the yield equivalents of Combine's
+# (delta^+ - delta^-) / 2 and (delta^+ + delta^-) / 2, with w_b^0 the nominal and w_b^+- the Up / Down yields
+PART_LABELS = {
+    'fit_slope': (r'$(w_b^{+} - w_b^{-})\,/\,2$', r'$(\hat{w}_b^{+} - \hat{w}_b^{-})\,/\,2$'),
+    'fit_symmetry': (r'$(w_b^{+} + w_b^{-})\,/\,2 - w_b^{0}$', r'$(\hat{w}_b^{+} + \hat{w}_b^{-})\,/\,2 - w_b^{0}$'),
+}
+# sign of each direction in the legend text of the network closure plots
+DIRECTION_SIGN = {'down': '-', 'up': '+'}
 
 
 def load_config(config_path):
     """
     The nuisance validation config, completed from the EFT validation config it names (ensemble): data, c0, wcs,
-    lumi, features and year_loc are taken from there (a nuisance config that sets one of them stops the run),
-    eft_cache is the EFT ensemble cache, {name}/ensemble of that config, and eft_config that config itself.
+    lumi, features, year_loc and the bias-test settings bias (n_bins, min_neff, z_threshold, features) are taken from
+    there (a nuisance config that sets one of them stops the run), eft_cache is the EFT ensemble cache,
+    {name}/ensemble of that config, and eft_config that config itself.
 
     Args:
         config_path: nuisance validation config yml (name, ensemble, seeds, optional device and workers)
@@ -160,9 +171,10 @@ def event_terms(coefs, n_wcs, background_processes):
 
 def closure_binning(features, feature_config, w0, terms, nbins=20, names=None, min_neff=30):
     """
-    Merged equal-count bins K_b of the network inputs, shared by every term: quantile bins of every event of the
-    data (quantile_binning), merged until the events of every term hold at least min_neff effective events in every
-    bin (metrics.merge_sparse_bins with one sample per term).
+    Merged equal-count bins K_b of the network inputs, shared by every term: the bins of the EFT bias test
+    (quantile_binning, then merged until every event together holds at least min_neff effective events per bin), merged
+    further until the events of every term also hold at least min_neff effective events in every bin
+    (metrics.merge_sparse_bins with every event as the first sample and one sample per term).
 
     Args:
         features: [N, n_features] raw network inputs of every event
@@ -171,7 +183,7 @@ def closure_binning(features, feature_config, w0, terms, nbins=20, names=None, m
         terms: [N] term of every event (event_terms)
         nbins: quantile bins per feature before merging
         names: features to bin, default every feature in feature_config
-        min_neff: minimum effective number of events of each term per merged bin
+        min_neff: minimum effective number of events per merged bin, of every event together and of each term
     Returns:
         binning dict (as quantile_binning), its index over every event
     """
@@ -183,8 +195,8 @@ def closure_binning(features, feature_config, w0, terms, nbins=20, names=None, m
     offset = 0
     for f, name in enumerate(binning['names']):
         x = features[:, feature_config[name]['loc']].double().numpy()
-        others = [(x[rows], w0[rows]) for rows in groups[1:]]
-        e = merge_sparse_bins(x[groups[0]], w0[groups[0]], binning['edges'][f], min_neff, others)
+        others = [(x[rows], w0[rows]) for rows in groups]
+        e = merge_sparse_bins(x, w0, binning['edges'][f], min_neff, others)
         k = np.clip(np.searchsorted(e, x, side='right') - 1, 0, len(e) - 2)
         edges.append(e)
         index.append(k + offset)
@@ -414,7 +426,8 @@ def eft_closure(binning, w0, rho, w_hat0, keep, members):
     """
     Closure of the learned EFT ratio alone at theta (nu = 0), hat w_b = sum_i w^s_i(c0, 0) r_hat(x_i; theta) against
     w_b = sum_i w^s_i(theta, 0), with Var_MC = sum_i (hat w_i - w_i)^2 of the member mean and Var_seeds from the
-    scatter of the members' hat w_b.
+    scatter of the members' hat w_b; rms_bias is relative to lambda_K_b(theta, 0) of every event, as in the nuisance
+    tests.
 
     Args:
         binning: binning of the events (closure_binning)
@@ -424,7 +437,9 @@ def eft_closure(binning, w0, rho, w_hat0, keep, members):
         keep: [N] bool, the events the EFT ensemble keeps
         members: [S, N] w^s(c0, 0) r_hat_e(x; theta) per member e (eft_member_ratios), 0 outside keep
     Returns:
-        (sums, component_bias result with one row)
+        (sums, component_bias result with one row); sums has bias, mc_var, sm_yield (lambda_K_b(theta, 0) of every
+        event), nominal and truth (both w_b on the kept events), shift_var (0: the target is the nominal yield) and
+        learned_shift_var (sum_i (hat w_i - w_i)^2 on the kept events)
     """
     index, n_bins = binning['index'], binning['n_bins']
     learned, true = w_hat0[keep], (w0 * rho)[keep]
@@ -432,9 +447,12 @@ def eft_closure(binning, w0, rho, w_hat0, keep, members):
     sums = {
         'bias': (binned_sums(members[:, keep], index[:, keep], n_bins) - truth)[:, None],
         'mc_var': binned_sums(((learned - true) ** 2)[None], index[:, keep], n_bins),
-        'sm_yield': truth[0],
+        'sm_yield': binned_sums((w0 * rho)[None], index, n_bins)[0],
+        'nominal': truth[0],
+        'truth': truth[0],
     }
-    sums['truth'] = sums['sm_yield']
+    sums['shift_var'] = np.zeros(n_bins)
+    sums['learned_shift_var'] = sums['mc_var'][0]
     return sums, component_bias(sums, binning)
 
 
@@ -453,6 +471,10 @@ def matched_variance(w_hat, index0, i0, w, index1, i1, n_bins):
         [n_bins] Var_MC
     """
     n_features = index0.shape[0]
+    # paired rows, one per event in the same order: the rows of an event are already together
+    if len(i0) == len(i1) and np.array_equal(i0, i1) and np.all(np.diff(i0) > 0) and torch.equal(index0, index1):
+        dw = np.asarray(w_hat, np.float64) - np.asarray(w, np.float64)
+        return binned_sums((dw**2)[None], index0, n_bins)[0]
     events = np.tile(np.concatenate([i0, i1]).astype(np.int64), n_features)
     bins = torch.cat([index0, index1], dim=1).reshape(-1).numpy().astype(np.int64)
     signed = np.tile(np.concatenate([np.asarray(w_hat, np.float64), -np.asarray(w, np.float64)]), n_features)
@@ -486,14 +508,22 @@ def nuisance_sums(cache, binning, w0, targets, methods=None, terms=None, w_hat0=
         list over (n, d), row k = 2 n + d, of dicts for validation.component_bias with
             bias: [S, 1, B] per member e, hat w_b - w_b with hat w_b = sum_i w^s_i(theta_ref, 0) exp f_hat_e(x_i)
             mc_var: [1, B] Var_MC with <f_hat>_e (matched_variance)
-            sm_yield: [B] nominal yield sum_i w^s_i(theta_ref, 0) of the tested events (normalises rms_bias)
+            sm_yield: [B] lambda_K_b(theta, 0) = sum_i w0_i over every event of the data, the yield of every term in
+                every era at the point of the test (normalises rms_bias, the same for every network)
+            nominal: [B] sum_i w0_i over the tested events, the nominal yield w_b(nu = 0) of the network's term in its
+                eras
             truth: [B] target yield w_b
+            shift_var: [B] MC-statistics variance of the true shift w_b - w_b(nu = 0) (matched_variance of the
+                target against the nominal rows)
+            learned_shift_var: [B] MC-statistics variance of the learned shift hat w_b - w_b(nu = 0) with
+                <f_hat>_e, sum_i (hat w_i - w0_i)^2 over the tested events
         None for the nuisances not tested
     """
     w0 = np.asarray(w0, dtype=np.float64)
     w_hat0 = w0 if w_hat0 is None else np.asarray(w_hat0, dtype=np.float64)
     offset = np.zeros_like(w0) if offset is None else np.asarray(offset, dtype=np.float64)
     index, n_bins = binning['index'], binning['n_bins']
+    total_yield = binned_sums(w0[None], index, n_bins)[0]
     # <f_hat>_e on every event (nan where some member's f_hat is not finite; those events are left out)
     mean = np.full(cache.f_hat.shape[:2] + cache.finite.shape, np.nan)
     mean[:, :, cache.finite] = cache.f_hat
@@ -525,8 +555,19 @@ def nuisance_sums(cache, binning, w0, targets, methods=None, terms=None, w_hat0=
                 {
                     'bias': np.stack(bias)[:, None],
                     'mc_var': mc_var[None],
-                    'sm_yield': binned_sums(w0[None, rows0], index[:, rows0], n_bins)[0],
+                    'sm_yield': total_yield,
+                    'nominal': binned_sums(w0[None, rows0], index[:, rows0], n_bins)[0],
                     'truth': truth,
+                    'shift_var': matched_variance(
+                        w0[rows0],
+                        index[:, rows0],
+                        t['i0'][rows0],
+                        t['w1'][keep1],
+                        t['index1'][:, keep1],
+                        t['i1'][keep1],
+                        n_bins,
+                    ),
+                    'learned_shift_var': binned_sums(((w_hat - w0[rows0]) ** 2)[None], index[:, rows0], n_bins)[0],
                 }
             )
     return out
@@ -543,10 +584,14 @@ def pair_sums(cache, binning, w0, targets):
         cache, binning, w0: as nuisance_sums
         targets: ClosureTargets (its pair(n): Down and Up targets on one event index)
     Returns:
-        list over nuisances n of {'fit_symmetry': sums, 'fit_slope': sums}, each a dict for validation.component_bias as nuisance_sums
+        list over nuisances n of {'fit_symmetry': sums, 'fit_slope': sums}, each a dict for validation.component_bias
+        as nuisance_sums (sm_yield the yield of every event, nominal that of the tested events); the shift of the
+        symmetric part is measured from the nominal yield, (w^Up_b + w^Down_b) / 2 - w_b(nu = 0), the slope is a shift
+        itself, (w^Up_b - w^Down_b) / 2, and shift_var counts an event in the nominal, Up and Down samples once
     """
     w0 = np.asarray(w0, dtype=np.float64)
     index, n_bins = binning['index'], binning['n_bins']
+    total_yield = binned_sums(w0[None], index, n_bins)[0]
     mean = np.full(cache.f_hat.shape[:2] + cache.finite.shape, np.nan)
     mean[:, :, cache.finite] = cache.f_hat
     out = []
@@ -556,6 +601,7 @@ def pair_sums(cache, binning, w0, targets):
         # a shifted event whose nominal event is left out is left out too; events only in the shifted samples stay
         keep1 = [~np.isin(t['i1'], t['i0'][~rows0]) for t in pair]
         truth = [binned_sums(t['w1'][None, k], t['index1'][:, k], n_bins)[0] for t, k in zip(pair, keep1)]
+        nominal = binned_sums(w0[None, rows0], index[:, rows0], n_bins)[0]
 
         def learned(f_hat):
             return binned_sums((w0 * np.exp(f_hat))[None, rows0], index[:, rows0], n_bins)[0]
@@ -570,13 +616,18 @@ def pair_sums(cache, binning, w0, targets):
             ]
             w_hat = w0[rows0] * (np.exp(mean[n, 1, rows0]) + sign * np.exp(mean[n, 0, rows0])) / 2
             w = np.concatenate([pair[1]['w1'][keep1[1]], sign * pair[0]['w1'][keep1[0]]]) / 2
+            # the nominal yield the shift is measured from: w0 for the symmetric part, none for the slope
+            base = w0[rows0] if sign == 1 else np.zeros(int(rows0.sum()))
             index1 = torch.cat([pair[1]['index1'][:, keep1[1]], pair[0]['index1'][:, keep1[0]]], dim=1)
             i1 = np.concatenate([pair[1]['i1'][keep1[1]], pair[0]['i1'][keep1[0]]])
             sums[part] = {
                 'bias': np.stack(bias)[:, None],
                 'mc_var': matched_variance(w_hat, index[:, rows0], pair[0]['i0'][rows0], w, index1, i1, n_bins)[None],
-                'sm_yield': binned_sums(w0[None, rows0], index[:, rows0], n_bins)[0],
+                'sm_yield': total_yield,
+                'nominal': nominal,
                 'truth': (truth[1] + sign * truth[0]) / 2,
+                'shift_var': matched_variance(base, index[:, rows0], pair[0]['i0'][rows0], w, index1, i1, n_bins),
+                'learned_shift_var': binned_sums(((w_hat - base) ** 2)[None], index[:, rows0], n_bins)[0],
             }
         out.append(sums)
     return out
@@ -662,13 +713,18 @@ def test_arrays(sums, biases, n_bins):
         n_bins: binning['n_bins']
     Returns:
         dict of [rows, B] arrays D (Delta_b), s2 (Var_seeds), mc_var (Var_MC), truth (w_b), sm_yield
+        (lambda_K_b(theta, 0) of every event), nominal (the nominal yield of the tested events), shift_var and
+        learned_shift_var (the MC-statistics variances of the true and the learned shift)
     """
-    out = {key: np.full((len(sums), n_bins), np.nan) for key in ('D', 's2', 'mc_var', 'truth', 'sm_yield')}
+    keys = ('D', 's2', 'mc_var', 'truth', 'sm_yield', 'nominal', 'shift_var', 'learned_shift_var')
+    out = {key: np.full((len(sums), n_bins), np.nan) for key in keys}
     for row, (s, bias) in enumerate(zip(sums, biases)):
         if s is None:
             continue
         out['D'][row], out['s2'][row] = bias['D'][0], bias['s2'][0]
-        out['mc_var'][row], out['truth'][row], out['sm_yield'][row] = s['mc_var'][0], s['truth'], s['sm_yield']
+        out['mc_var'][row], out['truth'][row] = s['mc_var'][0], s['truth']
+        out['sm_yield'][row], out['nominal'][row] = s['sm_yield'], s['nominal']
+        out['shift_var'][row], out['learned_shift_var'][row] = s['shift_var'], s['learned_shift_var']
     return out
 
 
@@ -678,8 +734,9 @@ def write_sums(name, cache, binning, tests, nu, yields):
     docs/validation.md:
         nuisances, methods: [n_n] names and methods; network tests have row k = 2 n + d
         binning/names, binning/feature, binning/discrete, binning/edges/<feature>: the binning K_b
-        <test>/D, s2, mc_var, truth, sm_yield: [rows, B] (test_arrays) for the tests closure, fit_symmetry,
-            fit_slope, factorisation/<label>, combined/<label>, difference/<label>, eft_only/<label>
+        <test>/D, s2, mc_var, truth, sm_yield, nominal, shift_var, learned_shift_var: [rows, B] (test_arrays) for the
+            tests closure, fit_symmetry, fit_slope, factorisation/<label>, combined/<label>, difference/<label>,
+            eft_only/<label>, eft_matched/<label>
         interpolation/nu [G], interpolation/yield [n_n, G] (interpolation_yield)
 
     Args:
@@ -706,9 +763,15 @@ def write_sums(name, cache, binning, tests, nu, yields):
     np.savez(f'{name}/nuisance_sums.npz', **arrays)
 
 
-def closure_entry(bias, features, z_threshold):
-    """Summary of one closure test (a component_bias result with one row): flagged, max_Z and its feature, rms_bias, Z."""
-    z, rms_bias = bias['Z'][0], bias['rms_bias'][0]
+def closure_entry(bias, features, z_threshold, skip=()):
+    """
+    Summary of one closure test (a component_bias result with one row): flagged, max_Z and its feature, rms_bias, Z.
+    The features in skip are not tested: their Z is nan, and they do not count in flagged, max_Z, worst_feature and
+    rms_bias.
+    """
+    tested = np.array([f not in skip for f in features])
+    z = np.where(tested, bias['Z'][0], np.nan)
+    rms_bias = np.where(tested, bias['rms_bias'][0], np.nan)
     return {
         'flagged': bool(np.nanmax(z) > z_threshold),
         'max_Z': float(np.nanmax(z)),
@@ -718,23 +781,85 @@ def closure_entry(bias, features, z_threshold):
     }
 
 
+def member_misclosure(sums, binning, z_threshold, skip=()):
+    """
+    Closure of each ensemble member of one network-direction, pooled over the bins K_b of every tested network input,
+    each relative to lambda_K_b(theta, 0) (sums['sm_yield'], the yield of every event at the point of the test):
+        misclosure: m_a = sqrt(<m_e^2>_e), with m_e = sqrt(mean_b max(bias_e,b^2 - Var_MC,b, 0) / lambda_K_b^2) the
+            noise-subtracted rms misclosure of member e (the definition of network_misclosure in the EFT validation)
+        member_misclosure: m_e of every member e
+        mean_misclosure: the same for the ensemble mean, sqrt(mean_b max(Delta_b^2 - Var_MC,b, 0) / lambda_K_b^2);
+            m_a / mean_misclosure is about sqrt(n_e) when the members' misclosures are independent training noise and
+            about 1 when the members share one bias
+        shift_size: sqrt(mean_b (w_b - w_b(nu = 0))^2 / lambda_K_b^2), the rms true shift on the same scale
+        members_flagged: number of members whose own closure Z exceeds z_threshold in some tested input
+    Var_MC of each member is approximated by Var_MC of the ensemble mean. The features in skip are not tested.
+
+    Args:
+        sums: one nuisance_sums dict (bias [S, 1, B], mc_var, sm_yield, truth, nominal)
+        binning: the binning of the sums
+        z_threshold: a member is flagged when its Z exceeds this in some tested input
+        skip: names of the network inputs not tested
+    Returns:
+        dict with misclosure, member_misclosure, mean_misclosure, shift_size, members_flagged
+    """
+    tested = [i for i, f in enumerate(binning['names']) if f not in skip]
+    b = np.isin(binning['feature'], tested) & (sums['sm_yield'] > 0)
+    lam2 = sums['sm_yield'][b] ** 2
+    bias, mc_var = sums['bias'][:, 0, b], sums['mc_var'][0, b]
+    members = np.sqrt(np.mean(np.maximum(bias**2 - mc_var, 0) / lam2, axis=1))
+    mean = np.sqrt(np.mean(np.maximum(bias.mean(0) ** 2 - mc_var, 0) / lam2))
+    shift = np.sqrt(np.mean((sums['truth'][b] - sums['nominal'][b]) ** 2 / lam2))
+    flagged = 0
+    for e in range(len(sums['bias'])):
+        own = {'bias': sums['bias'][e : e + 1], 'mc_var': sums['mc_var'], 'sm_yield': sums['sm_yield']}
+        flagged += bool(np.nanmax(component_bias(own, binning)['Z'][0, tested]) > z_threshold)
+    return {
+        'misclosure': float(np.sqrt(np.mean(members**2))),
+        'member_misclosure': [float(m) for m in members],
+        'mean_misclosure': float(mean),
+        'shift_size': float(shift),
+        'members_flagged': flagged,
+    }
+
+
 def write_results(
-    name, cache, binning, closure, parts, shape, factorisation, combined, difference, eft_only, z_threshold
+    name,
+    cache,
+    binning,
+    closure,
+    closure_sums,
+    parts,
+    shape,
+    factorisation,
+    combined,
+    difference,
+    eft_only,
+    eft_matched,
+    z_threshold,
+    era_feature=None,
 ):
     """
-    Write nuisance_diagnostics.yml to name: per nuisance its method, term and eras; per direction the closure of its
-    network averaged over members; the closure of the symmetric part and the slope of the interpolation and its shape
-    in nu; the closure at other WC points (factorisation); and the closure with the learned EFT ratio (combined,
-    difference), each in every network input. The rms_bias_change of a combined or difference test is measured
-    against the closure without the learned EFT ratio at the same point (baseline): the factorisation test, or the
-    closure at theta_ref for a nuisance without one (a background nuisance, whose events have rho = 1). Every key is
-    listed in docs/validation.md.
+    Write nuisance_diagnostics.yml to name: the nuisance cache used, the bins of every network input, the
+    network-directions whose closure is flagged (largest Z first), and per nuisance its method, term and eras; per
+    direction the closure of its network averaged over members and the misclosure of each member alone; the closure
+    of the symmetric part and the slope of the interpolation and its shape in nu; the closure at other WC points (factorisation); and the closure with the
+    learned EFT ratio (combined, difference), each in every network input. The era input is not tested for a nuisance
+    of one era, whose events fill a single bin of it. Every rms_bias is relative to lambda_K_b(theta, 0), the yield of
+    every event at the point of the test, so the rms_bias of different tests and nuisances are comparable. The
+    rms_bias_change of a difference test is measured against the closure without the learned EFT ratio at the same
+    point (baseline): the factorisation test, or the closure at theta_ref for a nuisance without one (a background
+    nuisance, whose events have rho = 1). The rms_bias_change of a combined test is measured against the learned EFT
+    ratio alone on the same events (baseline eft_only), so it is what the nuisance adds to the learned EFT ratio. Each
+    test stores the rms_bias of its baseline as baseline_rms_bias. Every key is listed in docs/validation.md.
 
     Args:
         name: output directory
         cache: NuisanceCache
         binning: the binning of the closure
         closure: component_bias result of every network, row k = 2 n + d
+        closure_sums: nuisance_sums of every network, row k = 2 n + d, for the closure of each member alone
+            (member_misclosure)
         parts: per nuisance n, {'fit_symmetry': component_bias result, 'fit_slope': component_bias result}
         shape: per nuisance n, the sizes and fractions of interpolation_shape
         factorisation: {label: component_bias result of every network at that WC point, row k = 2 n + d, None for
@@ -743,16 +868,25 @@ def write_results(
             the other terms
         difference: as combined, the nuisance shift alone on top of the learned EFT ratio
         eft_only: {label: component_bias result of the learned EFT ratio alone at that point}
+        eft_matched: {label: component_bias result of the learned EFT ratio alone on the events of each combined test,
+            row k = 2 n + d, None for the networks without one}
         z_threshold: a test is flagged when its Z exceeds this in some feature
+        era_feature: name of the network input holding the era index (year_loc), None if it is not an input
+    Returns:
+        the contents of nuisance_diagnostics.yml
     """
     features = binning['names']
     nuisances = {}
     for n, nuisance in enumerate(cache.nuisances):
-        entry = {'method': nuisance['method'], 'term': nuisance['term'], 'eras': nuisance.get('eras')}
+        eras = nuisance.get('eras')
+        skip = (era_feature,) if era_feature in features and eras is not None and len(eras) == 1 else ()
+        entry = {'method': nuisance['method'], 'term': nuisance['term'], 'eras': eras}
         for d, direction in enumerate(DIRECTIONS):
-            entry[direction] = closure_entry(closure[len(DIRECTIONS) * n + d], features, z_threshold)
+            row = len(DIRECTIONS) * n + d
+            entry[direction] = closure_entry(closure[row], features, z_threshold, skip)
+            entry[direction].update(member_misclosure(closure_sums[row], binning, z_threshold, skip))
         for part in ('fit_symmetry', 'fit_slope'):
-            entry[part] = closure_entry(parts[n][part], features, z_threshold)
+            entry[part] = closure_entry(parts[n][part], features, z_threshold, skip)
         entry['shape'] = shape[n]
         entry['factorisation'] = {}
         for label, results in factorisation.items():
@@ -761,7 +895,7 @@ def write_results(
                 continue
             entry['factorisation'][label] = {}
             for d, direction in enumerate(DIRECTIONS):
-                test = closure_entry(results[len(DIRECTIONS) * n + d], features, z_threshold)
+                test = closure_entry(results[len(DIRECTIONS) * n + d], features, z_threshold, skip)
                 test['rms_bias_change'] = test['rms_bias'] - entry[direction]['rms_bias']
                 entry['factorisation'][label][direction] = test
 
@@ -780,45 +914,67 @@ def write_results(
                     continue
                 entry[key][label] = {}
                 for d, direction in enumerate(DIRECTIONS):
-                    test = closure_entry(results[len(DIRECTIONS) * n + d], features, z_threshold)
-                    test['baseline'], rms_bias = baseline(label, direction)
+                    row = len(DIRECTIONS) * n + d
+                    test = closure_entry(results[row], features, z_threshold, skip)
+                    if key == 'combined':
+                        reference = closure_entry(eft_matched[label][row], features, z_threshold, skip)
+                        test['baseline'], rms_bias = 'eft_only', reference['rms_bias']
+                    else:
+                        test['baseline'], rms_bias = baseline(label, direction)
+                    test['baseline_rms_bias'] = rms_bias
                     test['rms_bias_change'] = test['rms_bias'] - rms_bias
                     entry[key][label][direction] = test
         nuisances[nuisance['name']] = entry
+    # the network-directions whose closure is flagged, largest Z first, named as their closure plots
+    flagged = [
+        (entry[direction]['max_Z'], f'{n}_{direction}')
+        for n, entry in nuisances.items()
+        for direction in DIRECTIONS
+        if entry[direction]['flagged']
+    ]
     results = {
-        'cache': f'{name}/nuisance',
-        'theta_ref': cache.theta_ref,
-        'seeds': cache.seeds,
-        'closure': {'z_threshold': z_threshold, 'features': features, 'n_bins': int(binning['n_bins'])},
+        'nuisance': {
+            'path': cache.path,
+            'created': cache.manifest['created'],
+            'seeds': list(cache.seeds),
+            'theta_ref': list(cache.theta_ref),
+            'ensemble': cache.manifest['ensemble'],
+        },
+        'binning': {f: int((binning['feature'] == i).sum()) for i, f in enumerate(features)},
+        'flagged': [label for _, label in sorted(flagged, key=lambda item: -item[0])],
         'factorisation_points': list(factorisation),
         'eft_only': {label: closure_entry(bias, features, z_threshold) for label, bias in eft_only.items()},
         'nuisances': nuisances,
     }
     with open(f'{name}/nuisance_diagnostics.yml', 'w') as f:
         yaml.safe_dump(results, f, sort_keys=False)
+    return results
 
 
-def plot_results(name, feature_config=None, n_sigma=3.0):
+def plot_results(name, feature_config=None, n_sigma=3.0, z_threshold=5.0):
     """
     Plots of the validation from nuisance_diagnostics.yml and nuisance_sums.npz under name, written to name/plots
-    (replaced): Z of every network and of the parts of the interpolation in every network input (z_heatmap_networks,
-    z_heatmap_parts), rms bias against Z (size_vs_significance), the closure of every network in its worst feature
-    (closure/{flagged,passed}) and of the flagged parts (closure_parts), the yield against nu (interpolation_yield),
-    the shape metrics (interpolation_shape), and per factorisation point the rms bias of the factorisation test
-    against the closure at theta_ref (factorisation_<label>) and of the difference and combined tests against their
-    baseline, the factorisation test or the closure at theta_ref for the nuisances without one
-    (eft_difference_<label>, eft_combined_<label>). Nuisances are ordered by method, then by name. Every file is
+    (replaced): Z of every network and of the parts of the interpolation in every network input (z_heatmap_full,
+    z_heatmap_parts_full; the compact versions show the flagged tests and the next 10, sorted by their largest Z), rms
+    bias against Z (size_vs_significance), the misclosure of every network and its members against the size of its
+    true shift (network_misclosure), the closure of every network in its worst feature (closure/{flagged,passed}) and of every part (closure_parts/{flagged,passed}), the yield against nu
+    (interpolation_yield), the shape metrics (interpolation_shape), and per factorisation point the rms bias of the
+    factorisation test against the closure at theta_ref (factorisation_<label>), of the difference test against the
+    factorisation test or the closure at theta_ref for the nuisances without one (eft_difference_<label>) and of the
+    combined test against the learned EFT ratio alone on the same events (eft_combined_<label>). Nuisances are ordered by method, then by name. Every file is
     listed in docs/validation.md.
 
     Args:
         name: output directory of the validation
         feature_config: contents of the features yml, for the TeX labels of the features
         n_sigma: significance of the symmetric part in the shape metrics (config shape.n_sigma), for the label
+        z_threshold: flagging threshold of the bias test (config bias.z_threshold), for the outlined cells and the
+            lines at the threshold
     """
     with open(f'{name}/nuisance_diagnostics.yml') as f:
         diag = yaml.safe_load(f)
     sums = np.load(f'{name}/nuisance_sums.npz')
-    entries, z_threshold = diag['nuisances'], diag['closure']['z_threshold']
+    entries = diag['nuisances']
     features = [str(f) for f in sums['binning/names']]
     binning = {
         'names': features,
@@ -831,45 +987,48 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
     names = [nuisances[n] for n in order]
     plots = f'{name}/plots'
     shutil.rmtree(plots, ignore_errors=True)
-    for sub in ('closure/flagged', 'closure/passed', 'closure_parts/flagged'):
+    for sub in ('closure/flagged', 'closure/passed', 'closure_parts/flagged', 'closure_parts/passed'):
         os.makedirs(f'{plots}/{sub}', mode=0o755)
 
     def test(key):
-        return {k: sums[f'{key}/{k}'] for k in ('D', 's2', 'mc_var', 'truth', 'sm_yield')}
+        keys = ('D', 's2', 'mc_var', 'truth', 'sm_yield', 'nominal', 'shift_var', 'learned_shift_var')
+        return {k: sums[f'{key}/{k}'] for k in keys}
 
-    # plot 1: Z of every network (Down beside Up) and of the parts, grouped by method / part, in the shared order
-    labels = [f'{n} {DIRECTION_TEX[d]}' for n in names for d in DIRECTIONS]
-    Z = np.array([[entries[n][d]['Z'][f] for f in features] for n in names for d in DIRECTIONS])
-    kinds = [METHOD_NAMES[entries[n]['method']] for n in names for d in DIRECTIONS]
-    plot_z_heatmap(
-        Z,
-        labels,
-        kinds,
-        features,
-        f'{plots}/z_heatmap_networks.png',
-        z_threshold,
-        feature_config=feature_config,
-        kind_order=list(METHOD_NAMES.values()),
-        tick_labels=labels,
-        sort=False,
-    )
-    Z = np.array([[entries[n][p]['Z'][f] for f in features] for p in PARTS for n in names])
-    kinds = [PARTS[p] for p in PARTS for n in names]
-    labels = names * len(PARTS)
-    plot_z_heatmap(
-        Z,
-        labels,
-        kinds,
-        features,
-        f'{plots}/z_heatmap_parts.png',
-        z_threshold,
-        feature_config=feature_config,
-        kind_order=list(PARTS.values()),
-        tick_labels=labels,
-        sort=False,
-    )
+    # Z of every network (Down beside Up) and of the parts, grouped by method / part: full in the shared order,
+    # compact the flagged tests and the next 10, sorted by their largest Z within each group
+    heatmaps = {
+        'z_heatmap': (
+            np.array([[entries[n][d]['Z'][f] for f in features] for n in names for d in DIRECTIONS]),
+            [f'{n} {DIRECTION_TEX[d]}' for n in names for d in DIRECTIONS],
+            [METHOD_NAMES[entries[n]['method']] for n in names for d in DIRECTIONS],
+            list(METHOD_NAMES.values()),
+        ),
+        'z_heatmap_parts': (
+            np.array([[entries[n][p]['Z'][f] for f in features] for p in PARTS for n in names]),
+            names * len(PARTS),
+            [PARTS[p] for p in PARTS for n in names],
+            list(PARTS.values()),
+        ),
+    }
+    for stem, (Z, labels, kinds, kind_order) in heatmaps.items():
+        max_z = np.nanmax(Z, axis=1)
+        compact = [int(k) for k in np.argsort(-max_z)[: int((max_z > z_threshold).sum()) + 10]]
+        for version, columns, sort in (('full', None, False), ('compact', compact, True)):
+            plot_z_heatmap(
+                Z,
+                labels,
+                kinds,
+                features,
+                f'{plots}/{stem}_{version}.png',
+                z_threshold,
+                components=columns,
+                feature_config=feature_config,
+                kind_order=kind_order,
+                tick_labels=labels,
+                sort=sort,
+            )
 
-    # plot 2: rms bias against Z of the networks and of the parts
+    # rms bias against Z of the networks and of the parts
     def size(key):
         return {n: (entries[n][key]['max_Z'], entries[n][key]['rms_bias']) for n in names}
 
@@ -886,13 +1045,21 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
         reference=reference,
     )
 
-    # plot 3: closure of every network and of the flagged parts in their worst feature
+    # misclosure of every network and its members against the size of the true shift
+    plot_nuisance_misclosure(
+        {(n, direction): entries[n][direction] for n in names for direction in DIRECTIONS},
+        {n: entries[n]['method'] for n in names},
+        f'{plots}/network_misclosure.png',
+    )
+
+    # closure of every network and of every part in their worst feature, as the learned against the true shift
     closure = test('closure')
     for n in order:
         entry = entries[nuisances[n]]
         for d, direction in enumerate(DIRECTIONS):
             result = entry[direction]
             group = 'flagged' if result['flagged'] else 'passed'
+            sign = DIRECTION_SIGN[direction]
             plot_nuisance_closure(
                 closure,
                 len(DIRECTIONS) * n + d,
@@ -900,32 +1067,34 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
                 result['max_Z'],
                 binning,
                 f'{plots}/closure/{group}/{nuisances[n]}_{direction}.png',
-                f'{nuisances[n]} {DIRECTION_TEX[direction]} ({METHOD_NAMES[entry["method"]]})',
+                f'{nuisances[n]} {DIRECTION_TEX[direction]}',
+                (rf'$w_b^{{{sign}}} - w_b^{{0}}$', rf'$\hat{{w}}_b^{{{sign}}} - w_b^{{0}}$'),
                 feature_config=feature_config,
             )
     for p in PARTS:
         part = test(p)
         for n in order:
             result = entries[nuisances[n]][p]
-            if result['flagged']:
-                plot_nuisance_closure(
-                    part,
-                    n,
-                    features.index(result['worst_feature']),
-                    result['max_Z'],
-                    binning,
-                    f'{plots}/closure_parts/flagged/{nuisances[n]}_{p}.png',
-                    f'{nuisances[n]} {PARTS[p]}',
-                    nominal=False,
-                    feature_config=feature_config,
-                )
+            group = 'flagged' if result['flagged'] else 'passed'
+            plot_nuisance_closure(
+                part,
+                n,
+                features.index(result['worst_feature']),
+                result['max_Z'],
+                binning,
+                f'{plots}/closure_parts/{group}/{nuisances[n]}_{p}.png',
+                f'{nuisances[n]} {PARTS[p]}',
+                PART_LABELS[p],
+                subtract_nominal=p != 'fit_slope',
+                feature_config=feature_config,
+            )
 
-    # plot 4: yield against nu, with the true yields at nu = -1, +1 from the closure of the networks (one feature
+    # yield against nu, with the true yields at nu = -1, +1 from the closure of the networks (one feature
     # counts every tested event once)
     first = binning['feature'] == 0
-    sm = closure['sm_yield'][:, first].sum(1)
-    truth = (closure['truth'][:, first].sum(1) / sm).reshape(-1, len(DIRECTIONS))
-    truth_err = (np.sqrt(closure['mc_var'][:, first].sum(1)) / sm).reshape(-1, len(DIRECTIONS))
+    nominal = closure['nominal'][:, first].sum(1)
+    truth = (closure['truth'][:, first].sum(1) / nominal).reshape(-1, len(DIRECTIONS))
+    truth_err = (np.sqrt(closure['mc_var'][:, first].sum(1)) / nominal).reshape(-1, len(DIRECTIONS))
     plot_interpolation_yield(
         sums['interpolation/nu'],
         sums['interpolation/yield'][order],
@@ -936,7 +1105,7 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
         f'{plots}/interpolation_yield.png',
     )
 
-    # plot 5: shape metrics of the interpolation
+    # shape metrics of the interpolation
     plot_interpolation_shape(
         [entries[n]['shape'] for n in names],
         names,
@@ -961,15 +1130,8 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
         def flagged(nuisances, key):
             return np.array([[entries[n][key][label][d]['flagged'] for d in DIRECTIONS] for n in nuisances])
 
-        def baseline(nuisances):
-            # the factorisation test at the point, or the closure at theta_ref for the nuisances without one
-            rows = []
-            for n in nuisances:
-                source = (
-                    entries[n] if entries[n]['factorisation'][label] is None else entries[n]['factorisation'][label]
-                )
-                rows.append([source[d]['rms_bias'] for d in DIRECTIONS])
-            return np.array(rows)
+        def baseline(nuisances, key):
+            return np.array([[entries[n][key][label][d]['baseline_rms_bias'] for d in DIRECTIONS] for n in nuisances])
 
         tested = [n for n in names if entries[n]['factorisation'][label] is not None]
         if tested:
@@ -989,7 +1151,7 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
             reference_label += r' (closure at $\theta_{\mathrm{ref}}$ for background nuisances)'
         plot_rms_comparison(
             checked,
-            baseline(checked),
+            baseline(checked, 'difference'),
             rms(checked, 'difference'),
             flagged(checked, 'difference'),
             (reference_label, f'difference test at {theta}'),
@@ -997,12 +1159,11 @@ def plot_results(name, feature_config=None, n_sigma=3.0):
         )
         plot_rms_comparison(
             checked,
-            baseline(checked),
+            baseline(checked, 'combined'),
             rms(checked, 'combined'),
             flagged(checked, 'combined'),
-            (reference_label, f'combined at {theta}'),
+            (f'EFT ensemble alone at {theta} (events of the test)', f'combined at {theta}'),
             f'{plots}/eft_combined_{label}.png',
-            reference=(f'EFT ensemble alone at {theta}', diag['eft_only'][label]['rms_bias']),
         )
 
 
@@ -1017,9 +1178,10 @@ def main(config_path, refit=False):
         factorisation: the signal weight_shift networks, trained at theta_ref, at other WC points theta;
         combined: the learned model at those points, the nuisance ratio times the term of the learned EFT ratio it
             belongs to plus the other terms (for a signal nuisance w^s(c0, 0) [r_hat(x; nu) T(theta) Gamma_sig +
-            mu_bg Gamma_bg]), on the events of every term;
+            mu_bg Gamma_bg]), on the events of every term in the nuisance's eras;
         difference: the nuisance shift alone on top of the learned EFT ratio at those points;
-        eft_only: the learned EFT ratio alone at those points.
+        eft_only: the learned EFT ratio alone at those points, on every event and on the events of each combined test
+            (eft_matched, the baseline of the combined test).
     The networks' reference point theta_ref is the WC point of c0 (check_reference), so
     w^s(theta_ref, 0) = w^s(c0, 0) on every event.
 
@@ -1045,8 +1207,9 @@ def main(config_path, refit=False):
     coefs = load_combined(config['data'], 'nominal', ('coefs',))[1]
     terms = event_terms(coefs, eft.n_wcs, eft.background_processes)
 
-    # closure of every network, averaged over members, in merged equal-count bins of every network input
-    cfg = config.get('closure', {})
+    # closure of every network, averaged over members, in the bins of the EFT bias test (merged further where a term
+    # is sparse) of every network input
+    cfg = config.get('bias', {})
     binning = closure_binning(
         features, config['features'], w0, terms, cfg.get('n_bins', 20), cfg.get('features'), cfg.get('min_neff', 30)
     )
@@ -1081,7 +1244,7 @@ def main(config_path, refit=False):
     # the learned model of the scans at the factorisation points (weight_shift only), r_hat(x; nu) at nu_n = +-1 times
     # the term of the learned EFT ratio the nuisance belongs to, plus the other terms, on the events of every term;
     # the closure of the learned EFT ratio alone at nu = 0 for comparison
-    combined, difference, eft_only = {}, {}, {}
+    combined, difference, eft_only, eft_matched = {}, {}, {}, {}
     for label, rho in weights.items():
         parts_theta = eft_terms(eft, points[label])
         keep = np.all([np.isfinite(part) for part in parts_theta.values()], axis=0)
@@ -1125,14 +1288,49 @@ def main(config_path, refit=False):
         members = w0[None] * eft_member_ratios(eft, points[label], keep)
         sums, eft_only[label] = eft_closure(binning, w0, rho, total, keep, members)
         tests[f'eft_only/{label}'] = ([sums], [eft_only[label]])
+        # the learned EFT ratio alone on the events of each combined test (every term, in the nuisance's eras), the
+        # baseline of the combined test; one closure per set of eras
+        by_eras = {None: (sums, eft_only[label])}
+        matched_sums = [None] * len(combined_sums)
+        eft_matched[label] = [None] * len(combined_sums)
+        for n, nuisance in enumerate(cache.nuisances):
+            if combined_sums[len(DIRECTIONS) * n] is None:
+                continue
+            eras = nuisance.get('eras')
+            key = None if eras is None else tuple(sorted(eras))
+            if key not in by_eras:
+                by_eras[key] = eft_closure(binning, w0, rho, total, keep & targets.era_rows(n), members)
+            for d in range(len(DIRECTIONS)):
+                matched_sums[len(DIRECTIONS) * n + d], eft_matched[label][len(DIRECTIONS) * n + d] = by_eras[key]
+        tests[f'eft_matched/{label}'] = (matched_sums, eft_matched[label])
 
     z_threshold = cfg.get('z_threshold', 5.0)
-    write_results(
-        name, cache, binning, closure, parts, shape, factorisation, combined, difference, eft_only, z_threshold
+    year_loc = config.get('year_loc', 21)
+    era_feature = next((f for f, p in config['features'].items() if p['loc'] == year_loc), None)
+    results = write_results(
+        name,
+        cache,
+        binning,
+        closure,
+        closure_sums,
+        parts,
+        shape,
+        factorisation,
+        combined,
+        difference,
+        eft_only,
+        eft_matched,
+        z_threshold,
+        era_feature,
     )
     write_sums(name, cache, binning, tests, nu, yields)
-    plot_results(name, config['features'], config.get('shape', {}).get('n_sigma', 3.0))
-    n_flagged = sum(bool(np.nanmax(bias['Z']) > z_threshold) for bias in closure)
+    plot_results(
+        name,
+        config['features'],
+        config.get('shape', {}).get('n_sigma', 3.0),
+        config.get('bias', {}).get('z_threshold', 5.0),
+    )
+    n_flagged = len(results['flagged'])
     print(f'[info]: {n_flagged} of {len(closure)} nuisance networks flagged; see {name}/nuisance_diagnostics.yml')
 
 
@@ -1148,6 +1346,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.plots_only:
         config = load_config(args.config)
-        plot_results(config['name'], config['features'], config.get('shape', {}).get('n_sigma', 3.0))
+        plot_results(
+            config['name'],
+            config['features'],
+            config.get('shape', {}).get('n_sigma', 3.0),
+            config.get('bias', {}).get('z_threshold', 5.0),
+        )
     else:
         main(args.config, args.refit)

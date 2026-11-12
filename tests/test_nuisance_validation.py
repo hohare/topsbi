@@ -267,12 +267,11 @@ def test_event_terms_and_binning(toy):
     with pytest.raises(ValueError, match='another background process'):
         nv.event_terms(torch.cat([coefs, coefs[:, N_Q:]], dim=1), N_WCS, ['bg', 'copy'])
 
-    # the shared bins hold min_neff effective events of every term in every feature
+    # the shared bins hold min_neff effective events of every event together and of every term in every feature
     w0 = nv.sample_weight(toy.tensors, 'nominal', {'lumi': LUMI}).double().numpy()
     binning = nv.closure_binning(features, FEATURES, w0, terms, nbins=20, min_neff=30)
     index = binning['index'].numpy()
-    for term in ('signal', 'bg'):
-        rows = terms == term
+    for rows in (np.ones(len(terms), dtype=bool), terms == 'signal', terms == 'bg'):
         for f in range(len(binning['names'])):
             sumw = np.bincount(index[f, rows], w0[rows], binning['n_bins'])
             sumw2 = np.bincount(index[f, rows], w0[rows] ** 2, binning['n_bins'])
@@ -325,6 +324,27 @@ def test_closure_targets(toy, run):
     assert np.array_equal(down['i0'], up['i0']) and np.all(down['i0'][~signal] == -1)
     # the Down sample is a copy of Up, so both give every shifted event the index of its nominal event
     assert np.array_equal(down['i1'], up['i1'])
+
+    # the shift of a part counts every event once: for weight_shift, (w_Up + w_Down) / 2 - w0 for the symmetric part
+    # and (w_Up - w_Down) / 2 for the slope, per event
+    parts = nv.pair_sums(cache, binning, w0, targets)[row['ISR']]
+    rows0 = targets.rows0(row['ISR']) & cache.finite
+    w_down, w_up = targets(row['ISR'], 0)['w1'], targets(row['ISR'], 1)['w1']
+    index = binning['index'].numpy()
+    for part, sign, base in (('fit_symmetry', 1, w0), ('fit_slope', -1, 0)):
+        per_event = ((w_up + sign * w_down) / 2 - base)[rows0] ** 2
+        expected = sum(np.bincount(index[f, rows0], per_event, binning['n_bins']) for f in range(index.shape[0]))
+        assert np.allclose(parts[part]['shift_var'], expected)
+
+    # paired rows give the same Var_MC as the general sum over events
+    rng = np.random.default_rng(0)
+    w_hat, w = rng.uniform(0.5, 1.5, len(events)), rng.uniform(0.5, 1.5, len(events))
+    paired = nv.matched_variance(w_hat, binning['index'], events, w, binning['index'], events, binning['n_bins'])
+    order = events[::-1].copy()
+    general = nv.matched_variance(
+        w_hat, binning['index'], events, w[order], binning['index'][:, order], order, binning['n_bins']
+    )
+    assert np.allclose(paired, general)
 
 
 def test_eft_helpers(toy):
@@ -399,6 +419,33 @@ def test_eft_helpers(toy):
     assert np.allclose(bias['D'][0], np.bincount(bins[keep], w_hat0[keep], n_bins) - true)
     assert np.allclose(bias['s2'][0], per_member.var(0, ddof=1) / len(MEMBERS))
     assert np.allclose(sums['mc_var'][0], np.bincount(bins[keep], (w_hat0 - w0 * rho)[keep] ** 2, n_bins))
+    # the target of the learned EFT ratio alone is the nominal yield at theta: no true shift
+    assert np.array_equal(sums['shift_var'], np.zeros(n_bins))
+    assert np.allclose(sums['learned_shift_var'], sums['mc_var'][0])
+
+
+def test_member_misclosure():
+    # two inputs of two bins; members with the same bias (shared) and with opposite biases (independent noise)
+    binning = {'names': ['a', 'year'], 'feature': np.array([0, 0, 1, 1])}
+    base = {
+        'mc_var': np.ones((1, 4)),
+        'sm_yield': np.full(4, 100.0),
+        'truth': np.array([110.0, 90.0, 100.0, 100.0]),
+        'nominal': np.full(4, 100.0),
+    }
+    shared = dict(base, bias=np.tile([5.0, -5.0, 0.0, 0.0], (2, 1, 1)))
+    result = nv.member_misclosure(shared, binning, 5.0)
+    assert np.isclose(result['misclosure'], np.sqrt(48 / 4 / 1e4))
+    assert np.isclose(result['mean_misclosure'], result['misclosure'])
+    assert result['members_flagged'] == 2
+    # an input that is not tested leaves the pooled bins
+    result = nv.member_misclosure(shared, binning, 5.0, skip=('year',))
+    assert np.isclose(result['misclosure'], np.sqrt(24 / 1e4))
+    assert np.isclose(result['shift_size'], 0.1)
+    opposite = dict(base, bias=np.array([[[5.0, -5.0, 0.0, 0.0]], [[-5.0, 5.0, 0.0, 0.0]]]))
+    result = nv.member_misclosure(opposite, binning, 5.0, skip=('year',))
+    assert np.allclose(result['member_misclosure'], np.sqrt(24 / 1e4))
+    assert result['mean_misclosure'] == 0.0
 
 
 def test_main_outputs(toy, run):
@@ -407,24 +454,49 @@ def test_main_outputs(toy, run):
         diagnostics = yaml.safe_load(f)
     sums = np.load(f'{name}/nuisance_sums.npz')
     entries = diagnostics['nuisances']
+    # the flagged network-directions, largest Z first, and the bins of every input
+    flagged = [f'{row}_{d}' for row in ROWS for d in nv.DIRECTIONS if entries[row][d]['flagged']]
+    assert sorted(diagnostics['flagged']) == sorted(flagged)
+    z = [entries[label.rsplit('_', 1)[0]][label.rsplit('_', 1)[1]]['max_Z'] for label in diagnostics['flagged']]
+    assert z == sorted(z, reverse=True)
+    assert sum(diagnostics['binning'].values()) == sums['closure/D'].shape[1]
+    assert diagnostics['nuisance']['seeds'] == run.cache.seeds
+    # a nuisance of one era fills one bin of the era input: that input is not tested
+    for d in nv.DIRECTIONS:
+        assert np.isnan(entries['JER_2017'][d]['Z']['year']) and entries['JER_2017'][d]['worst_feature'] != 'year'
+        assert not np.isnan(entries['ISR'][d]['Z']['year'])
+    # the misclosure of each member alone: one value per member, flagged members counted
+    for row in ROWS:
+        for d in nv.DIRECTIONS:
+            entry = entries[row][d]
+            assert len(entry['member_misclosure']) == len(run.cache.seeds)
+            assert np.isclose(entry['misclosure'], np.sqrt(np.mean(np.square(entry['member_misclosure']))))
+            assert 0 <= entry['members_flagged'] <= len(run.cache.seeds)
     assert list(entries) == list(ROWS) and diagnostics['factorisation_points'] == list(POINTS)
     assert {row: entries[row]['term'] for row in ROWS} == {row: NETWORKS[k][0] for row, k in ROWS.items()}
 
     # the factorisation test runs on the signal weight_shift networks, the tests with the learned EFT ratio on every
-    # weight_shift network, measured against the factorisation test or, for the background one, the closure
+    # weight_shift network: the difference test measured against the factorisation test or, for the background one,
+    # the closure; the combined test against the learned EFT ratio alone on its events (every event for these
+    # nuisances of every era)
     for label in POINTS:
         assert entries['ISR_bg']['factorisation'][label] is None and entries['JER_2017']['factorisation'][label] is None
         assert entries['JER_2017']['combined'][label] is None and entries['JER_2017']['difference'][label] is None
         for row, baseline in (('ISR', 'factorisation'), ('ISR_bg', 'closure')):
-            for key in ('combined', 'difference'):
-                for direction in nv.DIRECTIONS:
-                    test = entries[row][key][label][direction]
-                    if baseline == 'closure':
-                        reference = entries[row][direction]
-                    else:
-                        reference = entries[row]['factorisation'][label][direction]
-                    assert test['baseline'] == baseline
-                    assert np.isclose(test['rms_bias_change'], test['rms_bias'] - reference['rms_bias'], equal_nan=True)
+            for direction in nv.DIRECTIONS:
+                test = entries[row]['difference'][label][direction]
+                if baseline == 'closure':
+                    reference = entries[row][direction]
+                else:
+                    reference = entries[row]['factorisation'][label][direction]
+                assert test['baseline'] == baseline
+                assert np.isclose(test['baseline_rms_bias'], reference['rms_bias'], equal_nan=True)
+                assert np.isclose(test['rms_bias_change'], test['rms_bias'] - reference['rms_bias'], equal_nan=True)
+                test = entries[row]['combined'][label][direction]
+                reference = diagnostics['eft_only'][label]
+                assert test['baseline'] == 'eft_only'
+                assert np.isclose(test['baseline_rms_bias'], reference['rms_bias'], equal_nan=True)
+                assert np.isclose(test['rms_bias_change'], test['rms_bias'] - reference['rms_bias'], equal_nan=True)
 
     def same(a, b):
         """Whether two [rows, B] arrays of per-bin sums agree, rows not tested (nan) included."""
@@ -433,15 +505,33 @@ def test_main_outputs(toy, run):
 
     row = {name: [2 * list(ROWS).index(name) + d for d in range(len(nv.DIRECTIONS))] for name in ROWS}
     tested = row['ISR'] + row['ISR_bg']
+    # every test at theta_ref normalises by the yield of every event, the sum of the nominal yields of the terms
+    every_event = sums['closure/nominal'][row['ISR'][0]] + sums['closure/nominal'][row['ISR_bg'][0]]
+    tests = ('closure', 'fit_symmetry', 'fit_slope', 'factorisation/sm', 'combined/sm', 'difference/sm', 'eft_only/sm', 'eft_matched/sm')
+    for key in tests:
+        lam = sums[f'{key}/sm_yield']
+        assert same(lam[~np.isnan(lam).all(1)], np.broadcast_to(every_event, lam[~np.isnan(lam).all(1)].shape))
+    # a network of one era is tested on fewer events than the normaliser holds
+    assert np.all(sums['closure/nominal'][row['JER_2017']] <= every_event)
     # per event the combined and difference tests differ by w^s(c0, 0) r_hat(x; theta) - w^s(theta, 0), the closure
-    # of the learned EFT ratio alone
+    # of the learned EFT ratio alone on the events of the test
     for label in POINTS:
         change = sums[f'combined/{label}/D'][tested] - sums[f'difference/{label}/D'][tested]
+        assert same(change, sums[f'eft_matched/{label}/D'][tested])
         assert same(change, np.broadcast_to(sums[f'eft_only/{label}/D'], change.shape))
     # at theta_SM (rho = 1): the factorisation test of the signal network is its closure, and the difference test of
     # the background network is its closure, the signal term of the learned EFT ratio entering neither
     assert same(sums['factorisation/sm/D'][row['ISR']], sums['closure/D'][row['ISR']])
     assert same(sums['difference/sm/D'][row['ISR_bg']], sums['closure/D'][row['ISR_bg']])
 
-    for plot in ('z_heatmap_networks', 'interpolation_yield', 'factorisation_theta', 'eft_combined_theta'):
+    for plot in (
+        'z_heatmap_full',
+        'z_heatmap_compact',
+        'z_heatmap_parts_full',
+        'z_heatmap_parts_compact',
+        'network_misclosure',
+        'interpolation_yield',
+        'factorisation_theta',
+        'eft_combined_theta',
+    ):
         assert os.path.exists(f'{name}/plots/{plot}.png')

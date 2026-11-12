@@ -248,7 +248,7 @@ class RatioFit:
         background_fit = self.config.get('background_fit')
         self.Theta = []
         # filled row by row: no long-lived per-network tensors between the evaluation temporaries, so the heap does
-        # not fragment (fitprobe, ensemble_validation diary)
+        # not fragment
         self.R = torch.empty((len(paths) + 1, features.shape[0]))
         sm_reference = self.config.get('sm') is None
         if background_fit is not None:

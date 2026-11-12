@@ -692,7 +692,7 @@ def bin_tick_labels(edges, params=None, value_names=None):
     return positions, labels
 
 
-def place_legend(ax, samples, rows, fontsize=17, beside=True, gap=10):
+def place_legend(ax, samples, rows, fontsize=17, beside=True, gap=10, handles=None):
     """
     Legend with rows of text, each drawn as 'label = value' and aligned on its '=' sign, placed where legend and rows
     together cover the fewest data samples. With beside, the rows sit to the right of the legend, top-aligned with it
@@ -710,6 +710,8 @@ def place_legend(ax, samples, rows, fontsize=17, beside=True, gap=10):
         fontsize: font size of the legend entries and the rows
         beside: rows to the right of the legend (True) or under it (False)
         gap: space between the legend and the rows, in pixels
+        handles: (handles, labels) of the legend entries, e.g. a line and its error bars as one tuple handle drawn
+            overlaid; default the labelled artists of ax
     Returns:
         the legend
     """
@@ -719,6 +721,7 @@ def place_legend(ax, samples, rows, fontsize=17, beside=True, gap=10):
     samples = np.asarray(samples, dtype=np.float64)
     points = ax.transData.transform(samples[np.isfinite(samples).all(1)])
     axes_box = ax.get_window_extent(renderer)
+    entries = () if handles is None else handles
 
     def size(text):
         probe = ax.text(0, 0, text, fontsize=fontsize)
@@ -742,7 +745,7 @@ def place_legend(ax, samples, rows, fontsize=17, beside=True, gap=10):
             # a lower legend is lifted so the rows fit under it
             lift = (block_h + gap) / axes_box.height
             anchor = (0, lift, 1, 1 - lift) if vertical == 'lower' else (0, 0, 1, 1)
-        legend = ax.legend(fontsize=fontsize, loc=loc, bbox_to_anchor=anchor, bbox_transform=ax.transAxes)
+        legend = ax.legend(*entries, fontsize=fontsize, loc=loc, bbox_to_anchor=anchor, bbox_transform=ax.transAxes)
         box = legend.get_window_extent(renderer)
         if beside:
             x0 = box.x1 + gap
@@ -1229,13 +1232,15 @@ def _closure_figure(
     labels,
     outname,
     errors=None,
-    nominal=None,
     title=None,
+    zero_line=False,
+    headroom=0.0,
 ):
     '''
     Two-panel closure figure on equal-width bins labelled by their edges: the learned and target yields per bin (top),
     Delta_b / lambda_K_b with the band of its noise (bottom); bins in empty are hatched in both panels, and Z_max is
-    shown with the legend (plot_closure, plot_nuisance_closure).
+    shown with the legend (plot_closure, plot_nuisance_closure). A line with error bars has one legend entry showing
+    both.
 
     Args:
         edges: bin edges in the feature
@@ -1247,9 +1252,12 @@ def _closure_figure(
         labels: {'truth', 'learned', 'ratio', 'band'} legend text of the two lines, the points and the band
         outname: file to save the plot to
         errors: (truth_err, learned_err) [B] error bars at the bin centres, optional
-        nominal: (values [B], label) drawn as a grey line in the top panel, with (truth - values) / sm in the bottom
-            panel as the true shift, optional
-        title: drawn above the top panel, optional
+        title: drawn centred just above the top panel, under the CMS header, which moves up above it (as the kind names
+            of the Z heatmaps), optional
+        zero_line: draw a dashed line at 0 in the top panel when the two lines take both signs (signed yields such as
+            shifts)
+        headroom: the top of the top panel's y range is raised by this fraction of the range, room for the legend
+            above the lines
     '''
     x = np.arange(len(edges))
     centers = x[:-1] + 0.5
@@ -1257,26 +1265,28 @@ def _closure_figure(
     fig, (top, bottom) = plt.subplots(
         2, 1, sharex=True, figsize=(10, 9), gridspec_kw={'height_ratios': [2, 1], 'hspace': 0}
     )
-    if nominal is not None:
-        top.stairs(nominal[0], x, color='#9a9a9a', linewidth=2, label=nominal[1])
-    top.stairs(truth, x, color='k', linewidth=2, label=labels['truth'])
-    top.stairs(learned, x, color=ENSEMBLE_COLOR, linewidth=2, label=labels['learned'])
+    handles = [
+        top.stairs(truth, x, color='k', linewidth=2),
+        top.stairs(learned, x, color=ENSEMBLE_COLOR, linewidth=2),
+    ]
     if errors is not None:
-        top.errorbar(centers, truth, yerr=errors[0], fmt='none', color='k', linewidth=2)
-        top.errorbar(
-            centers,
-            learned,
-            yerr=errors[1],
-            fmt='none',
-            color=ENSEMBLE_COLOR,
-            linewidth=2,
-        )
+        bars = [
+            top.errorbar(centers, values, yerr=err, fmt='none', color=color, linewidth=2)
+            for values, err, color in ((truth, errors[0], 'k'), (learned, errors[1], ENSEMBLE_COLOR))
+        ]
+        # each line and its error bars share one legend entry, drawn overlaid
+        handles = [(line, bar) for line, bar in zip(handles, bars)]
+    values = np.concatenate([truth, learned])
+    if zero_line and np.nanmin(values) < 0 < np.nanmax(values):
+        top.axhline(0, color='k', linestyle='--', linewidth=1)
+    if headroom:
+        low, high = top.get_ylim()
+        top.set_ylim(low, high + headroom * (high - low))
     top.set_ylabel(ylabel)
     # bins in empty may have sm = 0; they are masked
     with np.errstate(divide='ignore', invalid='ignore'):
         band = np.where(empty, np.nan, noise / sm)
         ratio = D / sm
-        shift = None if nominal is None else np.where(empty, np.nan, (truth - nominal[0]) / sm)
     bottom.stairs(
         band,
         x,
@@ -1285,12 +1295,6 @@ def _closure_figure(
         color='#d9d9d9',
         label=labels['band'],
     )
-    if nominal is not None:
-        bottom.stairs(shift, x, color='#9a9a9a', linewidth=1.5)
-        # the bottom panel's entries go in the legend of the top panel
-        top.fill_between([], [], color='#d9d9d9', label=labels['band'])
-        top.plot([], [], color='#9a9a9a', linewidth=1.5, label='true shift')
-        top.plot([], [], 'o', color='k', label=labels['ratio'])
     bottom.plot(centers[~empty], ratio[~empty], 'o', color='k', label=labels['ratio'])
     bottom.axhline(0, color='k', linestyle='--', linewidth=1)
     # bins in empty: hatched in both panels
@@ -1312,16 +1316,17 @@ def _closure_figure(
     # minor ticks on every bin edge, so major and minor ticks both sit on edges (shared by the top panel)
     bottom.set_xticks(x, minor=True)
     bottom.set_xlim(x[0], x[-1])
+    name = None
     if title is not None:
-        # centred above the row of the CMS label
-        top.set_title(title, fontsize=18, pad=45)
+        gap = ScaledTranslation(0, 4 / 72, fig.dpi_scale_trans)
+        name = top.text(0.5, 1, title, transform=top.transAxes + gap, ha='center', va='bottom', fontsize=20)
     # the CMS label measures the text already on the figure, so the filter must be on before it is added
     mathtext_log = logging.getLogger('matplotlib.mathtext')
     mathtext_log.addFilter(_no_tex_mapping)
     try:
-        mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=top)
+        cms = mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=top)
         # legend and Z_max where they cover the least of the lines and error bars (the ranges stay as they are)
-        lines = (truth, learned) if nominal is None else (truth, learned, nominal[0])
+        lines = (truth, learned)
         sampled = [np.c_[np.linspace(x[i], x[i + 1], 20), np.full(20, v[i])] for v in lines for i in range(len(v))]
         sampled += [
             np.c_[np.full(20, x[i + 1]), np.linspace(v[i], v[i + 1], 20)] for v in lines for i in range(len(v) - 1)
@@ -1332,9 +1337,22 @@ def _closure_figure(
                 for vals, errs in ((truth, errors[0]), (learned, errors[1]))
                 for c, v, e in zip(centers, vals, errs)
             ]
-        # smaller text for the six entries with nominal
-        fontsize = 20 if nominal is None else 15
-        place_legend(top, np.concatenate(sampled), [(r'$Z_{max}$', f'{z_max:.1f}')], fontsize=fontsize, beside=False)
+        place_legend(
+            top,
+            np.concatenate(sampled),
+            [(r'$Z_{max}$', f'{z_max:.1f}')],
+            fontsize=20,
+            beside=False,
+            handles=(handles, [labels['truth'], labels['learned']]),
+        )
+        if name is not None:
+            # the CMS header moves up above the title, whose height is known only once it is drawn
+            fig.canvas.draw()
+            height = name.get_window_extent(fig.canvas.get_renderer()).height / fig.dpi
+            lift = ScaledTranslation(0, height + 8 / 72, fig.dpi_scale_trans)
+            for text in cms:
+                if text is not None:
+                    text.set_transform(text.get_transform() + lift)
         fig.savefig(outname, bbox_inches='tight')
     finally:
         mathtext_log.removeFilter(_no_tex_mapping)
@@ -1388,48 +1406,59 @@ def plot_closure(k, f, sums, bias, binning, labels, outname, feature_config=None
     )
 
 
-def plot_nuisance_closure(sums, row, f, z_max, binning, outname, title, nominal=True, feature_config=None):
+def plot_nuisance_closure(
+    sums, row, f, z_max, binning, outname, title, labels, subtract_nominal=True, feature_config=None
+):
     '''
-    Closure of one nuisance test in one feature: the learned yield hat w_b = sum_i w^s_i(theta_ref, 0) exp f_hat(x_i)
-    against the target w_b per bin K_b (top), and Delta_b relative to the nominal yield lambda_K_b(theta_ref, 0) with
-    the noise band sqrt(Var_MC + Var_seeds) (bottom). With nominal, lambda_K_b(theta_ref, 0) is drawn in the top panel
-    and the true shift (w_b - lambda_K_b) / lambda_K_b in the bottom one. Bins without tested events are hatched.
+    Closure of one nuisance test in one feature: the learned against the true shift per bin K_b (top), measured from
+    the nominal yield w_b^0 of the tested events, with hat w_b = sum_i w^s_i(theta_ref, 0) exp f_hat(x_i), and
+    Delta_b relative to lambda_b(theta_ref, 0), the yield of every event, with the noise band
+    sqrt(Var_MC + Var_seeds) (bottom). Error bars show the MC statistics of each shift (and the seed spread for the
+    learned one), both at the bin centre, as in plot_closure; a dashed line marks 0 when the shifts take both signs,
+    and the top panel leaves room for the legend above the lines. Bins without tested events are hatched.
 
     Args:
-        sums: {D, s2, mc_var, truth, sm_yield} [rows, B] of one test (nuisance_sums.npz, nuisance_validation.test_arrays)
+        sums: {D, s2, mc_var, truth, sm_yield, nominal, shift_var, learned_shift_var} [rows, B] of one test
+            (nuisance_sums.npz, nuisance_validation.test_arrays)
         row: row of the test (2 n + d for the networks, n for the parts)
         f: feature index into binning['names']
         z_max: largest Z of the test (nuisance_diagnostics.yml)
         binning: {'names', 'edges', 'feature'} of the closure
         outname: file to save the plot to
-        title: drawn above the top panel
-        nominal: draw the nominal yield and the true shift (for the closure of a network, not of the parts of the
-            interpolation)
+        title: the test, drawn under the CMS header, e.g. the nuisance and its direction or part
+        labels: (truth, learned) legend text of the two shifts, e.g. w_b^+ - w_b^0 and hat w_b^+ - w_b^0
+        subtract_nominal: measure both yields from w_b^0 (a network, the symmetric part); False for a test whose
+            yields are shifts already (the slope, (w_b^+ - w_b^-) / 2)
         feature_config: contents of the features yml, for the feature's TeX label
     '''
     b = binning['feature'] == f
     truth, D, sm = sums['truth'][row, b], sums['D'][row, b], sums['sm_yield'][row, b]
-    lam = r'\lambda_{K_b}(\theta_{\mathrm{ref}}, 0)'
+    tested = sums['nominal'][row, b]
+    base = tested if subtract_nominal else np.zeros_like(tested)
+    errors = (np.sqrt(sums['shift_var'][row, b]), np.sqrt(sums['learned_shift_var'][row, b] + sums['s2'][row, b]))
+    lam = r'\lambda_b(\theta_r, 0)'
     _closure_figure(
         binning['edges'][f],
-        truth,
-        truth + D,
+        truth - base,
+        truth + D - base,
         D,
         np.sqrt(sums['mc_var'][row, b] + sums['s2'][row, b]),
         sm,
-        sm <= 0,
+        tested <= 0,
         z_max,
         _feature_label(binning['names'][f], feature_config),
-        'Events',
+        'Shift [events]',
         {
-            'truth': r'$w_b$',
-            'learned': r'$\hat{w}_b$',
+            'truth': labels[0],
+            'learned': labels[1],
             'ratio': rf'$\Delta_b / {lam}$',
             'band': rf'$\pm\sqrt{{\mathrm{{Var}}_{{\mathrm{{MC}}}} + \mathrm{{Var}}_{{\mathrm{{seeds}}}}}} / {lam}$',
         },
         outname,
-        nominal=(sm, rf'${lam}$') if nominal else None,
+        errors=errors,
         title=title,
+        zero_line=True,
+        headroom=0.5,
     )
 
 
@@ -2108,6 +2137,79 @@ def plot_size_significance(panels, methods, z_threshold, outname, reference=None
     # smaller than the default so it fits above one 8 inch panel
     mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=axes[0, 0], fontsize=18)
     fig.savefig(outname, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_nuisance_misclosure(entries, methods, outname, n_labels=6, floor=1e-6):
+    '''
+    Misclosure m_a of every nuisance network (a fraction of lambda_K_b(theta, 0), member_misclosure) against the size
+    of its true shift on the same scale, both on log scales, coloured by method, with the direction as marker. Every
+    member's m_e is drawn as a small marker, joined by a thin line from the smallest to the largest, with m_a as the
+    large marker and the misclosure of the ensemble mean as a black bar: the bar sits about sqrt(n_e) below m_a when
+    the members' misclosures are independent training noise and close to m_a when the members share one bias.
+    Networks whose closure is flagged have a black edge. The dotted line marks a misclosure as large as the shift.
+    Values below floor are drawn at floor. The n_labels networks with the largest m_a relative to their shift are
+    labelled, skipping a network that sits on an already labelled one.
+
+    Args:
+        entries: {(nuisance, direction): its direction entry of nuisance_diagnostics.yml, with misclosure,
+            member_misclosure, mean_misclosure, shift_size and flagged}
+        methods: {nuisance: method}
+        outname: file to save the plot to
+        n_labels: networks labelled
+        floor: smallest value drawn
+    '''
+    fig, ax = plt.subplots(figsize=(12, 9))
+    shown, candidates = [], []
+    for (nuisance, direction), e in entries.items():
+        x = max(e['shift_size'], floor)
+        m = max(e['misclosure'], floor)
+        mean = max(e['mean_misclosure'], floor)
+        members = np.maximum(np.asarray(e['member_misclosure'], dtype=np.float64), floor)
+        color, marker = METHOD_COLORS[methods[nuisance]], DIRECTION_MARKERS[direction]
+        ax.vlines(x, members.min(), members.max(), colors=color, linewidth=1, alpha=0.4, zorder=1)
+        ax.scatter(np.full(len(members), x), members, marker=marker, s=10, color=color, alpha=0.4, zorder=1)
+        ax.scatter(x, mean, marker='_', s=150, color='k', linewidths=2, zorder=2)
+        edge = 'k' if e['flagged'] else 'none'
+        ax.scatter(x, m, marker=marker, s=80, color=color, edgecolors=edge, linewidths=1.2, zorder=3)
+        shown += [x, m, mean, *members]
+        candidates.append((m / x, x, m, f'{nuisance} {DIRECTION_TEX[direction]}'))
+    # labelled points at least 0.15 decades apart in m_a or in the shift, so the labels do not overlap
+    labelled = []
+    for _, x, m, label in sorted(candidates, reverse=True):
+        near = [abs(np.log10(m / v)) < 0.15 and abs(np.log10(x / u)) < 0.15 for u, v in labelled]
+        if len(labelled) == n_labels or any(near):
+            continue
+        labelled.append((x, m))
+        ax.annotate(label, (x, m), xytext=(6, 6), textcoords='offset points', fontsize=14)
+    low, high = min(shown) / 2, max(shown) * 2
+    ax.plot([low, high], [low, high], color='#5a5a5a', linestyle=':', linewidth=2, zorder=0)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlim(low, high)
+    ax.set_ylim(low, high)
+    ax.set_xlabel(r'rms true shift (fraction of $\lambda_{K_b}$)')
+    ax.set_ylabel(r'$m_a$ (fraction of $\lambda_{K_b}$)')
+    # legend: method by colour, direction by marker, the members, the ensemble mean and the reference line
+    present = [m for m in METHOD_COLORS if m in methods.values()]
+    handles = [Patch(color=METHOD_COLORS[m], label=METHOD_NAMES[m]) for m in present]
+    handles += [
+        Line2D([], [], marker=DIRECTION_MARKERS[k], linestyle='', color='#5a5a5a', markersize=10, label=text)
+        for k, text in (('down', 'Down'), ('up', 'Up'))
+    ]
+    handles += [
+        Line2D([], [], color='#5a5a5a', alpha=0.4, linewidth=1, label='members'),
+        Line2D([], [], marker='_', linestyle='', color='k', markersize=14, markeredgewidth=2, label='ensemble mean'),
+        Line2D([], [], color='#5a5a5a', linestyle=':', linewidth=2, label=r'$m_a$ = shift'),
+    ]
+    ax.legend(handles=handles, fontsize=16, loc='upper left', ncol=2)
+    mathtext_log = logging.getLogger('matplotlib.mathtext')
+    mathtext_log.addFilter(_no_tex_mapping)
+    try:
+        mh.cms.label("Preliminary", data=False, lumi=None, com=13, ax=ax)
+        fig.savefig(outname, bbox_inches='tight')
+    finally:
+        mathtext_log.removeFilter(_no_tex_mapping)
     plt.close(fig)
 
 
