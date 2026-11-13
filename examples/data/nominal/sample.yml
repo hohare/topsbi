@@ -1,6 +1,9 @@
 # presence marks <root>/nominal as combined data (eft trainings then use the event-key split)
 # checked against every variation's sample.yml: must be equal
 reference: gen     # the point of w_ref (here the generation point)
+# value of that point: SM entry first, then one value per WC in the config's wcs order (read by background trainings
+# and the nuisance cache)
+reference_point: [1.0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, -0.5, -0.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
 salt_split: 0      # salt of the train / validation split hash
 # any other keys are free, e.g. what the combiner records:
 variation: nominal

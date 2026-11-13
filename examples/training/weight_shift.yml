@@ -1,5 +1,5 @@
-# weight_shift training: one network for the nuisance systematic ISR, direction up (weight-systematic ratio stored in the nominal sample (syst_ratio)); keys are described in
-# README.md, the data in docs/data.md
+# weight_shift training: one network for the nuisance systematic ISR, direction up (the weight-systematic ratio is
+# stored in the nominal sample, syst_ratio); keys are described in README.md, the data in docs/data.md
 
 # data: the root of a combined sample (nominal/ and the variation directories; holdout: validation.p)
 method: weight_shift

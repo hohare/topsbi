@@ -7,10 +7,10 @@ Run with `python -m topsbi.validation -c config.yml [--refit] [--backgrounds]`; 
 - `backgrounds`: `--backgrounds` only, `{process: nominal directory of its combined background sample}`; the ensemble and the background ratios are evaluated on its `validation.p`
 - `bias`: optional settings of the bias test
     - `features`: network inputs to test, names from the feature configuration (default: all)
-    - `min_neff`: minimum effective number of events per bin, $n_{\rm eff} = (\sum w)^2 / \sum w^2$ with $w = w^s(\theta_0)$; neighbouring bins are merged until each reaches it (default 30)
+    - `min_neff`: minimum effective number of events per bin, $N_{\rm eff} = (\sum w)^2 / \sum w^2$ with $w = w^s(\theta_0)$; neighbouring bins are merged until each reaches it (default 30)
     - `n_bins`: equal-count bins per input before merging; an input with at most this many distinct values gets one bin per value (default 20)
     - `z_threshold`: a component is flagged if its largest $Z$ over the inputs exceeds it (default 5.0)
-- `c0`: the reference point $\theta_0$ every network was trained against: $n_{\rm wcs}+1$ values, 1 (SM) followed by one value per WC in `wcs` order. It must match the networks' `c0`
+- `c0`: the reference point $\theta_0$ every network was trained against: $n_{\rm wcs}+1$ values, 1 (SM) followed by one value per WC in `wcs` order, then one strength $\mu_p$ per background process when the networks have `background_processes`. It must match the networks' `c0`
 - `data`: path to the dataset the ensemble is evaluated and tested on, a pickled `TensorDataset` whose first two tensors are the features and the structure constants $s_q(z)$ ([`docs/data.md`](../../docs/data.md)). Use events that no network was trained on, e.g. the `validation.p` produced alongside `train.p`
 - `device`: device the networks are evaluated on: `cpu` (default) or `cuda`. The `device` in the networks' training configs is ignored
 - `eras`: optional era names, indexed like `lumi`, for the tick labels of the era column in the closure plots (without it the eras are labelled by their index); as in the training configs

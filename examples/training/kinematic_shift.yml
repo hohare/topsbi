@@ -1,5 +1,5 @@
-# kinematic_shift training: one network for the nuisance systematic JES_Absolute, direction up (shifted sample in its own directory (<systematic>Up)); keys are described in
-# README.md, the data in docs/data.md
+# kinematic_shift training: one network for the nuisance systematic JES_Absolute, direction up (the shifted sample is
+# in its own directory, <systematic>Up); keys are described in README.md, the data in docs/data.md
 
 # data: the root of a combined sample (nominal/ and the variation directories; holdout: validation.p)
 method: kinematic_shift

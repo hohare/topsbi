@@ -17,7 +17,7 @@ What a training writes, its metrics and plots: [`docs/training.md`](../../docs/t
 - `eras`: optional era names for the plot labels, indexed like `lumi` (as many entries); without it, the eras are labelled by their index
 - `features`: path to the feature configuration yaml ([`examples/features/README.md`](../features/README.md))
 - `features_to_animate`: features from the feature configuration whose closure plot is animated over the epochs (`animations/<feature>.gif`)
-- `holdout`: optional path to a dataset not used for training, early stopping or the learning-rate scheduler, e.g. the `validation.p` produced alongside `train.p` (the default for a combined sample). When set, the final plots and `performance.yml` in `complete/` are computed on it. Without it, they are computed on the early-stopping test split and are slightly optimistic
+- `holdout`: optional path to a dataset not used for training, early stopping or the learning-rate scheduler, e.g. the `validation.p` produced alongside `train.p` (the default for a combined sample). When set, the final plots and `performance.yml` in `complete/` are computed on it. Without it, they are computed on the early-stopping test split and are slightly optimistic. Ignored by the nuisance methods and `background`, whose holdout is always `validation.p` (of both samples for `background`)
 - `learningRate`: initial learning rate for network training
 - `lumi`: integrated luminosity of each era ($n_{\rm eras}$ values), indexed by the era column (`year_loc`). Required by every method. Training uses only the ratios between eras; the expected events in the plots also use the absolute values ([`docs/data.md`](../../docs/data.md): `coefs` in pb with `lumi` in fb$^{-1}$)
 - `method` (required):
@@ -28,14 +28,14 @@ What a training writes, its metrics and plots: [`docs/training.md`](../../docs/t
 
     The last three read combined samples; see [`docs/training.md`](../../docs/training.md) and [`docs/data.md`](../../docs/data.md)
 - `name`: directory for output of training
-- `network`: optional list of layers, each `{type: Linear, out: int, activation: LeakyReLU | Sigmoid | None}` with optional `in` (checked against the previous layer's `out`) and `dropout`; `None` gives a linear output. The last activation sets the output: `Sigmoid` (probability) for `eft`, `None` (log ratio) for the nuisance methods and `background`. Without it, the network is $n_{\rm features}$ x 128 x 128 x 1 with LeakyReLU and a Sigmoid output, which suits `eft` only
+- `network`: optional list of layers, each `{type: Linear, out: int, activation: LeakyReLU | Sigmoid | None}` with optional `in` (checked against the previous layer's `out`) and `dropout`; `None` gives a linear output. The last activation sets the output: `Sigmoid` (probability) for `eft`, `None` (log ratio) for the nuisance methods and `background`. Without it, the network is $n_{\rm features}$ x 128 x 128 x 1 with LeakyReLU, and a Sigmoid output for `eft` or a linear output for the nuisance methods and `background`
 - `patience`: early stopping, number of epochs without improvement of the test loss before training stops (default 10)
 - `scheduler`: learning-rate scheduler, `plateau` (default), `cosine` or `none`
     - `factor`: `plateau` only, multiplicative learning-rate decay (default 0.5)
     - `lr_patience`: `plateau` only, epochs without improvement before the learning rate is reduced (default 5)
     - `warmup_epochs`: `cosine` only, length of the linear warmup (default 5)
 - `seed`: random seed used for network initialization and the train/test split
-- `systematic`: nuisance methods (required). `weight_shift`: a name in `nominal/systematics.yml`; `kinematic_shift`: the variation, read from the directories `<systematic>Up` and `<systematic>Down`. A list of per-era names on disjoint eras is trained as one network ([`docs/data.md`](../../docs/data.md), section 2)
+- `systematic`: nuisance methods (required). `weight_shift`: a name in `nominal/systematics.yml`; `kinematic_shift`: the variation, read from the directory `<systematic>Up` or `<systematic>Down` given by `direction`. A list of per-era names on disjoint eras is trained as one network ([`docs/data.md`](../../docs/data.md), section 2)
 - `threads`: optional number of CPU threads: torch's intra-op threads and the BLAS / OpenMP pools of numpy (`threadpoolctl`). Without it, the libraries' defaults (usually every core). Batches are built in the training process, so a run with `threads: 1` uses one core
 - `wcs`: names of the $n_{\rm wcs}$ Wilson coefficients, in the order of the `coefs` columns; `c0` and `c1` follow this order
 - `year_loc`: optional column of the features holding the integer era index $0, \dots, n_{\rm eras}-1$; used to look up `lumi` and `eras` (default 21)

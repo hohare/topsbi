@@ -7,8 +7,8 @@ directory per kinematic variation). The tensors themselves are described in [`do
 
 Read by `weight_shift` trainings, next to the nominal `train.p` / `validation.p`.
 
-- `syst_ratio`: names of the weight systematics, in the order of axis 1 of the `syst_ratio` tensor; a config's
-  `systematic` must be one of them
+- `syst_ratio`: names of the weight systematics, in the order of axis 1 of the `syst_ratio` tensor; each name in a
+  config's `systematic` must be one of them
 - `directions`: order of the tensor's last axis (default `[Up, Down]`); a config's `direction` must be one of them
 
 ## `nominal/sample.yml`, `<variation>/sample.yml`
@@ -18,7 +18,12 @@ Next to `train.p` / `validation.p` in every directory of the combined data.
 - presence: marks the directory as combined data (an `eft` training on `<root>/nominal` then splits train / test by
   event key and uses `validation.p` as the default holdout)
 - `reference`: the point at which `w_ref` is the event weight; must be the same in nominal and every variation
+- `reference_point`: the value of that point, SM entry first, then one value per WC in the config's `wcs` order; read
+  from the signal's nominal `sample.yml` by background trainings (written to `performance.yml`) and by the nuisance
+  cache
 - `salt_split`: the salt of the train / validation split; must be the same in nominal and every variation
+- `eft`: `false` marks a background sample (default `true`, signal)
+- `process`: the background process's name; required with `eft: false`
 - any other keys are free and not read (e.g. `variation`, `columns`)
 
 ## `zero_terms.yml`
