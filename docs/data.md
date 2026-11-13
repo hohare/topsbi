@@ -37,7 +37,8 @@ background is linear in its strength and does not interfere with the WCs:
 `coefs` then has $n_q + K$ columns, and `c0` and `c1` have $n_{\rm wcs} + 1 + K$ values. $\mu_p = 1$ is the nominal
 yield of $p$; $\mu_p = 0$ removes it. A training with $\mu_p = 1$ in both `c0` and `c1` has the background on both
 sides, with the same weight. To separate a background column from the SM column, the ensemble fit
-([`ensemble.md`](ensemble.md)) needs networks trained at $\mu_p \neq 1$. All backgrounds can share one column, or
+([`ensemble.md`](ensemble.md)) needs a network whose point weights the background differently from the signal:
+for example the background alone (first entry 0, every WC 0, $\mu_p = 1$), or $\mu_p \neq 1$. All backgrounds can share one column, or
 each process can have its own. Zero terms name WC pairs only, so background columns are always kept.
 
 ## 2. The combined format: nuisance trainings (optional for eft)
@@ -53,6 +54,11 @@ Nuisance trainings compare two samples of the same events, so they need one dire
 
 A kinematic variation may cover only some eras; its nominal sample is then restricted to those eras. For eft on
 combined data, `data` is `<root>/nominal`; for nuisance trainings it is `<root>`.
+
+**Background samples.** A background process has the same layout and tensor order, with `eft: false` and its process
+name `process` in `nominal/sample.yml`. It is read by a `background` training (config `background`, against the
+signal sample in `data`) and by nuisance trainings on background events (`data` set to the background root). Their
+networks shift the background term of the learned model, not the signal term.
 
 Tensor order in `train.p` and `validation.p`:
 
@@ -79,9 +85,16 @@ hash of the event key and the training seed.
 **`nominal/systematics.yml`** (weight_shift; [example](../examples/data/nominal/systematics.yml)): `syst_ratio`, the systematic names in column order, and `directions`
 (default `[Up, Down]`).
 
+**Per-era systematics trained as one.** A training's `systematic` can be a list of names whose variations act on
+disjoint eras, for example one systematic per era. `weight_shift` takes the product of their `syst_ratio` columns and
+stops if an event has a ratio ≠ 1 in more than one of them. `kinematic_shift` reads the union of their variation
+directories, which must cover disjoint eras. The era column (`year_loc`) should be a network input, so the network
+can tell which era's variation applies.
+
 **`sample.yml`** ([nominal](../examples/data/nominal/sample.yml), [variation](../examples/data/JES_AbsoluteUp/sample.yml)): marks a directory as combined data (needed for eft on combined data). When nominal and a variation
 both have one, their `reference` (the reference point of `w_ref`) and `salt_split` (the salt of the train /
-validation split) must agree. Other keys are free.
+validation split) must agree. `eft: false` marks a background sample, and `process` (required then) names its
+process. Other keys are free.
 
 ## 3. Settings tied to the data layout
 
@@ -103,11 +116,11 @@ either `zero_terms` or `background_processes` is set), the number of values in `
 
 ## 5. One way to produce it
 
-The reco_systematics analysis builds its data with ttbarEFT:
+One way is ttbarEFT:
 [`analysis/tensor_processor.py`](https://github.com/TopEFT/ttbarEFT/blob/main/analysis/tensor_processor.py) writes
 per-chunk tensors from NanoAOD (features, structure constants, event identity, weight-systematic ratios), and
 [`analysis/combine_tensors.py`](https://github.com/TopEFT/ttbarEFT/blob/main/analysis/combine_tensors.py) merges
 them per variation, removes duplicate events, adds `w_ref` and makes the event-key train / validation split and
 `sample.yml`. The processor's `--drop-wcs` fixes WCs to 0 at the reference point, and the combine step removes their
 columns from the structure constants; `sample.yml` then lists the WCs of the data (`wcs`) and those dropped
-(`dropped_wcs`). The current data are `/groups/klannon/cmcgrad2/data/reco_systematics_v4/SR_CHANNELS_2j3j_gen`.
+(`dropped_wcs`).

@@ -23,6 +23,8 @@ $$\hat r(x; \theta) = T(\theta)[\text{mask}]\, \langle \hat\Gamma \rangle_e .$$
 
 All members must be trained at the same set of points; a member with a different `mask` stops the fit. A member needs at least as many networks as kept terms, $n_a \ge K$, for $\Theta$ to have full column rank.
 
+**Background columns and network groups.** With background processes ([`data.md`](data.md), section 1), row $a$ of $\Theta$ is $T(\theta_1^{(a)}, \mu^{(a)})$ and $\hat\Gamma$ has one more row per process, so $\hat r(x; \theta, \mu) = T(\theta, \mu)[\text{mask}]\, \langle \hat\Gamma \rangle_e$. A background column needs a network whose point weights that background differently from the signal. The strengths can stay at $\mu_p = 1$ in every network: a network trained at the point with the signal removed (first entry 0, every WC 0, $\mu_p = 1$: the background alone) against $\theta_0$ determines the background column, together with the SM network. A network at $\mu_p \neq 1$ would also do. A member's `networks` can be given as groups, `{group: [training configs]}`. With `background_fit: <group>`, the background columns are fitted from that group's networks and the SM network alone, and the other columns from every network with the background term subtracted, so the networks of the other groups do not pull the background columns.
+
 ## 2. What it reads
 
 From the validation config:
@@ -96,10 +98,34 @@ cache.matches(config)  # False if the cache is stale for this config
 
 A likelihood scan needs only `gamma_cache.npy`, `mask_cache.npy` and `filter_cache.npy`.
 
-## 7. Nuisance parameters
+## 7. Background caches
 
-The ensemble describes the dependence on the Wilson coefficients only. Nuisance networks (`weight_shift`, `kinematic_shift`, [`training.md`](training.md)) are trained at a nominal reference $(\theta, 0)$ and give $\hat f = \log \hat r(x; \theta, \nu)$ for one direction of one nuisance; they are not part of this fit. With the factorisation $r(x; \theta, \nu) = r(x; \theta)\, r(x; \nu)$ the two enter the learned ratio as a sum of logarithms,
+For a mixture likelihood, the scanner needs the EFT ensemble and the background ratios on the events of each background process. `python -m topsbi.validation -c <config.yml> --backgrounds [--refit]` builds them, and nothing else, from the config keys `backgrounds` (`{process: nominal directory of its combined background sample}`) and `background_networks` (`{process: {member: training yml of a background training}}`).
 
-$$\log \hat r(x; \theta, \nu) = \log\left[T(\theta)[\text{mask}]\, \langle \hat\Gamma \rangle_e\right] + \sum_n \log \hat r(x; \nu_n).$$
+It first checks that:
 
-Combining them is not yet implemented.
+- both keys name the same processes;
+- every process has networks for the same members;
+- each background directory has a `validation.p` and a `sample.yml` with `eft: false`;
+- every network's `performance.yml` names its process and has `reference_point` equal to `c0`.
+
+It writes under `{name}/`:
+
+| File | Content |
+|---|---|
+| `ensemble_<p>/` | the EFT ensemble on the holdout events (`validation.p`) of process $p$, with the layout of `ensemble/` (section 4); its kept terms must equal those of the signal cache |
+| `background_ratios/<set>.npz` | $\hat r(x; p) = \exp \hat f$ of every background network on every event set (the signal and every process): `r_hat` [$n_p$, $n_e$, $N$] float32, `processes`, `seeds`, and `finite` [$N$] (every network finite and positive) |
+| `background_ratios/manifest.yml` | the inputs the ratios were built from; the ratios are rebuilt when these change, or with `--refit` |
+| `background_diagnostics.yml` | per process: the fraction of its events dropped by the ensemble and by the ratio filters, the fraction with $\hat r(x; \theta_{\rm SM}) \le 0$ and with $\hat r(x; \theta_0) \le 0$ (member mean and each member), and $\sum w\, \hat r(x; \theta_{\rm SM})$ against $\sum w$; per background network, the spread of $\hat r$ over members |
+
+Caches that match the config are read, not rebuilt.
+
+## 8. Nuisance parameters
+
+The ensemble describes only the dependence on the Wilson coefficients and background strengths.
+
+Nuisance networks (`weight_shift`, `kinematic_shift`, [`training.md`](training.md)) are not part of this fit. Each is trained at the nominal reference $(\theta_{\rm ref}, 0)$, with $\theta_{\rm ref}$ the point of `c0`, and gives $\hat f = \log \hat r(x; \theta, \nu)$ for one direction of one nuisance. Each nuisance belongs to one term of the learned ratio: the signal, or one background process, as given by the `sample.yml` of its training data. With the factorisation $r(x; \theta, \nu) = r(x; \theta)\, r(x; \nu)$ applied term by term, the learned model is
+
+$$\hat r(x; \theta, \mu, \nu) = T(\theta)[\text{mask}]\, \langle \hat\Gamma_{\rm sig} \rangle_e \prod_{n \in {\rm sig}} \hat r(x; \nu_n) + \sum_p \mu_p\, \langle \hat\Gamma_p \rangle_e \prod_{n \in p} \hat r(x; \nu_n),$$
+
+with $\hat r(x; \nu_n)$ interpolated in $\nu_n$ between the Up and Down networks. A per-era nuisance acts only on the events of its eras, which the nuisance cache records. The nuisance validation evaluates the nuisance networks once into this cache and tests the model ([`validation.md`](validation.md)).

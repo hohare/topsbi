@@ -3,10 +3,10 @@
 
 # data: the nominal directory of a combined sample (holdout: its validation.p)
 method: eft
-data: /groups/klannon/cmcgrad2/data/reco_systematics_v3/SR_CHANNELS_2j3j_gen/nominal
+data: <data_root>/nominal
 lumi: [19.52, 16.81, 41.48, 59.83]  # fb^-1 per era
 eras: [2016APV, '2016', '2017', '2018']  # era names for the plots, indexed like lumi
-zero_terms: /groups/klannon/cmcgrad2/data/reco_systematics_v3/zero_terms.yml
+zero_terms: examples/data/zero_terms.yml
 
 # training point: c0 = SM, c1 = ctj8 at 0.1 (first entry 1, then one value per WC in wcs order)
 wcs: [cQd1, ctj1, cQj31, ctj8, ctd1, ctd8, ctGRe, ctGIm, cQj11, cQj18, ctu8, cQd8, ctu1, cQu1, cQj38, cQu8]
@@ -31,9 +31,9 @@ device: cpu
 threads: 1
 
 # plots
-features: /groups/klannon/cmcgrad2/data/reco_systematics_v3/features.yml
+features: examples/features/config.yml
 features_to_animate: [dldbjmass, dlmass, dlpt]
 animate_per_epoch: 5
 
 # output
-name: /groups/klannon/cmcgrad2/results/examples/eft_ctj8_0.1
+name: <results>/examples/eft_ctj8_0.1

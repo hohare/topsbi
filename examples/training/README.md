@@ -26,7 +26,7 @@ What a training writes, its metrics and plots: [`docs/training.md`](../../docs/t
     1. `kinematic_shift`: nuisance training of the nominal sample against the shifted sample of the variation directory (keys `systematic`, `direction`), with the soft$^+$ loss
     1. `background`: the signal at its reference point (label 0) against one background process $p$ (label 1, key `background`), with the soft$^+$ loss: $\hat r(x; p) = f_p(x) / f_S(x; \theta_{\rm ref})$. Negative event weights are kept in the loss
 
-    All three read combined samples; see [`docs/training.md`](../../docs/training.md) and [`docs/data.md`](../../docs/data.md)
+    The last three read combined samples; see [`docs/training.md`](../../docs/training.md) and [`docs/data.md`](../../docs/data.md)
 - `name`: directory for output of training
 - `network`: optional list of layers, each `{type: Linear, out: int, activation: LeakyReLU | Sigmoid | None}` with optional `in` (checked against the previous layer's `out`) and `dropout`; `None` gives a linear output. The last activation sets the output: `Sigmoid` (probability) for `eft`, `None` (log ratio) for the nuisance methods and `background`. Without it, the network is $n_{\rm features}$ x 128 x 128 x 1 with LeakyReLU and a Sigmoid output, which suits `eft` only
 - `patience`: early stopping, number of epochs without improvement of the test loss before training stops (default 10)
@@ -35,7 +35,7 @@ What a training writes, its metrics and plots: [`docs/training.md`](../../docs/t
     - `lr_patience`: `plateau` only, epochs without improvement before the learning rate is reduced (default 5)
     - `warmup_epochs`: `cosine` only, length of the linear warmup (default 5)
 - `seed`: random seed used for network initialization and the train/test split
-- `systematic`: nuisance methods (required); `weight_shift`: a name in `nominal/systematics.yml`; `kinematic_shift`: the variation, read from the directories `<systematic>Up` and `<systematic>Down`
+- `systematic`: nuisance methods (required). `weight_shift`: a name in `nominal/systematics.yml`; `kinematic_shift`: the variation, read from the directories `<systematic>Up` and `<systematic>Down`. A list of per-era names on disjoint eras is trained as one network ([`docs/data.md`](../../docs/data.md), section 2)
 - `threads`: optional number of CPU threads: torch's intra-op threads and the BLAS / OpenMP pools of numpy (`threadpoolctl`). Without it, the libraries' defaults (usually every core). Batches are built in the training process, so a run with `threads: 1` uses one core
 - `wcs`: names of the $n_{\rm wcs}$ Wilson coefficients, in the order of the `coefs` columns; `c0` and `c1` follow this order
 - `year_loc`: optional column of the features holding the integer era index $0, \dots, n_{\rm eras}-1$; used to look up `lumi` and `eras` (default 21)

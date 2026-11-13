@@ -6,9 +6,10 @@
 # by a script from the results directory.
 
 # events the ensemble is evaluated and tested on (never used in training), with their structure constants
-data: /groups/klannon/cmcgrad2/data/reco_systematics_v3/SR_CHANNELS_2j3j_gen/nominal/validation.p
-features: /groups/klannon/cmcgrad2/data/reco_systematics_v3/features.yml
+data: <data_root>/nominal/validation.p
+features: examples/features/config.yml
 lumi: [19.52, 16.81, 41.48, 59.83]  # fb^-1 per era, indexed by the era column
+eras: [2016APV, '2016', '2017', '2018']  # era names for the plots, indexed like lumi
 year_loc: 21
 
 # reference point of every network and the WC order (as in the training configs)
@@ -19,16 +20,16 @@ c0: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
 seeds:
   0:
     networks:
-      - /groups/klannon/cmcgrad2/results/reco_systematics/0_seed/nominal/ctj8/p_one/training.yml
-      - /groups/klannon/cmcgrad2/results/reco_systematics/0_seed/nominal/ctj8/n_one/training.yml
-      - /groups/klannon/cmcgrad2/results/reco_systematics/0_seed/nominal/ctGRe_ctj8/p_one_p_one/training.yml
-    sm: /groups/klannon/cmcgrad2/results/reco_systematics/0_seed/nominal/sm/training.yml
+      - <results>/0_seed/nominal/ctj8/p_one/training.yml
+      - <results>/0_seed/nominal/ctj8/n_one/training.yml
+      - <results>/0_seed/nominal/ctGRe_ctj8/p_one_p_one/training.yml
+    sm: <results>/0_seed/nominal/sm/training.yml
   1:
     networks:
-      - /groups/klannon/cmcgrad2/results/reco_systematics/1_seed/nominal/ctj8/p_one/training.yml
-      - /groups/klannon/cmcgrad2/results/reco_systematics/1_seed/nominal/ctj8/n_one/training.yml
-      - /groups/klannon/cmcgrad2/results/reco_systematics/1_seed/nominal/ctGRe_ctj8/p_one_p_one/training.yml
-    sm: /groups/klannon/cmcgrad2/results/reco_systematics/1_seed/nominal/sm/training.yml
+      - <results>/1_seed/nominal/ctj8/p_one/training.yml
+      - <results>/1_seed/nominal/ctj8/n_one/training.yml
+      - <results>/1_seed/nominal/ctGRe_ctj8/p_one_p_one/training.yml
+    sm: <results>/1_seed/nominal/sm/training.yml
 
 # resources: networks evaluated on the CPU; members processed one at a time (workers > 1: one process and one core
 # per member at once)
@@ -55,4 +56,4 @@ point_search:
 n_top_networks: 5
 
 # output: ensemble cache, ensemble_diagnostics.yml, proposed_points.yml, plots/
-name: /groups/klannon/cmcgrad2/results/examples/validation
+name: <results>/examples/validation

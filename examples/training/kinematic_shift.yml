@@ -3,7 +3,7 @@
 
 # data: the root of a combined sample (nominal/ and the variation directories; holdout: validation.p)
 method: kinematic_shift
-data: /groups/klannon/cmcgrad2/data/reco_systematics_v3/SR_CHANNELS_2j3j_gen
+data: <data_root>
 lumi: [19.52, 16.81, 41.48, 59.83]  # fb^-1 per era
 eras: [2016APV, '2016', '2017', '2018']  # era names for the plots, indexed like lumi
 
@@ -30,9 +30,9 @@ device: cpu
 threads: 1
 
 # plots
-features: /groups/klannon/cmcgrad2/data/reco_systematics_v3/features.yml
+features: examples/features/config.yml
 features_to_animate: [dbjmass, dbjpt, dldbjmass, dldeta, dldphi, dlmass, dlpt, ljopt]
 animate_per_epoch: 5
 
 # output
-name: /groups/klannon/cmcgrad2/results/examples/kinematic_shift_JES_Absolute_up
+name: <results>/examples/kinematic_shift_JES_Absolute_up

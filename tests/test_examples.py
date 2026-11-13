@@ -40,11 +40,9 @@ def test_example_zero_terms():
 
 @pytest.mark.parametrize('name', ['eft', 'weight_shift', 'kinematic_shift'])
 def test_example_training_configs(name):
-    """the training examples pass check_config; their data and features exist where /groups is mounted"""
+    """the training examples pass check_config; their features and zero_terms files are the examples in the repo"""
     config = yaml.safe_load((EXAMPLES / 'training' / f'{name}.yml').read_text())
     check_config(config)
-    if not Path(config['data']).exists():
-        pytest.skip('example data not mounted')
-    assert Path(config['features']).exists()
+    assert (EXAMPLES.parent / config['features']).exists()
     if 'zero_terms' in config:
-        assert Path(config['zero_terms']).exists()
+        assert (EXAMPLES.parent / config['zero_terms']).exists()
