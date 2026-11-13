@@ -6,6 +6,8 @@ The last check of an ensemble before it is used for likelihood scans: whether ev
 python -m topsbi.validation -c <config.yml> [--refit]
 ```
 
+The validation of the nuisance networks and of the learned model with them is in section 10.
+
 The configuration keys are listed in [`examples/validation/README.md`](../examples/validation/README.md). The ensemble it tests, its cache and `--refit` are described in [`ensemble.md`](ensemble.md); notation as there: $a$ a training network (row of $\Theta$), $e$ an ensemble member, $q$ a kept term of $T(\theta)$ (`k` in the code), $\langle \cdot \rangle_e$ the mean over members.
 
 ## 1. What it does and reads
@@ -133,3 +135,107 @@ The settings of a run (thresholds, `n_units`, ...) are those of its config.
 - **Remaining flags after all of this** limit what the ensemble can be trusted for: test their effect on the scan (bias of the scan minimum on Asimov data) before using it.
 
 The bias test can only resolve biases larger than the noise of the validation sample; an unflagged component is consistent with zero bias at that precision, not proven unbiased.
+
+## 10. Nuisance validation
+
+The last check before likelihood scans: whether the nuisance networks close, whether their interpolation in $\nu$ reproduces the true Up and Down variations, whether a network trained at $\theta_{\rm ref}$ still holds at other WC points, and how much each nuisance adds to the error of the learned model the scans use.
+
+```sh
+python -m topsbi.nuisance_validation -c <config.yml> [--refit] [--plots-only]
+```
+
+The configuration keys are listed in [`examples/validation/README.md`](../examples/validation/README.md) (Nuisance validation); the learned model and the nuisance cache are described in [`ensemble.md`](ensemble.md), section 8. Notation as in the sections above, with $n$ a nuisance, $\nu$ its parameter and $\hat f^{\pm}$ the output of its Up and Down networks.
+
+### 10.1 What it reads
+
+- **The EFT validation config** named by `ensemble`: `data`, `c0`, `wcs`, `lumi`, `eras`, `features`, `year_loc` and `bias` are taken from it, so both ensembles see the same events and bins. Its cache `{name}/ensemble/` gives the learned EFT ratio.
+- **The nuisance cache** `{name}/nuisance/`: $\hat f$ of every nuisance network of every member on every event, built with `--refit`. Every network must be trained at $\theta_{\rm ref}$, the point of `c0`; the run stops otherwise. $\theta_{\rm ref}$ is the reference point of the training samples (`reference` in their `sample.yml`: the generation point or the SM).
+- **The targets.** `weight_shift`: the events of `data` with $w^s(\theta_{\rm ref}, \nu) = w^s(\theta_{\rm ref}, 0)\, r(x, z; \theta, \nu)$ (`syst_ratio`). `kinematic_shift`: the shifted events of the variation file in the network's training data, binned by their own $x'$ and matched to the nominal events by event keys.
+
+Each nuisance is tested on the events of its term (the signal, or one background process) in its eras. `--plots-only` redraws `plots/` from the stored results.
+
+### 10.2 Common definitions
+
+**Bins.** The bins $K_b$ of the bias test (section 3), merged further until the events of every term hold `bias.min_neff` effective events in every bin, so the same bins serve every nuisance.
+
+**Bias.** Per test and bin, as in section 3: $\Delta_b = \langle \hat w_b - w_b \rangle_e$, with $\hat w_b$ the learned and $w_b$ the true yield of the tested events; $\mathrm{Var}_{\rm MC}$, in which an event in both the learned and the target sample counts once; and $\mathrm{Var}_{\rm seeds}$ from the members' sums. $Z$ is the statistic of section 3, and a test is flagged when its largest $Z$ over the inputs exceeds `bias.z_threshold`. The era input is not tested for a nuisance of one era, whose events fill one of its bins.
+
+**rms bias.** As in section 3, but relative to $\lambda_{K_b}(\theta, 0)$, the yield of every event (every term, every era) at the point of the test. All tests and nuisances share this normaliser, so their rms biases can be compared with each other and with that of the learned EFT ratio. The stored `rms_bias` is the largest over the inputs. Each input's value is noise-subtracted, which is unbiased only on average; with many inputs the largest picks up their upward fluctuations. Below the flagging threshold, differences of the order of the noise level carry no meaning.
+
+**Kinematic truth.** For a `kinematic_shift` network an event moves between bins when its features are shifted, so its nominal and shifted rows enter different bins and do not cancel in $\mathrm{Var}_{\rm MC}$. Its closure is therefore noisier than that of a `weight_shift` network with the same number of events, whose target is the same events reweighted.
+
+### 10.3 Tests
+
+1. **Closure** (`down`, `up`). Per network, $\hat w_b = \sum_{i \in K_b} w^s_i(\theta_{\rm ref}, 0)\, e^{\hat f(x_i)}$ per member, against the target $w_b$. From the same sums, the misclosure of each member alone,
+   $m_e = \sqrt{\langle \max(\Delta_{e,b}^2 - \mathrm{Var}_{\rm MC},\ 0) / \lambda_{K_b}^2 \rangle_b}$ over the bins of every tested input, combined as $m_a = \sqrt{\langle m_e^2 \rangle_e}$; and $m$, the same for the ensemble mean. $\mathrm{Var}_{\rm seeds}$ is not subtracted here: $m_a / m$ is about $\sqrt{n_e}$ when the members' errors are independent training noise that the average cancels, and about 1 when the members share one bias. `shift_size`, the rms of the true shift $(w_b(\pm 1) - w_b(0)) / \lambda_{K_b}$ over the same bins, sets the scale.
+2. **Parts of the interpolation** (`fit_symmetry`, `fit_slope`). Combine interpolates a shape variation from $\delta^{\pm} = \hat f^{\pm}$: for $\lvert\nu\rvert \le 1$,
+   $$\log \hat r(x; \nu) = \nu\, \hat f^{\rm slope} + h(\nu)\, \hat f^{\rm sym}, \qquad \hat f^{\rm slope} = \tfrac{1}{2}(\hat f^{+} - \hat f^{-}),\quad \hat f^{\rm sym} = \tfrac{1}{2}(\hat f^{+} + \hat f^{-}),\quad h(\nu) = \tfrac{1}{8}(15\nu^2 - 10\nu^4 + 3\nu^6),$$
+   and linearly beyond. Each part is tested by its own closure, $\Delta^{\rm slope}_b = \tfrac{1}{2}(\Delta^{+}_b - \Delta^{-}_b)$ against the true $\tfrac{1}{2}(w^{+}_b - w^{-}_b)$, and $\Delta^{\rm sym}_b = \tfrac{1}{2}(\Delta^{+}_b + \Delta^{-}_b)$ against $\tfrac{1}{2}(w^{+}_b + w^{-}_b) - w^0_b$. A spurious $\hat f^{\rm sym}$ shows up in the second.
+3. **Yield against $\nu$.** $\hat\kappa(\nu) = \hat\lambda(\nu) / \lambda(0)$ on the tested events, the weighted mean of $e^{\log \hat r(x; \nu)}$ with $\langle \hat f \rangle_e$, against the true $\kappa(\pm 1)$. $\kappa(\pm 1)$ are the Up and Down values a lnN uncertainty would carry. The truth exists only at $\nu = -1, 0, +1$; between them the interpolation follows Combine's convention, and its effect on a fit is seen in the likelihood scans.
+4. **Factorisation** (`factorisation.<label>`), at the points of `factorisation.points` (default $\theta_{\rm SM}$). The events are reweighted from $\theta_{\rm ref}$ to $\theta$ by $\rho_i(\theta) = s(z_i) \cdot T(\theta) / s(z_i) \cdot T(\theta_{\rm ref})$, the target by the same factor, and the network trained at $\theta_{\rm ref}$ is closed again. This tests $r(x; \theta, \nu) / r(x; \theta, 0) \approx \hat r(x; \theta_{\rm ref}, \nu)$, the factorisation the learned model assumes. Only the signal `weight_shift` networks are tested: the variation files of `kinematic_shift` have no structure constants, and $\rho = 1$ on background events. If $\theta_{\rm ref} = \theta_{\rm SM}$, the default point repeats the closure; set other points.
+5. **Combined** (`combined.<label>`). The learned model of the scans at each point and $\nu = \pm 1$, on the events of every term in the nuisance's eras: the nuisance multiplies the term of the learned EFT ratio it belongs to, the other terms enter unchanged, $\hat w = w^s(\theta_0, 0) \left[\hat r_{\rm term}(x; \theta)\, e^{\hat f} + \sum_{\rm other} \hat r_{\rm other}(x; \theta)\right]$, against $w^s(\theta, \nu)$. Its baseline is the learned EFT ratio alone at $\nu = 0$ on the same events (`eft_matched`), so `rms_bias_change` is what the nuisance adds to the error of the learned EFT ratio. `eft_only` is the learned EFT ratio alone on every event. Tested for the `weight_shift` networks.
+
+### 10.4 Possible problems (`nuisance_problems.yml`)
+
+Flags measure significance, which grows with the number of events. The possible problems measure size: each compares a misclosure with the shift it describes or with the error of the learned EFT ratio. Thresholds are tolerances set in `problems`, not derived values.
+
+| Criterion | Value | Default |
+|---|---|---|
+| `not_learned` | $m$ / `shift_size`: the error of the ensemble mean as a fraction of the shift it learns | 0.8 |
+| `closure_size` | closure `rms_bias` / `rms_bias` of the learned EFT ratio alone at $\theta_{\rm SM}$ (needs the point `sm`) | 1.0 |
+| `yield_mismatch` | rate closure $\lvert\hat\kappa - \kappa\rvert$ at $\nu = \pm 1$ in units of $\sqrt{\mathrm{Var}_{\rm MC} + \mathrm{Var}_{\rm seeds}}$ of the rate, counted only when $\lvert\hat\kappa - \kappa\rvert$ exceeds `yield_fraction` times $\lvert\kappa - 1\rvert$ | `yield_n_sigma` 3.0, `yield_fraction` 0.2 |
+| `factorisation` | factorisation `rms_bias` / `rms_bias` of the learned EFT ratio alone at that point | 1.0 |
+| `combined_excess` | combined `rms_bias_change` / its baseline | 0.5 |
+
+The rate closure sums every tested event in one bin, so its $\mathrm{Var}_{\rm MC}$ keeps the events that move between bins. Each problem has `nuisance`, `test` (the direction, or `<test>/<point>/<direction>`), `criterion`, `value`, `threshold` and `severity` = value / threshold; the file lists them largest severity first, with the thresholds used.
+
+### 10.5 Outputs
+
+#### `nuisance_diagnostics.yml`
+
+| Key | Measures |
+|---|---|
+| `nuisance.path`, `created`, `seeds`, `theta_ref`, `ensemble` | the nuisance cache used, its reference point and the EFT cache |
+| `binning.<input>` | number of bins $K_b$ of each input |
+| `flagged` | network-directions whose closure is flagged, largest $Z$ first, named as their closure plots |
+| `factorisation_points` | labels of the factorisation points |
+| `eft_only.<label>` | the learned EFT ratio alone at that point: `flagged`, `max_Z`, `worst_feature`, `rms_bias`, `Z` |
+| `nuisances.<n>.method`, `term`, `eras` | the nuisance |
+| `nuisances.<n>.<direction>` | closure: `flagged`, `max_Z`, `worst_feature`, `rms_bias`, `Z` per input; `misclosure` ($m_a$), `member_misclosure` ($m_e$), `mean_misclosure` ($m$), `shift_size`, `members_flagged` (members whose own closure is flagged) |
+| `nuisances.<n>.fit_symmetry`, `fit_slope` | closure of each part, keys as the closure |
+| `nuisances.<n>.factorisation.<label>.<direction>` | factorisation test, keys as the closure, and `rms_bias_change` from the closure; null for the nuisances not tested |
+| `nuisances.<n>.combined.<label>.<direction>` | combined test, keys as the closure, with `baseline` (`eft_only`), `baseline_rms_bias` and `rms_bias_change`; null for the nuisances not tested |
+
+#### `nuisance_sums.npz`
+
+The per-bin arrays behind the diagnostics, for redrawing plots or further checks: `nuisances` and `methods` (network tests have row $k = 2n + d$, $d$ = 0 Down, 1 Up); `binning/names`, `binning/feature`, `binning/discrete`, `binning/edges/<input>`; per test (`closure`, `fit_symmetry`, `fit_slope`, `factorisation/<label>`, `combined/<label>`, `eft_only/<label>`, `eft_matched/<label>`) the [rows, bins] arrays `D` ($\Delta$), `s2` ($\mathrm{Var}_{\rm seeds}$), `mc_var` ($\mathrm{Var}_{\rm MC}$), `truth` ($w_b$), `sm_yield` ($\lambda_{K_b}(\theta, 0)$), `nominal` ($w_b(0)$ of the tested events), `shift_var` and `learned_shift_var` (the MC variances of the true and the learned shift); for `closure`, `factorisation/<label>` and `combined/<label>` also the [rows] arrays `rate_mc_var` and `rate_s2` of the rate closure; and `interpolation/nu`, `interpolation/yield` ($\hat\kappa(\nu)$ per nuisance).
+
+### 10.6 Plots (`plots/`)
+
+Nuisances are ordered by method, then by name.
+
+| File | Shows | Look for |
+|---|---|---|
+| `z_heatmap_full.png`, `z_heatmap_compact.png` | $Z$ of every network (Down beside Up, grouped by method) in every input; outlined above the threshold, hatched where not tested. Compact: the flagged networks and the next 10 | inputs or networks with many outlined cells |
+| `z_heatmap_parts_full.png`, `z_heatmap_parts_compact.png` | the same for $\hat f^{\rm slope}$ and $\hat f^{\rm sym}$ | a part flagged where the networks are not |
+| `size_vs_significance_networks.png`, `_slope.png`, `_symmetry.png` | rms bias against largest $Z$ per test, by method, with the threshold and the rms bias of the learned EFT ratio at $\theta_{\rm SM}$ | flagged tests with a large rms bias; flagged but tiny is real and negligible |
+| `network_misclosure.png` | $m$ of every network against its `shift_size`, with each member's $m_e$ and their range; flagged networks edged; the line $m$ = shift | networks near or above the line; the large marker near the top of its range (a bias the members share) |
+| `closure/{flagged,passed}/<n>_<direction>.png` | one network in its worst input: learned and true shift per bin, and $\Delta_b / \lambda_{K_b}$ with the noise band | where the misclosure sits, shape or normalisation |
+| `closure_parts/{flagged,passed}/<n>_<part>.png` | the same for each part | a symmetric part the truth does not have |
+| `interpolation_yield/<n>.png` | $\hat\kappa(\nu) - 1$ from the interpolation, with the true values at $\nu = -1, 0, +1$ and their MC noise | the curve missing a true point |
+| `yield_summary_<method>.png` | per nuisance, the true and learned $\kappa - 1$ at $\nu = \pm 1$ (left) and the pull of the rate closure with a band at $\pm$`yield_n_sigma` (right); `yield_mismatch` problems in red | pulls outside the band on large shifts |
+| `factorisation_<label>.png` | rms bias of each signal `weight_shift` network at $\theta_{\rm ref}$ (open) and at the point (filled); `factorisation` problems ringed; dashed line at the threshold times the rms bias of the learned EFT ratio at the point | long arrows to the right, filled markers past the line |
+| `eft_combined_<label>.png` | rms bias of the learned EFT ratio alone (open) and of the learned model with the nuisance (filled), on the events of each test; `combined_excess` problems ringed; ticks at (1 + threshold) times the baseline | filled markers past their ticks |
+
+In `factorisation_<label>.png`, $\hat r(x; \theta, \nu)$ is the nuisance ratio relative to $(\theta, 0)$; in `eft_combined_<label>.png`, it is the learned model relative to $\theta_0$. The open markers of `eft_combined_<label>.png` differ between nuisances because each baseline uses only the events of the nuisance's eras.
+
+### 10.7 Reading the results
+
+- **Nothing flagged and no possible problems.** The nuisance networks and their interpolation close within the noise of the validation sample, and the learned model holds at the tested points.
+- **Flagged, but no possible problem.** A real misclosure that is small compared with the shift and with the error of the learned EFT ratio; it can usually be accepted.
+- **`not_learned` or a large closure.** The network has not learned its shift: check its training plots ([`training.md`](training.md)); for a large ratio $m_a / m$ more members help, for a ratio near 1 they do not.
+- **`yield_mismatch`.** The normalisation of the shift is wrong: compare with `yield_summary_<method>.png` and the closure of the parts.
+- **`factorisation` or `combined_excess`.** The nuisance does not factorise from the WC dependence at that point: its shift depends on how the event mix changes with $\theta$. The model of the scans is then off by more than the learned EFT ratio's own error; test the effect on the scans (or model the nuisance differently) before using it.
+- **A part flagged where the networks are not.** The parts combine the Up and Down misclosures: errors the two networks share add in the symmetric part and cancel in the slope, and the noise of the combination is smaller when the two samples share events. A flagged symmetric part is a spurious $\hat f^{\rm sym}$, which bends the interpolation inside $\lvert\nu\rvert < 1$.
+
+The tests resolve misclosures larger than the noise of the validation sample; an unflagged nuisance is consistent with closure at that precision, not proven exact.
