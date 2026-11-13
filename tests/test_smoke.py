@@ -350,6 +350,30 @@ def test_kinematic_shift_merged_eras(nuisance_config):
         load_nuisance_data({**kinematic, 'systematic': ['JER_2017', 'JER_2017']})
 
 
+
+def test_kinematic_shift_moved_era_column(nuisance_config):
+    """The train / test split and the event matching follow year_loc: moving the era column changes nothing."""
+    from topsbi.tools.data import load_nuisance_data
+
+    config = {**nuisance_config, 'method': 'kinematic_shift', 'systematic': 'JES_X'}
+    reference = load_nuisance_data(config)
+
+    # swap the era (column 21) with feature 0, which the variation shifts, in nominal and in the variation
+    root = nuisance_config['data']
+    for directory in ('nominal', 'JES_XUp'):
+        for split in ('train', 'validation'):
+            tensors = list(torch.load(f'{root}/{directory}/{split}.p', weights_only=False).tensors)
+            tensors[0] = tensors[0][:, [21, *range(1, 21), 0, *range(22, tensors[0].shape[1])]]
+            torch.save(torch.utils.data.TensorDataset(*tensors), f'{root}/{directory}/{split}.p')
+    moved = load_nuisance_data({**config, 'year_loc': 0})
+
+    for key, split in reference.items():
+        for sample in ('nominal', 'shifted'):
+            x, w, i = split[sample]
+            x_moved, w_moved, i_moved = moved[key][sample]
+            assert torch.equal(x_moved[:, 0], x[:, 21]) and torch.equal(w_moved, w) and torch.equal(i_moved, i)
+
+
 @pytest.mark.parametrize('systematic', [[], ['JER_2017', 'JER_2017'], ['JER_2017', 3], 5])
 def test_check_config_systematic(nuisance_config, systematic):
     """'systematic' is a name or a non-empty list of distinct names."""

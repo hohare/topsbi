@@ -403,7 +403,8 @@ def kinematic_shift_sample(nominal: list, shifted: list, config: dict):
     x = dict(zip(NUISANCE_COLUMNS['nominal'], nominal))['features']
     x_shift = dict(zip(NUISANCE_COLUMNS['variation'], shifted))['features']
     w0, w1 = sample_weight(nominal, 'nominal', config), sample_weight(shifted, 'variation', config)
-    i0, i1 = matched_events(event_keys(nominal, 'nominal'), event_keys(shifted, 'variation'))
+    year_loc = config.get('year_loc', 21)
+    i0, i1 = matched_events(event_keys(nominal, 'nominal', year_loc), event_keys(shifted, 'variation', year_loc))
     labels = torch.cat([torch.zeros_like(w0), torch.ones_like(w1)])
     return {
         'rows': (torch.cat([x, x_shift]), torch.cat([w0, w1]), labels),
@@ -557,8 +558,8 @@ def load_nuisance_data(config: dict):
             out['holdout'] = build(nominal, shifted)
             continue
         # split on the CPU (event_split hashes numpy arrays), then move to the device
-        test_nominal = event_split(nominal, 'nominal', seed)
-        test_shifted = None if shifted is None else event_split(shifted, 'variation', seed)
+        test_nominal = event_split(nominal, 'nominal', seed, year_loc=year_loc)
+        test_shifted = None if shifted is None else event_split(shifted, 'variation', seed, year_loc=year_loc)
         if not test_nominal.any() or (test_shifted is not None and not test_shifted.any()):
             raise ValueError(f'empty test split in {root}: too few events for early stopping')
         if shifted is None:

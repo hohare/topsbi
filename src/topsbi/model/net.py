@@ -2,7 +2,7 @@ import torch
 
 ACTIVATIONS = {'LeakyReLU': torch.nn.LeakyReLU, 'Sigmoid': torch.nn.Sigmoid, 'None': None}
 
-# architecture of the current reco_regrouped results, used when the config gives no network
+# default architecture, used when the config gives no network
 DEFAULT_NETWORK = [
     {'type': 'Linear', 'out': 128, 'activation': 'LeakyReLU'},
     {'type': 'Linear', 'in': 128, 'out': 128, 'activation': 'LeakyReLU'},
