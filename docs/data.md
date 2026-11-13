@@ -69,14 +69,15 @@ Tensor order in `train.p` and `validation.p`:
 
 - **`event_id`**, [$n_{\rm events}$, $n_{\rm id}$] integer, any $n_{\rm id}$: the identity of each event. It must be unique within a file and the same for
   the same event in nominal and in every variation: it drives the train / test split (`event_split`) and the
-  matching of nominal and varied events in the kinematic_shift metrics. The event key also includes column 2 of the
-  third tensor.
+  matching of nominal and varied events in the kinematic_shift metrics. The event key is the era (`year_loc`), column 2
+  of the third tensor and every `event_id` column.
 - **`syst_ratio`**, [$n_{\rm events}$, $n_{\rm systematics}$, 2] float: $w(\theta, \nu) / w(\theta, 0)$ of each of
   $n_{\rm systematics}$ weight systematics, in the order of
   `systematics.yml`; the last axis holds the directions. Only weight_shift reads it.
 - **`w_ref`**, [$n_{\rm events}$, 1] float: the event weight at one fixed reference point, normalised as `coefs`; nominal and the
   variations use the same point.
-- The third tensor is otherwise not read; any [$n_{\rm events}$, ...] tensor.
+- The third tensor, [$n_{\rm events}$, ≥ 3] integer, is read only for its column 2, part of the event key (e.g. the
+  index of the sample an event comes from, when event numbers can repeat between samples).
 
 **Split.** `validation.p` (the holdout) must be disjoint from `train.p` and split by event identity, so every event
 is on the same side in nominal and in every variation. topsbi splits `train.p` into train and test itself, with a
@@ -94,7 +95,8 @@ can tell which era's variation applies.
 **`sample.yml`** ([nominal](../examples/data/nominal/sample.yml), [variation](../examples/data/JES_AbsoluteUp/sample.yml)): marks a directory as combined data (needed for eft on combined data). When nominal and a variation
 both have one, their `reference` (the reference point of `w_ref`) and `salt_split` (the salt of the train /
 validation split) must agree. `eft: false` marks a background sample, and `process` (required then) names its
-process. Other keys are free.
+process. `reference_point`, the point of `w_ref` with the SM entry first, is read from the signal's nominal
+`sample.yml` by background trainings (written to `performance.yml`) and by the nuisance cache. Other keys are free.
 
 ## 3. Settings tied to the data layout
 
@@ -111,7 +113,9 @@ process. Other keys are free.
 Checked when loading: the number of tensors in each file, `reference` and `salt_split` between nominal and a
 variation, the eras of a variation's `train.p` and `validation.p`, a non-empty test split, the era and closure-group
 columns against the number of features, the width of `coefs` against `wcs` and `background_processes` (when
-either `zero_terms` or `background_processes` is set), the number of values in `c0` and `c1` (training config), and (validation) `lumi` covering every era index. Not checked: that
+either `zero_terms` or `background_processes` is set), the number of values in `c0` and `c1` (training config),
+the names in `systematic` (in `systematics.yml` for weight_shift, distinct) and, for a list, that no event is shifted
+by two of them (weight_shift) and that their variations cover disjoint eras (kinematic_shift), and (validation) `lumi` covering every era index. Not checked: that
 `event_id` is unique and that `validation.p` was split by event identity.
 
 ## 5. One way to produce it

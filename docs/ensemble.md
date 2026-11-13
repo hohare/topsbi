@@ -12,10 +12,10 @@ The configuration keys are listed in [`examples/validation/README.md`](../exampl
 
 The ensemble consists of members $e$, each a complete set of networks trained with one seed. Every network $a$ of a member is trained at its own point $\theta_1^{(a)}$ against the same reference $\theta_0$ (config `c0`) and returns $\hat r(x; \theta_1^{(a)})$. Since the true ratio is quadratic in $\theta$, $r(x; \theta) = T(\theta)\, \Gamma(x)$ with $T(\theta)$ the expansion of $(1, \theta)$ into its constant, linear, quadratic and cross terms (`get_lower_tri`), the per-event coefficients follow from all networks of the member at once. For each member $e$ (`RatioFit`):
 
-1. **Evaluate.** Every network, and the SM network ($\theta = 0$) last, is evaluated on the $N$ events of `data`, giving $R$ with row $a$ equal to $\hat r(x; \theta_1^{(a)})$ ([$n_a$, $N$]).
+1. **Evaluate.** Every network, and the SM network ($\theta_{\rm SM}$, every background strength $\mu_p = 1$) last, is evaluated on the $N$ events of `data`, giving $R$ with row $a$ equal to $\hat r(x; \theta_1^{(a)})$ ([$n_a$, $N$]).
 2. **Expand.** Row $a$ of $\Theta$ is $T(\theta_1^{(a)})$, restricted to the kept terms: a term is dropped if it is zero for every network, or listed in the networks' `zero_terms` (terms that vanish by construction). The kept terms are indexed by $q$ (`mask`, $K$ terms).
 3. **Keep finite events.** An event is kept if every network's $\hat r$ is finite there (a probability network gives $\hat r = \infty$ where $\hat s = 1$).
-4. **Solve.** $\Theta \hat\Gamma_e = R$ in least squares on the kept events (`torch.linalg.lstsq`, driver `gelsd`), giving $\hat\Gamma_e$ ([$K$, $N_e$]), the rank of $\Theta$ and, when $\Theta$ has full column rank and more rows than columns, the residual $\sum_a (\Theta \hat\Gamma_e - R)^2_{a,i}$ per event.
+4. **Solve.** $\hat\Gamma_e = \Theta^+ R$ on the kept events, the least-squares solution of $\Theta \hat\Gamma_e = R$ ($\Theta^+$ the pseudo-inverse, in float64, applied to blocks of events; `fit_gamma`), giving $\hat\Gamma_e$ ([$K$, $N_e$]), the rank of $\Theta$ and the residual $\sum_a (\Theta \hat\Gamma_e - R)^2_{a,i}$ per event.
 
 The members are then averaged (`Ensemble`) on the events every member keeps, $\langle \hat\Gamma \rangle_e$, and the learned ratio at any point is
 
@@ -23,7 +23,7 @@ $$\hat r(x; \theta) = T(\theta)[\text{mask}]\, \langle \hat\Gamma \rangle_e .$$
 
 All members must be trained at the same set of points; a member with a different `mask` stops the fit. A member needs at least as many networks as kept terms, $n_a \ge K$, for $\Theta$ to have full column rank.
 
-**Background columns and network groups.** With background processes ([`data.md`](data.md), section 1), row $a$ of $\Theta$ is $T(\theta_1^{(a)}, \mu^{(a)})$ and $\hat\Gamma$ has one more row per process, so $\hat r(x; \theta, \mu) = T(\theta, \mu)[\text{mask}]\, \langle \hat\Gamma \rangle_e$. A background column needs a network whose point weights that background differently from the signal. The strengths can stay at $\mu_p = 1$ in every network: a network trained at the point with the signal removed (first entry 0, every WC 0, $\mu_p = 1$: the background alone) against $\theta_0$ determines the background column, together with the SM network. A network at $\mu_p \neq 1$ would also do. A member's `networks` can be given as groups, `{group: [training configs]}`. With `background_fit: <group>`, the background columns are fitted from that group's networks and the SM network alone, and the other columns from every network with the background term subtracted, so the networks of the other groups do not pull the background columns.
+**Background columns and network groups.** With background processes ([`data.md`](data.md), section 1), row $a$ of $\Theta$ is $T(\theta_1^{(a)}, \mu^{(a)})$ and $\hat\Gamma$ has one more row per process, so $\hat r(x; \theta, \mu) = T(\theta, \mu)[\text{mask}]\, \langle \hat\Gamma \rangle_e$. A background column needs a network whose point weights that background differently from the signal. The strengths can stay at $\mu_p = 1$ in every network: a network trained at the point with the signal removed (first entry 0, every WC 0, $\mu_p = 1$: the background alone) against $\theta_0$ determines the background column, together with the SM network. A network at $\mu_p \neq 1$ would also do. If no network moves a strength away from $\mu_p = 1$, that column is not kept: the SM column holds the background, and the ratio is available only at $\mu_p = 1$. A member's `networks` can be given as groups, `{group: [training configs]}`. With `background_fit: <group>`, the background columns are fitted from that group's networks and the SM network alone, and the other columns from every network with the background term subtracted, so the networks of the other groups do not pull the background columns.
 
 ## 2. What it reads
 
@@ -31,9 +31,10 @@ From the validation config:
 
 | Key | Used for |
 |---|---|
-| `seeds.<e>.networks`, `seeds.<e>.sm` | the training configs of member $e$'s networks and its SM network; each network's `c1` gives its row of $\Theta$, its `name` the directory with `model.pt` and `complete/performance.yml` |
+| `seeds.<e>.networks`, `seeds.<e>.sm` | the training configs of member $e$'s networks (a list, or groups `{group: [...]}`) and of its SM network; each network's `c1` gives its row of $\Theta$, its `name` the directory with `model.pt` and `complete/performance.yml`. Without `sm` every network must be trained against $\theta_0 = \theta_{\rm SM}$, and the SM row of $R$ is exactly 1 |
 | `data` | the events the networks are evaluated on; use events that no network was trained on |
 | `c0`, `wcs` | the reference point and the WC order of $T(\theta)$ (every network must use the same `wcs` and `zero_terms`) |
+| `background_fit` | optional: the group of `networks` whose networks, with the SM network, alone determine the background columns (section 1) |
 | `device` | where the networks are evaluated (default `cpu`). The `device` in each training config is ignored, so networks trained on a GPU can be evaluated on a machine without one |
 | `workers` | members fitted at once, one single-threaded process each (default 1) |
 
@@ -46,7 +47,7 @@ The members are independent, so with `workers` > 1 they are fitted in parallel, 
 What a run needs depends on the number of members $n_e$, networks per member $n_a$ and events $N$:
 
 - **Disk.** The cache holds $R$ and $\hat\Gamma$ of every member in float32: about $n_e (n_a + K)\, N \times 4$ bytes, almost all of it $R$.
-- **Memory.** A member's fit holds its $R$ ($n_a N \times 4$ bytes) and the working copies of the least-squares solve, about 3–5 times the size of $R$ in total. With `workers` > 1 that is per worker, so the peak is roughly `workers` times it, plus the main process (the data and the averages, a small multiple of $N K \times 8$ bytes). The later validation steps read the cache memory-mapped.
+- **Memory.** A member's fit holds its $R$ ($n_a N \times 4$ bytes), its $\hat\Gamma$ ($K N \times 4$ bytes) and one block of events of $R$ in float64 at a time. With `workers` > 1 that is per worker, so the peak is roughly `workers` times it, plus the main process (the data and the averages, a small multiple of $N K \times 8$ bytes). The later validation steps read the cache memory-mapped.
 - **Time.** Dominated by evaluating every network on every event, proportional to $n_e n_a N$ and to the network size; divided by up to `workers` when members run in parallel.
 
 Choose `workers` so that its memory fits the machine and the machine has that many free cores. Several workers on a shared interactive machine compete with other users; run them through a batch system with `workers` cores requested.
@@ -58,14 +59,14 @@ Each member's files are written as soon as the member is fitted, so only one mem
 | File / key | Content | Symbol | Shape |
 |---|---|---|---|
 | `gamma_cache.npy` | mean coefficients on the events every member keeps | $\langle \hat\Gamma \rangle_e$ | [$K$, $N_{\rm finite}$] float32 |
-| `mask_cache.npy` | kept terms of $T(\theta)$ | range of $q$ | [$n_q$] bool |
+| `mask_cache.npy` | kept terms of $T(\theta, \mu)$ ($n_p$ background processes) | range of $q$ | [$n_q + n_p$] bool |
 | `filter_cache.npy` | events kept by every member | | [$N$] bool |
 | `seed_<e>/gammas.npy` | member $e$'s coefficients on its own kept events | $\hat\Gamma_e$ | [$K$, $N_e$] float32 |
 | `seed_<e>/filter.npy` | member $e$'s kept events | | [$N$] bool |
-| `seed_<e>/residuals.npy` | least-squares residual per event (only with more networks than terms and full column rank) | | [$N_e$] float32 |
+| `seed_<e>/residuals.npy` | least-squares residual per event | | [$N_e$] float32 |
 | `seed_<e>/ratios.npy` | every network's $\hat r$ for every event, row $a$, SM last; `inf` where a network diverged | $R$ | [$n_a$, $N$] float32 |
-| `seed_<e>/network.npz`: `Theta`, `networks` | the expanded training points (row $a$, SM last) and the network names (relative to the member's results directory) | $\Theta$, $a$ | [$n_a$, $K$], [$n_a$] |
-| `ensemble.yml`: `data`, `c0`, `wcs`, `lumi`, `seeds` | the inputs the cache was fitted from | $\theta_0$, $L$ | |
+| `seed_<e>/network.npz`: `Theta`, `networks`, `background_rows` | the expanded training points (row $a$, SM last); the network names (relative to the common directory of the member's networks, or `<group>:` followed by the path relative to that group's common directory); with `background_fit`, the rows that alone determine the background columns | $\Theta$, $a$ | [$n_a$, $K$], [$n_a$], [$n_a$] bool |
+| `ensemble.yml`: `data`, `c0`, `wcs`, `background_processes`, `lumi`, `seeds` | the inputs the cache was fitted from | $\theta_0$, $L$ | |
 | `ensemble.yml`: `model_hash` | sha256 of every network's `model.pt`, per member in `seeds` order, SM last | | |
 | `ensemble.yml`: `rank` | rank of each member's $\Theta$ | $\mathrm{rank}(\Theta_e)$ | |
 | `ensemble.yml`: `created` | when the cache was written | | |
@@ -88,15 +89,15 @@ Whether the ensemble is unbiased is tested by validation, term by term ([`valida
 from topsbi.tools.ensembleCache import EnsembleCache
 
 cache = EnsembleCache('<name>/ensemble')  # memory-maps the large arrays (mmap=False loads them)
-r_hat = cache([1.0, *theta])  # r_hat(x; theta) on the events of cache.finite, float64
+r_hat = cache([1.0, *theta, *mu])  # r_hat(x; theta, mu) on the events of cache.finite, float64; mu one strength per process in cache.background_processes (none without backgrounds)
 cache.Gamma, cache.mask, cache.finite  # <Gamma>_e, kept terms, kept events
 cache.seed_Gamma[e], cache.seed_finite[e]  # member e
-cache.network(e)  # {'Theta': ..., 'networks': [...]}
+cache.network(e)  # {'Theta': ..., 'networks': [...]}, plus 'background_rows' with background_fit
 cache.seed_R(e)  # R of member e, memory-mapped
 cache.matches(config)  # False if the cache is stale for this config
 ```
 
-A likelihood scan needs only `gamma_cache.npy`, `mask_cache.npy` and `filter_cache.npy`.
+A likelihood scan needs only `gamma_cache.npy`, `mask_cache.npy`, `filter_cache.npy` and `ensemble.yml` (the WCs and background processes).
 
 ## 7. Background caches
 

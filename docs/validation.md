@@ -22,11 +22,11 @@ Besides the ensemble it reads `data` (the events the ensemble is evaluated on; t
 
 ## 2. Running it
 
-Without `--refit` the cache must exist and match the config ([`ensemble.md`](ensemble.md), section 3). The steps after the fit read it memory-mapped. `workers` (default 1) also runs the per-member steps in parallel, one process per member: the binned sums of every network (section 4), and the refits of the drop tests (section 5). Their memory per worker is of the order of one member's $R$ in float64; the needs of the fit itself are given in [`ensemble.md`](ensemble.md). The bias test, the attribution and the point search are fast compared with the fit.
+Without `--refit` the cache must exist and match the config ([`ensemble.md`](ensemble.md), section 3). The steps after the fit read it memory-mapped. `workers` (default 1) also runs the per-member steps in parallel, one process per member: the binned sums of every network (section 4), and the refits of the drop tests (section 5). Each worker reads its member's $R$ memory-mapped, a block of networks or events at a time in float64, and a refit holds the member's new $\hat\Gamma$; the needs of the fit itself are given in [`ensemble.md`](ensemble.md). The bias test, the attribution and the point search are fast compared with the fit.
 
 ## 3. Bias test
 
-**Binning.** Each network input $f$ is divided into `bias.n_bins` equal-count bins (one bin per value for a discrete input), and neighbouring bins are merged until each holds `bias.min_neff` effective events, $n_{\rm eff} = (\sum w)^2 / \sum w^2$ with $w = w^s(\theta_0)$. These are the bins $K_b$, $b \in B_f$.
+**Binning.** Each network input $f$ is divided into `bias.n_bins` equal-count bins (one bin per value for a discrete input), and neighbouring bins are merged until each holds `bias.min_neff` effective events, $N_{\rm eff} = (\sum w)^2 / \sum w^2$ with $w = w^s(\theta_0)$. These are the bins $K_b$, $b \in B_f$.
 
 **Bias.** For component $q$ the true per-event contribution is $w_{q,i} = L\, s_q(z_i) \times 1000$ and the learned one $\hat w_{q,i} = w^s_i(\theta_0)\, \hat\gamma_{q,i}$. Per bin:
 
@@ -70,12 +70,12 @@ With the misclosures as independent network errors, the propagated covariance of
 
 $$\mathrm{Cov}(\hat\gamma) = H^+ \Theta^T \mathrm{diag}(m_a^2)\, \Theta\, H^+, \qquad H = \Theta^T \Theta,$$
 
-and $\sqrt{\mathrm{Var}(\hat\gamma_q)}$ its diagonal (`sigma_propagated`). Components outside the range of $\Theta$ (a part of their direction in its null space) cannot be determined by the design; they are marked `constrained: false` and get no uncertainty.
+and $\sqrt{\mathrm{Var}(\hat\gamma_q)}$ its diagonal (`sigma_propagated`). Components outside the range of $\Theta$ (a part of their direction in its null space) cannot be determined by the design; they are marked `constrained: false` and get no uncertainty. With `background_fit`, the background columns come from their own rows: their covariance is $\Theta^-_{\rm bg}\, \mathrm{diag}(m_a^2)\, \Theta^{-T}_{\rm bg}$ ($\Theta^-_{\rm bg}$ the background rows of $\Theta^-$), new points join only the fit of the other columns, and their covariance follows from the least squares with the background term subtracted.
 
 The search adds candidate units one at a time, each time the one that most lowers the objective $\mathrm{tr}(\mathrm{Cov}(\hat\gamma)\, G)$, and stops after `point_search.n_units` units or when a step lowers it by less than the fraction `point_search.min_gain`.
 
 - **Weights.** `G: flagged` (default): $G = \mathrm{diag}(g_q / \mathrm{Var}(\hat\gamma_q))$ with the variance of the current design, $g_q = 1$ for flagged components and `unflagged_weight` for the others, so the objective is the $g$-weighted sum of relative variance reductions. `G: scan`: $G = \langle T(\theta) T(\theta)^T \rangle$ over a scan region (`bounds` per WC, `mode` box or 1d, `shape` uniform or gaussian), the uncertainty of $\hat r$ averaged over the region.
-- **Candidates.** For every cross term $\theta_i \theta_j$, units of the four points $(\pm\theta_i, \pm\theta_j)$ built from the existing single-WC training values, with the misclosure of the worse of the two source networks assumed for the new networks. Units whose points all exist, or with a point whose inclusive yield relative to the SM exceeds `max_yield_ratio` (default: the largest of the existing points), are left out.
+- **Candidates.** For every cross term $\theta_i \theta_j$, units of the four points $(\pm\theta_i, \pm\theta_j)$ for every pair of single-WC magnitude levels of the two WCs (a level pairs the same-rank positive and negative existing training values), with the misclosure of the worse of the two source networks assumed for the new networks; every background strength of a new point is 1. Units whose points all exist, or with a point whose inclusive yield relative to the SM exceeds `max_yield_ratio` (default: the largest of the existing points), are left out.
 
 The dropped networks leave the design before the search. `sigma_after_search` is the propagated uncertainty with the chosen units added. The search assumes the new networks close as well as existing ones; it cannot fix a bias that every network shares.
 
@@ -89,7 +89,7 @@ The dropped networks leave the design before the search. `sigma_after_search` is
 | `ensemble.residual_outliers` | members whose median fit residual is more than 3 times the typical one | empty |
 | `binning.<input>` | number of bins $K_b$ of each input after merging | |
 | `flagged` | components with largest $Z$ above `bias.z_threshold`, largest first | empty |
-| `attribution_identity` | max $\lvert$ rebuilt $-\ \Delta \rvert$ / max $\lvert \Delta \rvert$ (section 4) | float32 rounding, about $10^{-3}$ |
+| `attribution_identity` | max $\lvert$ rebuilt $-\ \Delta \rvert$ / max $\lvert \Delta \rvert$ (section 4) | rounding level, far below $10^{-3}$ |
 | `components.<q>.kind` | `sm`, `linear`, `quadratic` or `cross` | |
 | `components.<q>.Z`, `max_Z`, `worst_feature` | $Z_{q,f}$ per input, its largest value and that input | $\lvert Z \rvert$ of a few at most, below the threshold |
 | `components.<q>.rms_bias` | the largest rms bias over the inputs | small compared with the precision the analysis needs |
@@ -111,7 +111,7 @@ The settings of a run (thresholds, `n_units`, ...) are those of its config.
 
 ### `proposed_points.yml`
 
-`wcs` (the WC order) and `points`, each with `name`, `kind` (`cross`) and `theta` (SM-inclusive, first entry 1): the new training points, ready to be turned into training configs.
+`wcs` (the WC order), `background_processes` and `points`, each with `name`, `kind` (`cross`) and `theta` (SM-inclusive, first entry 1, followed by the background strengths, all 1): the new training points, ready to be turned into training configs.
 
 ## 8. Plots (`plots/`)
 
@@ -122,7 +122,7 @@ The settings of a run (thresholds, `n_units`, ...) are those of its config.
 | `closure/flagged/<q>.png`, `closure/passed/<q>.png` | one component in its worst input: learned and true sums per bin, and $\Delta$ relative to the SM yield with the noise band $\sqrt{\mathrm{Var}_{\rm MC} + \mathrm{Var}_{\rm seeds}}$ | where in the input the bias sits, and whether it is a shape or a normalisation |
 | `attribution/<q>.png` | flagged components: the signed shares of the 10 largest networks and the sum of the others | one dominant network (a candidate to drop) or many small shares (a bias the networks share) |
 | `drop_tests_compact.png`, `drop_tests_full.png` | change of the largest $Z$ of the affected components for every tested group and for the combined refit; blamed cells outlined, accepted groups in dark red | gains where the group was blamed, no new outlined cells elsewhere |
-| `network_misclosure.png` | $m_a$ of every network against the inclusive yield of its training point, by kind, with the spread over members; suspects marked | networks far above the others of their kind |
+| `network_misclosure.png` | $m_a$ of every network against the inclusive yield of its training point, by kind (single-WC, interference, SM anchors), with the spread over members; dropped networks marked; networks without signal in a narrow panel on the right | networks far above the others of their kind |
 | `point_search_objective.png` | the objective after each added unit, relative to the current design | how fast the gain falls off: a flat curve means more points will not help |
 | `point_search_uncertainty_flagged.png`, `point_search_uncertainty_full.png` | $\sqrt{\mathrm{Var}(\hat\gamma_q)}$ before and after the search, over the measured rms bias | a bias well above the propagated uncertainty: more points will not remove it |
 
