@@ -33,6 +33,24 @@ import argparse, datetime, os, shutil, sys, torch, types, yaml
 mh.style.use("CMS")
 
 
+def era_names(config):
+    """
+    Names of the eras for the plots, from the config's 'eras' (indexed like lumi) and year_loc (default 21).
+
+    Args:
+        config: validation config (features as the contents of the features yml; optional eras, year_loc)
+    Returns:
+        {name of the feature holding the era index: {index: era name}}; empty without 'eras' or when no feature holds
+        the era index
+    """
+    eras = config.get('eras')
+    year_loc = config.get('year_loc', 21)
+    feature = next((f for f, p in config['features'].items() if p['loc'] == year_loc), None)
+    if not eras or feature is None:
+        return {}
+    return {feature: {i: str(era) for i, era in enumerate(eras)}}
+
+
 def load_ensemble(config, features, refit=False, data=None, path=None):
     """
     The ensemble cache of config: read from path when it matches config (data, c0, networks and their model.pt),
@@ -1276,6 +1294,7 @@ def main(config_path, refit=False, backgrounds=False):
             labels,
             f'{name}/plots/closure/{group}/{safe}.png',
             feature_config=config['features'],
+            value_names=era_names(config),
         )
 
     # attribution of the flagged biases to the training networks
